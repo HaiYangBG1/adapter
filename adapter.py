@@ -1450,7 +1450,7 @@ def _render_office_pages(filename: str, data: bytes) -> tuple[list[dict[str, Any
         return [], "unavailable: LibreOffice/soffice is not installed in this runtime"
 
     suffix = pathlib.Path(filename).suffix.lower() or ".xlsx"
-    with tempfile.TemporaryDirectory(prefix="ppu-office-render-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="adapter-office-render-") as tmp:
         tmpdir = pathlib.Path(tmp)
         input_path = tmpdir / f"input{suffix}"
         output_dir = tmpdir / "out"
@@ -1917,7 +1917,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _write_sse_error(self, message: str) -> None:
-        self._write_sse_data({"error": {"message": message, "type": "ppu_adapter_proxy_error"}})
+        self._write_sse_data({"error": {"message": message, "type": "adapter_proxy_error"}})
 
     def _proxy_stream_with_progress(self, payload: dict[str, Any], web_default_mode: str) -> None:
         model = str(payload.get("model") or "adapter")
@@ -2016,7 +2016,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             self.close_connection = True
         except Exception as exc:
-            self._send_json(502, {"error": {"message": str(exc), "type": "ppu_adapter_proxy_error"}})
+            self._send_json(502, {"error": {"message": str(exc), "type": "adapter_proxy_error"}})
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
