@@ -9,9 +9,31 @@ This document describes the public, deployment-neutral capabilities of `adapter`
 | OpenAI-compatible proxy | Yes | Supports common chat, responses, models, and health paths |
 | File adaptation | Yes | Converts file parts into text/image parts before forwarding |
 | Web augmentation | Yes | Optional `/web/v1` path for URL fetch and search |
-| SSE streaming | Yes | Streams upstream chunks and optional progress chunks |
+| Agentic web | Yes | `/v1/agent` tool-calling loop (search / fetch / screenshot) |
+| SSE streaming | Yes | Streams upstream chunks, progress chunks, and agent token deltas |
 | SSRF protection | Yes | Blocks internal/private targets and validates redirects |
 | Upstream auth | Yes | Optional bearer token through environment variable |
+
+## Agentic Web (`/v1/agent/chat/completions`)
+
+A model-driven tool-calling loop. Unlike `/web/v1` (which passively injects
+fetched context), the agent decides for itself when and what to search,
+fetch, or screenshot, iterating until it can answer.
+
+| Feature | Status | Description |
+|---|---|---|
+| `web_search` tool | Supported | Free providers: SearXNG (self-hosted), Baidu. Keyed: Tavily, Bing |
+| `web_fetch` tool | Supported | Fetches page text; auto-falls back to a screenshot when text is empty |
+| `web_view` tool | Supported | Headless-Chromium screenshot for SPAs, charts, scanned pages |
+| N-iteration loop | Supported | Budgeted by iterations / searches / fetches |
+| Parallel tool calls | Supported | Multiple tools dispatched concurrently per turn |
+| SSE streaming | Supported | Live progress events + token-level answer streaming |
+| Citation guard | Supported | Flags answer URLs the tools never actually visited |
+| Current-date injection | Supported | Tells the model "today" so stale memory is not trusted |
+| Concurrency gate | Supported | Caps in-flight agent requests; excess returns HTTP 429 |
+| Observability | Supported | One `AGENT_METRICS` JSON log line per request |
+
+See `DEPLOYMENT.md` for configuration and the environment-variable reference.
 
 ## File Inputs
 

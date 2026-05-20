@@ -79,6 +79,10 @@ WEB_SEARCH_PROVIDER = os.environ.get("ADAPTER_WEB_SEARCH_PROVIDER", "bing_html")
 # the public-URL SSRF guard. Requires the instance to enable JSON output
 # (settings.yml: search.formats includes "json").
 SEARXNG_URL = os.environ.get("ADAPTER_SEARXNG_URL", "").rstrip("/")
+# Fallback search provider used when the primary provider fails (e.g. SearXNG
+# container down). "baidu" is a sensible default — no key, no infra. Set empty
+# to disable fallback. Ignored when it equals the primary provider.
+WEB_SEARCH_FALLBACK = os.environ.get("ADAPTER_WEB_SEARCH_FALLBACK", "baidu").lower()
 WEB_USER_AGENT = os.environ.get(
     "ADAPTER_WEB_USER_AGENT",
     "adapter/1.0",
@@ -111,6 +115,10 @@ AGENT_MODEL = os.environ.get("ADAPTER_AGENT_MODEL", "")  # if empty, use payload
 AGENT_TIMEOUT = int(os.environ.get("ADAPTER_AGENT_TIMEOUT", "120"))
 AGENT_MAX_TOOL_RESULT_CHARS = int(os.environ.get("ADAPTER_AGENT_MAX_TOOL_RESULT_CHARS", "8000"))
 AGENT_PARALLEL_WORKERS = int(os.environ.get("ADAPTER_AGENT_PARALLEL_WORKERS", "4"))
+# Concurrency gate — caps simultaneous in-flight /v1/agent requests. Phase 5
+# stress testing put the EAS single-instance comfort zone at ~20 concurrent
+# agentic sessions; requests beyond this limit get HTTP 429 immediately.
+AGENT_MAX_CONCURRENT = int(os.environ.get("ADAPTER_AGENT_MAX_CONCURRENT", "20"))
 # Phase 2: budget control
 AGENT_MAX_ITERATIONS = int(os.environ.get("ADAPTER_AGENT_MAX_ITERATIONS", "5"))
 AGENT_MAX_FETCHES = int(os.environ.get("ADAPTER_AGENT_MAX_FETCHES", "8"))
@@ -121,7 +129,10 @@ AGENT_WEB_VIEW_VIEWPORT = os.environ.get("ADAPTER_AGENT_WEB_VIEW_VIEWPORT", "128
 AGENT_WEB_VIEW_TIMEOUT_MS = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_TIMEOUT_MS", "20000"))
 AGENT_WEB_VIEW_IMAGE_MAX_WIDTH = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_IMAGE_MAX_WIDTH", "1280"))
 AGENT_WEB_VIEW_JPEG_QUALITY = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_JPEG_QUALITY", "75"))
-AGENT_WEB_VIEW_MAX_PER_SESSION = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_MAX_PER_SESSION", "5"))
+# Hard cap on simultaneous headless Chromium processes. Each screenshot spawns
+# a Chromium instance (~150-300MB RSS), so unbounded concurrency can OOM the
+# host. Calls beyond this limit block until a slot frees (with a timeout).
+AGENT_WEB_VIEW_MAX_CONCURRENT = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_MAX_CONCURRENT", "3"))
 # When web_fetch returns text shorter than this, auto-fallback to web_view
 AGENT_FETCH_FALLBACK_MIN_CHARS = int(os.environ.get("ADAPTER_AGENT_FETCH_FALLBACK_MIN_CHARS", "200"))
 # Default max_tokens injected only when the client did not specify one.
@@ -1328,6 +1339,21 @@ def _search_searxng(query: str, max_results: int) -> list[dict[str, str]]:
     return results
 
 
+def _dispatch_search(provider: str, query: str, max_results: int) -> list[dict[str, str]]:
+    """Run a single search provider by name."""
+    if provider == "tavily":
+        return _search_tavily(query, max_results)
+    if provider == "bing":
+        return _search_bing(query, max_results)
+    if provider in {"bing_html", "bing-html", "binghtml"}:
+        return _search_bing_html(query, max_results)
+    if provider in {"searxng", "searx"}:
+        return _search_searxng(query, max_results)
+    if provider == "baidu":
+        return _search_baidu(query, max_results)
+    return _search_duckduckgo(query, max_results)
+
+
 def _search_web(query: str, max_results: int = WEB_SEARCH_RESULTS) -> list[dict[str, str]]:
     query = _collapse_ws(query)
     if not query:
@@ -1336,18 +1362,18 @@ def _search_web(query: str, max_results: int = WEB_SEARCH_RESULTS) -> list[dict[
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    if WEB_SEARCH_PROVIDER == "tavily":
-        results = _search_tavily(query, max_results)
-    elif WEB_SEARCH_PROVIDER == "bing":
-        results = _search_bing(query, max_results)
-    elif WEB_SEARCH_PROVIDER in {"bing_html", "bing-html", "binghtml"}:
-        results = _search_bing_html(query, max_results)
-    elif WEB_SEARCH_PROVIDER in {"searxng", "searx"}:
-        results = _search_searxng(query, max_results)
-    elif WEB_SEARCH_PROVIDER == "baidu":
-        results = _search_baidu(query, max_results)
-    else:
-        results = _search_duckduckgo(query, max_results)
+    try:
+        results = _dispatch_search(WEB_SEARCH_PROVIDER, query, max_results)
+    except WebError as primary_exc:
+        if WEB_SEARCH_FALLBACK and WEB_SEARCH_FALLBACK != WEB_SEARCH_PROVIDER:
+            print(
+                f"[search] primary provider '{WEB_SEARCH_PROVIDER}' failed "
+                f"({primary_exc}); falling back to '{WEB_SEARCH_FALLBACK}'",
+                flush=True,
+            )
+            results = _dispatch_search(WEB_SEARCH_FALLBACK, query, max_results)
+        else:
+            raise
     return _cache_set(cache_key, results)
 
 
@@ -1357,6 +1383,9 @@ def _search_web(query: str, max_results: int = WEB_SEARCH_RESULTS) -> list[dict[
 
 _agent_registry_lock = threading.Lock()
 _agent_registry_singleton: ToolRegistry | None = None
+
+# Caps simultaneous in-flight /v1/agent requests (see AGENT_MAX_CONCURRENT).
+_agent_request_semaphore = threading.BoundedSemaphore(max(AGENT_MAX_CONCURRENT, 1))
 
 
 def _tool_impl_web_search(args: dict[str, Any]) -> Any:
@@ -1375,8 +1404,9 @@ def _tool_impl_web_search(args: dict[str, Any]) -> Any:
 # web_view (Phase 3) — Playwright-based screenshot tool
 # -----------------------------------------------------------------------------
 
-_web_view_session_count_lock = threading.Lock()
-_web_view_session_count: dict[int, int] = {}  # thread_id → count for soft per-request guard
+# Bounds simultaneous Chromium processes spawned by web_view (see
+# AGENT_WEB_VIEW_MAX_CONCURRENT). Acquired in _take_screenshot.
+_web_view_semaphore = threading.Semaphore(max(AGENT_WEB_VIEW_MAX_CONCURRENT, 1))
 
 
 def _parse_viewport(spec: str, default_w: int = 1280, default_h: int = 1600) -> tuple[int, int]:
@@ -1427,25 +1457,36 @@ def _take_screenshot(url: str, viewport_spec: str, full_page: bool, timeout_ms: 
             "  python -m playwright install chromium"
         ) from exc
     width, height = _parse_viewport(viewport_spec)
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        try:
-            ctx = browser.new_context(
-                viewport={"width": width, "height": height},
-                user_agent=WEB_USER_AGENT or "Mozilla/5.0 (compatible; adapter/1.0)",
-                ignore_https_errors=False,
-            )
-            page = ctx.new_page()
-            page.set_default_timeout(timeout_ms)
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            # Give SPA renderers a moment
+    # Bound concurrent Chromium processes. Wait time = browser-launch slack +
+    # the page timeout, so a backed-up queue fails cleanly instead of hanging.
+    acquire_timeout = (timeout_ms / 1000.0) + 30.0
+    if not _web_view_semaphore.acquire(timeout=acquire_timeout):
+        raise RuntimeError(
+            f"web_view concurrency limit ({AGENT_WEB_VIEW_MAX_CONCURRENT}) reached; "
+            "timed out waiting for a browser slot"
+        )
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             try:
-                page.wait_for_load_state("networkidle", timeout=min(5000, timeout_ms))
-            except Exception:  # noqa: BLE001 — networkidle is best-effort
-                pass
-            return page.screenshot(full_page=full_page, type="png")
-        finally:
-            browser.close()
+                ctx = browser.new_context(
+                    viewport={"width": width, "height": height},
+                    user_agent=WEB_USER_AGENT or "Mozilla/5.0 (compatible; adapter/1.0)",
+                    ignore_https_errors=False,
+                )
+                page = ctx.new_page()
+                page.set_default_timeout(timeout_ms)
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                # Give SPA renderers a moment
+                try:
+                    page.wait_for_load_state("networkidle", timeout=min(5000, timeout_ms))
+                except Exception:  # noqa: BLE001 — networkidle is best-effort
+                    pass
+                return page.screenshot(full_page=full_page, type="png")
+            finally:
+                browser.close()
+    finally:
+        _web_view_semaphore.release()
 
 
 def _tool_impl_web_view(args: dict[str, Any]) -> Any:
@@ -2505,6 +2546,7 @@ class Handler(BaseHTTPRequestHandler):
                         "searxng_configured": bool(SEARXNG_URL),
                         "agentic_web": True,
                         "agentic_web_phase": 4,
+                        "agent_max_concurrent": AGENT_MAX_CONCURRENT,
                         "agent_max_iterations": AGENT_MAX_ITERATIONS,
                         "agent_max_fetches": AGENT_MAX_FETCHES,
                         "agent_max_searches": AGENT_MAX_SEARCHES,
@@ -2581,10 +2623,29 @@ class Handler(BaseHTTPRequestHandler):
         if not extra.get("max_tokens") and not extra.get("max_completion_tokens"):
             extra["max_tokens"] = AGENT_DEFAULT_MAX_TOKENS
         stream = bool(payload.get("stream"))
-        if stream:
-            self._handle_agent_chat_stream(cfg, registry, messages, extra)
-        else:
-            self._handle_agent_chat_blocking(cfg, registry, messages, extra)
+        # Concurrency gate — reject immediately (HTTP 429) rather than piling
+        # load onto the EAS instance past its comfortable throughput.
+        if not _agent_request_semaphore.acquire(blocking=False):
+            self._send_json(
+                429,
+                {
+                    "error": {
+                        "message": (
+                            f"agent is at capacity ({AGENT_MAX_CONCURRENT} concurrent "
+                            "requests). Retry shortly."
+                        ),
+                        "type": "rate_limit_error",
+                    }
+                },
+            )
+            return
+        try:
+            if stream:
+                self._handle_agent_chat_stream(cfg, registry, messages, extra)
+            else:
+                self._handle_agent_chat_blocking(cfg, registry, messages, extra)
+        finally:
+            _agent_request_semaphore.release()
 
     def _handle_agent_chat_blocking(
         self,

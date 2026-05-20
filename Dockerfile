@@ -30,7 +30,15 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install -r /app/requirements.txt
 
+# Install the Chromium browser used by the agentic web_view tool, plus the
+# system libraries it needs. --with-deps apt-installs the runtime deps.
+# If you do not need web_view, set ADAPTER_AGENT_WEB_VIEW_ENABLED=0 at runtime;
+# you may then remove this line to keep the image small.
+RUN python -m playwright install --with-deps chromium; \
+    rm -rf /var/lib/apt/lists/*
+
 COPY adapter.py /app/adapter.py
+COPY agentic_web.py /app/agentic_web.py
 
 EXPOSE 8000
 
