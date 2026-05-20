@@ -232,8 +232,9 @@ DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
     "   - 实时信息：天气、新闻、价格、汇率、股价、比赛、政策法规、库存\n"
     "   - 任何**带年份数字**（如 '2025'、'2026'）的查询\n"
     "   - 用户主动要求「联网 / 查一下 / 搜一下」的问题\n"
-    "2. 当 web_search 返回的 snippet 信息不足以完整回答时，"
-    "再调用 web_fetch 抓取对应 URL 的完整正文。\n"
+    "2. 当 web_search 返回的 snippet **不包含**回答问题所需的具体数据"
+    "（如具体的预报数值、价格、日期、参数、统计数字等）时，"
+    "**必须**调用 web_fetch 抓取对应结果页的完整正文 —— 不要只凭摘要勉强作答或绕开问题。\n"
     "3. 当页面是图表、数据可视化、JS 重度渲染的 SPA、扫描版 PDF 等"
     "**正文是图像而非文本**的场景，调用 web_view 让浏览器渲染并截图。\n"
     "4. 同一时刻可发出多个并行的工具调用，提高效率。\n"
@@ -250,10 +251,15 @@ DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
     "- 你的训练数据已经过时，工具查到的就是当前现实。\n"
     "\n"
     "答案规范（极其重要）：\n"
-    "- 引用工具返回的事实时，在句末用 [1][2] 标注来源序号。\n"
-    "- 答案最后追加 'Sources:' 列出每个序号对应的 URL。\n"
-    "- **Sources 里的每一个 URL 必须是你本次会话中真正通过 web_search / web_fetch / web_view 接触过的 URL**，"
-    "**绝对禁止**列出你「印象中」或「应该存在」的 URL —— 这是事实性谎言。\n"
+    "- 引用规则：在句末用 [1][2] 标注来源。编号按来源在你**答案中首次出现的先后顺序**，"
+    "从 [1] 起**连续递增**（[1]、[2]、[3]…）。\n"
+    "- **不要**用来源在搜索结果列表里的位置当编号 —— 哪怕你引用的是搜索结果里的第 2 条和第 5 条，"
+    "在答案里也必须写成 [1] 和 [2]。\n"
+    "- 每一轮回答都**独立从 [1] 重新编号**，不延续历史对话轮次的编号。\n"
+    "- 答案最后追加 'Sources:'，逐行列出 [1][2][3]… 各编号对应的 URL，"
+    "必须与正文里的编号**一一对应、连续、不重不漏**。\n"
+    "- **Sources 里的每一个 URL 必须是你本轮回答中真正通过 web_search / web_fetch / web_view 接触过的 URL**，"
+    "**绝对禁止**列出你「印象中」「应该存在」或来自历史对话的 URL —— 这是事实性谎言。\n"
     "- 如果你这次没有调用任何工具（即基于训练数据作答），"
     "请在答案末尾明确写："
     "'⚠️ 本回答基于训练数据，未联网核实，可能已过时。'"
@@ -448,6 +454,39 @@ def _truncate_tool_result(value: Any, max_chars: int) -> str:
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n[truncated, {len(text) - max_chars} more chars]"
     return text
+
+
+def _strip_citation_scaffolding(text: str) -> str:
+    """Remove citation scaffolding from a historical assistant answer.
+
+    Strips the trailing 'Sources:' / '来源:' block, any '⚠️' warning block,
+    and inline [N] citation markers. Prior-turn citation numbering must not
+    leak into the current turn — otherwise the model continues numbering from
+    where the last turn left off (e.g. [5], [6]) instead of restarting at [1].
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    cut = len(text)
+    for marker in ("\nSources:", "\nSources：", "\n来源:", "\n来源：", "\n⚠️", "⚠️"):
+        idx = text.find(marker)
+        if idx != -1:
+            cut = min(cut, idx)
+    cleaned = text[:cut]
+    cleaned = re.sub(r"\s*\[\d{1,3}\]", "", cleaned)  # drop inline [N] markers
+    return cleaned.rstrip()
+
+
+def _sanitize_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a copy of ``messages`` with citation scaffolding stripped from
+    historical assistant messages. Keeps prior-turn answers as clean prose so
+    the current turn numbers its citations fresh from [1]."""
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str):
+            out.append({**m, "content": _strip_citation_scaffolding(m["content"])})
+        else:
+            out.append(m)
+    return out
 
 
 def _ensure_system_prompt(
@@ -705,7 +744,7 @@ def run_agent(
     """
     trace = AgentTrace()
     tools = registry.schemas()
-    augmented = _ensure_system_prompt(messages, cfg.system_prompt)
+    augmented = _ensure_system_prompt(_sanitize_history(messages), cfg.system_prompt)
     seen_signatures: set[str] = set()
     last_response: dict[str, Any] = {}
 
@@ -842,7 +881,7 @@ def run_agent_stream(
     """
     trace = AgentTrace()
     tools = registry.schemas()
-    augmented = _ensure_system_prompt(messages, cfg.system_prompt)
+    augmented = _ensure_system_prompt(_sanitize_history(messages), cfg.system_prompt)
     seen_signatures: set[str] = set()
     model = cfg.model
 
