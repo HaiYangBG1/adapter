@@ -126,6 +126,11 @@ AGENT_MAX_SEARCHES = int(os.environ.get("ADAPTER_AGENT_MAX_SEARCHES", "8"))
 # Phase 3: vision tool (web_view) — controls browser screenshot fallback
 AGENT_WEB_VIEW_ENABLED = os.environ.get("ADAPTER_AGENT_WEB_VIEW_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 AGENT_WEB_VIEW_VIEWPORT = os.environ.get("ADAPTER_AGENT_WEB_VIEW_VIEWPORT", "1280x1600")
+# Optional explicit Chromium executable. When empty, Playwright uses its own
+# bundled browser (installed via `playwright install chromium`). Set this to a
+# system Chromium path (e.g. /usr/bin/chromium) when the bundled-browser
+# download is unavailable in your build environment.
+AGENT_CHROMIUM_PATH = os.environ.get("ADAPTER_AGENT_CHROMIUM_PATH", "")
 AGENT_WEB_VIEW_TIMEOUT_MS = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_TIMEOUT_MS", "20000"))
 AGENT_WEB_VIEW_IMAGE_MAX_WIDTH = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_IMAGE_MAX_WIDTH", "1280"))
 AGENT_WEB_VIEW_JPEG_QUALITY = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_JPEG_QUALITY", "75"))
@@ -1465,9 +1470,15 @@ def _take_screenshot(url: str, viewport_spec: str, full_page: bool, timeout_ms: 
             f"web_view concurrency limit ({AGENT_WEB_VIEW_MAX_CONCURRENT}) reached; "
             "timed out waiting for a browser slot"
         )
+    launch_kwargs: dict[str, Any] = {
+        "headless": True,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+    }
+    if AGENT_CHROMIUM_PATH:
+        launch_kwargs["executable_path"] = AGENT_CHROMIUM_PATH
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            browser = pw.chromium.launch(**launch_kwargs)
             try:
                 ctx = browser.new_context(
                     viewport={"width": width, "height": height},
