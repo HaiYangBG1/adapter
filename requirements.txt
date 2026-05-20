@@ -2,3 +2,6 @@ pypdf>=6.0.0
 PyMuPDF>=1.24.0
 python-docx>=1.1.0
 openpyxl>=3.1.0
+# Agentic web — web_view screenshot tool (optional; web_view is skipped if absent)
+playwright>=1.40.0
+Pillow>=10.0.0

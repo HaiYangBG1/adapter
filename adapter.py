@@ -39,6 +39,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from xml.etree import ElementTree
 
+from agentic_web import (
+    AgentConfig,
+    ToolRegistry,
+    WEB_FETCH_TOOL,
+    WEB_SEARCH_TOOL,
+    WEB_VIEW_TOOL,
+    run_agent as _run_agent_loop,
+    run_agent_stream as _run_agent_stream,
+)
+
 
 HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
@@ -64,6 +74,11 @@ LIBREOFFICE_BIN = os.environ.get("ADAPTER_LIBREOFFICE_BIN", "")
 
 WEB_ENABLED = os.environ.get("ADAPTER_WEB_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 WEB_SEARCH_PROVIDER = os.environ.get("ADAPTER_WEB_SEARCH_PROVIDER", "bing_html").lower()
+# SearXNG self-hosted metasearch — free, no API key. Typically an internal
+# address (localhost / docker network), so requests to it intentionally bypass
+# the public-URL SSRF guard. Requires the instance to enable JSON output
+# (settings.yml: search.formats includes "json").
+SEARXNG_URL = os.environ.get("ADAPTER_SEARXNG_URL", "").rstrip("/")
 WEB_USER_AGENT = os.environ.get(
     "ADAPTER_WEB_USER_AGENT",
     "adapter/1.0",
@@ -90,6 +105,29 @@ AI_NEWS_SOURCE_URLS = tuple(
     if item.strip()
 )
 WEB_AI_NEWS_MAX_SOURCES = int(os.environ.get("ADAPTER_WEB_AI_NEWS_MAX_SOURCES", "3"))
+
+# Agentic web — endpoint /v1/agent/chat/completions
+AGENT_MODEL = os.environ.get("ADAPTER_AGENT_MODEL", "")  # if empty, use payload's "model"
+AGENT_TIMEOUT = int(os.environ.get("ADAPTER_AGENT_TIMEOUT", "120"))
+AGENT_MAX_TOOL_RESULT_CHARS = int(os.environ.get("ADAPTER_AGENT_MAX_TOOL_RESULT_CHARS", "8000"))
+AGENT_PARALLEL_WORKERS = int(os.environ.get("ADAPTER_AGENT_PARALLEL_WORKERS", "4"))
+# Phase 2: budget control
+AGENT_MAX_ITERATIONS = int(os.environ.get("ADAPTER_AGENT_MAX_ITERATIONS", "5"))
+AGENT_MAX_FETCHES = int(os.environ.get("ADAPTER_AGENT_MAX_FETCHES", "8"))
+AGENT_MAX_SEARCHES = int(os.environ.get("ADAPTER_AGENT_MAX_SEARCHES", "8"))
+# Phase 3: vision tool (web_view) — controls browser screenshot fallback
+AGENT_WEB_VIEW_ENABLED = os.environ.get("ADAPTER_AGENT_WEB_VIEW_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
+AGENT_WEB_VIEW_VIEWPORT = os.environ.get("ADAPTER_AGENT_WEB_VIEW_VIEWPORT", "1280x1600")
+AGENT_WEB_VIEW_TIMEOUT_MS = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_TIMEOUT_MS", "20000"))
+AGENT_WEB_VIEW_IMAGE_MAX_WIDTH = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_IMAGE_MAX_WIDTH", "1280"))
+AGENT_WEB_VIEW_JPEG_QUALITY = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_JPEG_QUALITY", "75"))
+AGENT_WEB_VIEW_MAX_PER_SESSION = int(os.environ.get("ADAPTER_AGENT_WEB_VIEW_MAX_PER_SESSION", "5"))
+# When web_fetch returns text shorter than this, auto-fallback to web_view
+AGENT_FETCH_FALLBACK_MIN_CHARS = int(os.environ.get("ADAPTER_AGENT_FETCH_FALLBACK_MIN_CHARS", "200"))
+# Default max_tokens injected only when the client did not specify one.
+# Agentic answers (esp. vision-heavy ones) need headroom — too small a value
+# truncates the answer and the model degrades into repetition before the cut.
+AGENT_DEFAULT_MAX_TOKENS = int(os.environ.get("ADAPTER_AGENT_DEFAULT_MAX_TOKENS", "2000"))
 
 PYTHONPATH_EXTRA = os.environ.get("ADAPTER_PYTHONPATH_EXTRA", "")
 if PYTHONPATH_EXTRA:
@@ -351,6 +389,94 @@ class DuckDuckGoResultParser(HTMLParser):
             self.results.append({"title": title, "url": url, "snippet": ""})
         self._current_href = None
         self._current_text = []
+
+
+class BaiduHTMLResultParser(HTMLParser):
+    """Parse organic results from a Baidu search results page.
+
+    Baidu wraps each organic result in a ``<div class="... c-container ...">``.
+    The title + link live in an ``<h3>`` containing an ``<a href>``; the snippet
+    is the remaining text inside the container. Class names are partly obfuscated
+    and change over time, so we match structurally (container → h3 → a) rather
+    than on exact class names.
+
+    Result URLs are Baidu redirect links (``baidu.com/link?url=...``); they are
+    valid public URLs and resolve to the destination when fetched, so we keep
+    them as-is rather than trying to decode Baidu's opaque token.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict[str, str]] = []
+        self._in_result = False
+        self._div_depth = 0
+        self._in_h3 = False
+        self._in_title_a = False
+        self._current_href: str | None = None
+        self._current_title: list[str] = []
+        self._current_snippet: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attrs_dict = {key.lower(): value or "" for key, value in attrs}
+        css = attrs_dict.get("class", "")
+        if tag == "div":
+            if not self._in_result and "c-container" in css:
+                self._in_result = True
+                self._div_depth = 1
+                self._in_h3 = False
+                self._in_title_a = False
+                self._current_href = None
+                self._current_title = []
+                self._current_snippet = []
+                return
+            if self._in_result:
+                self._div_depth += 1
+            return
+        if not self._in_result:
+            return
+        if tag == "h3":
+            self._in_h3 = True
+        elif tag == "a" and self._in_h3 and self._current_href is None:
+            href = attrs_dict.get("href", "")
+            if href.startswith(("http://", "https://")):
+                self._current_href = href
+                self._in_title_a = True
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if not self._in_result:
+            return
+        if tag == "a" and self._in_title_a:
+            self._in_title_a = False
+        elif tag == "h3":
+            self._in_h3 = False
+        elif tag == "div":
+            self._div_depth -= 1
+            if self._div_depth <= 0:
+                title = _collapse_ws(" ".join(self._current_title))
+                snippet = _collapse_ws(" ".join(self._current_snippet))
+                if self._current_href and title:
+                    self.results.append(
+                        {"title": title[:200], "url": self._current_href, "snippet": snippet[:1000]}
+                    )
+                self._in_result = False
+                self._in_h3 = False
+                self._in_title_a = False
+                self._current_href = None
+                self._current_title = []
+                self._current_snippet = []
+
+    def handle_data(self, data: str) -> None:
+        if not self._in_result:
+            return
+        text = data.strip()
+        if not text:
+            return
+        if self._in_title_a:
+            self._current_title.append(text)
+        elif not self._in_h3:
+            self._current_snippet.append(text)
 
 
 class BingHTMLResultParser(HTMLParser):
@@ -1087,6 +1213,121 @@ def _search_bing_html(query: str, max_results: int) -> list[dict[str, str]]:
     return results
 
 
+# A real browser User-Agent. Baidu (and some other engines) serve a JS-only
+# anti-bot stub to non-browser UAs, so scraping requires this.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _search_baidu(query: str, max_results: int) -> list[dict[str, str]]:
+    """Scrape Baidu organic search results — free, no API key. Best for Chinese.
+
+    Baidu blocks non-browser User-Agents with a JS-redirect stub, so this uses
+    a dedicated request with browser headers instead of _http_get_public.
+    """
+    params = urllib.parse.urlencode({"wd": query, "rn": str(min(max(max_results, 10), 50))})
+    url = f"https://www.baidu.com/s?{params}"
+    _validate_public_url(url)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": BROWSER_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+        },
+        method="GET",
+    )
+    try:
+        with _prefer_ipv4_for_urllib():
+            resp_context = urllib.request.urlopen(req, timeout=WEB_TIMEOUT)
+        with resp_context as resp:
+            raw = resp.read(WEB_MAX_PAGE_BYTES)
+            content_type = resp.headers.get("Content-Type", "")
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                import gzip as _gzip
+
+                raw = _gzip.decompress(raw)
+    except (urllib.error.URLError, OSError) as exc:
+        raise WebError(f"Baidu request failed: {exc}") from exc
+    decoded = _decode_http_body(raw, content_type)
+    parser = BaiduHTMLResultParser()
+    parser.feed(decoded)
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in parser.results:
+        result_url = item.get("url", "")
+        if not result_url or result_url in seen:
+            continue
+        try:
+            _validate_public_url(result_url)
+        except WebError:
+            continue
+        results.append(item)
+        seen.add(result_url)
+        if len(results) >= max_results:
+            break
+    if not results:
+        raise WebError(f"No Baidu results parsed from {final_url}")
+    return results
+
+
+def _search_searxng(query: str, max_results: int) -> list[dict[str, str]]:
+    """Query a self-hosted SearXNG instance via its JSON API — free, no API key.
+
+    SearXNG is typically internal (localhost / docker network), so this call
+    intentionally does NOT go through the public-URL SSRF guard.
+    """
+    if not SEARXNG_URL:
+        raise WebError("ADAPTER_SEARXNG_URL is not configured")
+    params = urllib.parse.urlencode(
+        {
+            "q": query,
+            "format": "json",
+            "language": "zh-CN",
+            "safesearch": "0",
+        }
+    )
+    req = urllib.request.Request(
+        f"{SEARXNG_URL}/search?{params}",
+        headers={"User-Agent": WEB_USER_AGENT, "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=WEB_TIMEOUT) as resp:
+            data = json.loads(resp.read(WEB_MAX_PAGE_BYTES).decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:200]
+        raise WebError(f"SearXNG HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
+        raise WebError(f"SearXNG request failed: {exc}") from exc
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in data.get("results", []):
+        result_url = str(item.get("url") or "")
+        if not result_url or result_url in seen:
+            continue
+        try:
+            _validate_public_url(result_url)
+        except WebError:
+            continue
+        results.append(
+            {
+                "title": _collapse_ws(str(item.get("title") or result_url))[:200],
+                "url": result_url,
+                "snippet": _collapse_ws(str(item.get("content") or ""))[:1000],
+            }
+        )
+        seen.add(result_url)
+        if len(results) >= max_results:
+            break
+    if not results:
+        raise WebError(f"No SearXNG results for query: {query}")
+    return results
+
+
 def _search_web(query: str, max_results: int = WEB_SEARCH_RESULTS) -> list[dict[str, str]]:
     query = _collapse_ws(query)
     if not query:
@@ -1101,9 +1342,214 @@ def _search_web(query: str, max_results: int = WEB_SEARCH_RESULTS) -> list[dict[
         results = _search_bing(query, max_results)
     elif WEB_SEARCH_PROVIDER in {"bing_html", "bing-html", "binghtml"}:
         results = _search_bing_html(query, max_results)
+    elif WEB_SEARCH_PROVIDER in {"searxng", "searx"}:
+        results = _search_searxng(query, max_results)
+    elif WEB_SEARCH_PROVIDER == "baidu":
+        results = _search_baidu(query, max_results)
     else:
         results = _search_duckduckgo(query, max_results)
     return _cache_set(cache_key, results)
+
+
+# =============================================================================
+# Agentic web — Phase 1 wiring
+# =============================================================================
+
+_agent_registry_lock = threading.Lock()
+_agent_registry_singleton: ToolRegistry | None = None
+
+
+def _tool_impl_web_search(args: dict[str, Any]) -> Any:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return {"error": "missing 'query'"}
+    max_results = args.get("max_results")
+    if not isinstance(max_results, int) or max_results <= 0:
+        max_results = WEB_SEARCH_RESULTS
+    max_results = max(1, min(max_results, 10))
+    results = _search_web(query, max_results=max_results)
+    return {"results": results, "provider": WEB_SEARCH_PROVIDER, "count": len(results)}
+
+
+# -----------------------------------------------------------------------------
+# web_view (Phase 3) — Playwright-based screenshot tool
+# -----------------------------------------------------------------------------
+
+_web_view_session_count_lock = threading.Lock()
+_web_view_session_count: dict[int, int] = {}  # thread_id → count for soft per-request guard
+
+
+def _parse_viewport(spec: str, default_w: int = 1280, default_h: int = 1600) -> tuple[int, int]:
+    try:
+        w_s, h_s = spec.lower().split("x", 1)
+        return max(320, min(int(w_s), 1920)), max(320, min(int(h_s), 4000))
+    except (ValueError, AttributeError):
+        return default_w, default_h
+
+
+def _compress_screenshot(png_bytes: bytes, max_width: int, jpeg_quality: int) -> tuple[bytes, str, tuple[int, int]]:
+    """Compress raw PNG bytes to JPEG, scaling down to max_width if larger.
+
+    Returns (jpeg_bytes, mime, (w, h)).
+    """
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        return png_bytes, "image/png", (0, 0)
+    buf_in = io.BytesIO(png_bytes)
+    img = Image.open(buf_in)
+    img.load()
+    w, h = img.size
+    if w > max_width:
+        new_h = int(h * (max_width / w))
+        img = img.resize((max_width, new_h), Image.LANCZOS)
+        w, h = max_width, new_h
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=jpeg_quality, optimize=True)
+    return out.getvalue(), "image/jpeg", (w, h)
+
+
+def _take_screenshot(url: str, viewport_spec: str, full_page: bool, timeout_ms: int) -> bytes:
+    """Render the URL in headless Chromium and return PNG bytes.
+
+    Uses sync_playwright in a fresh per-call context (cheap enough for ~300ms
+    overhead; lets us stay thread-safe with the adapter's ThreadingHTTPServer).
+    """
+    _validate_public_url(url)  # SSRF guard, same as web_fetch
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "playwright is not installed. Install via:\n"
+            "  pip install playwright pillow\n"
+            "  python -m playwright install chromium"
+        ) from exc
+    width, height = _parse_viewport(viewport_spec)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        try:
+            ctx = browser.new_context(
+                viewport={"width": width, "height": height},
+                user_agent=WEB_USER_AGENT or "Mozilla/5.0 (compatible; adapter/1.0)",
+                ignore_https_errors=False,
+            )
+            page = ctx.new_page()
+            page.set_default_timeout(timeout_ms)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            # Give SPA renderers a moment
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(5000, timeout_ms))
+            except Exception:  # noqa: BLE001 — networkidle is best-effort
+                pass
+            return page.screenshot(full_page=full_page, type="png")
+        finally:
+            browser.close()
+
+
+def _tool_impl_web_view(args: dict[str, Any]) -> Any:
+    if not AGENT_WEB_VIEW_ENABLED:
+        return {"error": "web_view is disabled (set ADAPTER_AGENT_WEB_VIEW_ENABLED=1 to enable)"}
+    url = str(args.get("url") or "").strip()
+    if not url:
+        return {"error": "missing 'url'"}
+    viewport = str(args.get("viewport") or AGENT_WEB_VIEW_VIEWPORT)
+    full_page = bool(args.get("full_page"))
+    try:
+        png = _take_screenshot(url, viewport, full_page, AGENT_WEB_VIEW_TIMEOUT_MS)
+    except Exception as exc:  # noqa: BLE001 — surface error to model, not crash
+        return {"error": f"screenshot failed: {type(exc).__name__}: {exc}"}
+    jpeg, mime, (w, h) = _compress_screenshot(
+        png,
+        max_width=AGENT_WEB_VIEW_IMAGE_MAX_WIDTH,
+        jpeg_quality=AGENT_WEB_VIEW_JPEG_QUALITY,
+    )
+    b64 = base64.b64encode(jpeg).decode("ascii")
+    data_url = f"data:{mime};base64,{b64}"
+    return {
+        "content_type": "image",
+        "url": url,
+        "image_url": data_url,
+        "image_bytes": len(jpeg),
+        "image_size": [w, h],
+        "description": f"[web_view 截图：{url} (尺寸 {w}x{h}, {len(jpeg)//1024}KB)]",
+    }
+
+
+# -----------------------------------------------------------------------------
+# web_fetch with vision fallback
+# -----------------------------------------------------------------------------
+
+
+def _tool_impl_web_fetch(args: dict[str, Any]) -> Any:
+    url = str(args.get("url") or "").strip()
+    if not url:
+        return {"error": "missing 'url'"}
+    page = _fetch_web_page(url)
+    text = page.get("text") or ""
+    # Auto-fallback to web_view when text extraction was effectively empty
+    # (e.g. SPA-rendered pages). Only if vision is enabled.
+    if AGENT_WEB_VIEW_ENABLED and len(text.strip()) < AGENT_FETCH_FALLBACK_MIN_CHARS:
+        view_result = _tool_impl_web_view({"url": url})
+        if isinstance(view_result, dict) and view_result.get("content_type") == "image":
+            view_result["fallback_reason"] = (
+                f"web_fetch returned only {len(text.strip())} chars of text "
+                f"(threshold {AGENT_FETCH_FALLBACK_MIN_CHARS}); switched to visual mode."
+            )
+            return view_result
+        # Vision fallback failed too — return original text result with a note
+        return {
+            "url": page.get("url"),
+            "title": page.get("title"),
+            "content": text,
+            "content_type": page.get("content_type"),
+            "note": f"text extraction returned only {len(text.strip())} chars; visual fallback also failed ({view_result.get('error', 'unknown')})",
+        }
+    return {
+        "url": page.get("url"),
+        "title": page.get("title"),
+        "content": text,
+        "content_type": page.get("content_type"),
+    }
+
+
+def _get_agent_registry() -> ToolRegistry:
+    global _agent_registry_singleton
+    if _agent_registry_singleton is not None:
+        return _agent_registry_singleton
+    with _agent_registry_lock:
+        if _agent_registry_singleton is None:
+            reg = ToolRegistry()
+            reg.register(WEB_SEARCH_TOOL, _tool_impl_web_search)
+            reg.register(WEB_FETCH_TOOL, _tool_impl_web_fetch)
+            if AGENT_WEB_VIEW_ENABLED:
+                reg.register(WEB_VIEW_TOOL, _tool_impl_web_view)
+            _agent_registry_singleton = reg
+    return _agent_registry_singleton
+
+
+def _build_agent_config(model_from_payload: str) -> AgentConfig:
+    """Resolve agent config from env + payload."""
+    base = UPSTREAM.rstrip("/")
+    if base.endswith("/v1"):
+        upstream_url = base + "/chat/completions"
+    else:
+        upstream_url = base + "/v1/chat/completions"
+    auth_value = f"Bearer {UPSTREAM_API_KEY}" if UPSTREAM_API_KEY else ""
+    model = AGENT_MODEL or model_from_payload or ""
+    return AgentConfig(
+        upstream_url=upstream_url,
+        upstream_auth_header=UPSTREAM_AUTH_HEADER,
+        upstream_auth_value=auth_value,
+        model=model,
+        request_timeout=AGENT_TIMEOUT,
+        max_tool_result_chars=AGENT_MAX_TOOL_RESULT_CHARS,
+        parallel_dispatch_workers=AGENT_PARALLEL_WORKERS,
+        max_iterations=AGENT_MAX_ITERATIONS,
+        max_fetches=AGENT_MAX_FETCHES,
+        max_searches=AGENT_MAX_SEARCHES,
+    )
 
 
 def _extract_text_from_content(content: Any) -> str:
@@ -2056,16 +2502,185 @@ class Handler(BaseHTTPRequestHandler):
                         "document": True,
                         "web": WEB_ENABLED,
                         "web_search_provider": WEB_SEARCH_PROVIDER,
+                        "searxng_configured": bool(SEARXNG_URL),
+                        "agentic_web": True,
+                        "agentic_web_phase": 4,
+                        "agent_max_iterations": AGENT_MAX_ITERATIONS,
+                        "agent_max_fetches": AGENT_MAX_FETCHES,
+                        "agent_max_searches": AGENT_MAX_SEARCHES,
+                        "agent_web_view_enabled": AGENT_WEB_VIEW_ENABLED,
+                        "agent_fetch_fallback_min_chars": AGENT_FETCH_FALLBACK_MIN_CHARS,
                     },
                 },
             )
             return
         self._proxy()
 
+    def _log_agent_run(self, trace_dict: dict[str, Any], model: str, stream: bool) -> None:
+        """Emit one structured JSON line summarizing an agent run (observability).
+
+        Designed to be grep/jq-friendly and to feed a log pipeline. One line
+        per /v1/agent request — covers iteration count, tool usage, citation
+        health, truncation, and latency.
+        """
+        tool_calls = trace_dict.get("tool_calls", []) or []
+        record = {
+            "event": "agent_run",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "model": model,
+            "stream": stream,
+            "iterations": trace_dict.get("iterations"),
+            "stopped_reason": trace_dict.get("stopped_reason"),
+            "tool_calls_total": len(tool_calls),
+            "searches_used": trace_dict.get("searches_used"),
+            "fetches_used": trace_dict.get("fetches_used"),
+            "duplicate_calls_skipped": trace_dict.get("duplicate_calls_skipped"),
+            "tool_call_leaks_stripped": trace_dict.get("tool_call_leaks_stripped"),
+            "unverified_url_count": len(trace_dict.get("unverified_urls_in_answer", []) or []),
+            "answer_truncated": trace_dict.get("answer_truncated"),
+            "final_finish_reason": trace_dict.get("final_finish_reason"),
+            "search_provider": WEB_SEARCH_PROVIDER,
+            "upstream_latencies_ms": trace_dict.get("upstream_latencies_ms"),
+            "elapsed_total_ms": trace_dict.get("elapsed_total_ms"),
+        }
+        print("AGENT_METRICS " + json.dumps(record, ensure_ascii=False), flush=True)
+
+    def _agent_console_progress(self, stage: str, message: str, meta: dict[str, Any]) -> None:
+        """Server-side log of agent progress (visible in adapter.log)."""
+        try:
+            meta_str = json.dumps(meta, ensure_ascii=False)
+        except (TypeError, ValueError):
+            meta_str = str(meta)
+        print(f"[agent] {stage}: {message} {meta_str}", flush=True)
+
+    def _handle_agent_chat(self, body: bytes) -> None:
+        """Phase 2: N-iter agentic chat completion. Supports stream=true."""
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_json(400, {"error": {"message": "Request body is not valid JSON", "type": "bad_request"}})
+            return
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            self._send_json(400, {"error": {"message": "'messages' is required", "type": "bad_request"}})
+            return
+        model_from_payload = str(payload.get("model") or "")
+        cfg = _build_agent_config(model_from_payload)
+        if not cfg.model:
+            self._send_json(400, {"error": {"message": "'model' is required (or set ADAPTER_AGENT_MODEL)", "type": "bad_request"}})
+            return
+        registry = _get_agent_registry()
+        # Forward all non-loop-related sampling params (temperature, max_tokens, etc.)
+        extra = {
+            k: v
+            for k, v in payload.items()
+            if k not in {"messages", "model", "stream", "tools", "tool_choice", "parallel_tool_calls"}
+        }
+        # Inject a sane max_tokens default when the client didn't set one —
+        # agentic answers need headroom or they truncate mid-thought.
+        if not extra.get("max_tokens") and not extra.get("max_completion_tokens"):
+            extra["max_tokens"] = AGENT_DEFAULT_MAX_TOKENS
+        stream = bool(payload.get("stream"))
+        if stream:
+            self._handle_agent_chat_stream(cfg, registry, messages, extra)
+        else:
+            self._handle_agent_chat_blocking(cfg, registry, messages, extra)
+
+    def _handle_agent_chat_blocking(
+        self,
+        cfg: AgentConfig,
+        registry: ToolRegistry,
+        messages: list[dict[str, Any]],
+        extra: dict[str, Any],
+    ) -> None:
+        try:
+            response, trace = _run_agent_loop(
+                messages=messages,
+                cfg=cfg,
+                registry=registry,
+                extra_payload=extra,
+                progress_cb=self._agent_console_progress,
+            )
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:2000]
+            self._send_json(exc.code, {"error": {"message": f"upstream HTTP {exc.code}: {detail}", "type": "upstream_error"}})
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(502, {"error": {"message": f"{type(exc).__name__}: {exc}", "type": "agent_error"}})
+            return
+        trace_dict = {
+            "iterations": trace.iterations,
+            "stopped_reason": trace.stopped_reason,
+            "tool_calls": trace.tool_calls,
+            "upstream_latencies_ms": trace.upstream_latencies_ms,
+            "searches_used": trace.searches_used,
+            "fetches_used": trace.fetches_used,
+            "duplicate_calls_skipped": trace.duplicate_calls_skipped,
+            "tool_call_leaks_stripped": trace.tool_call_leaks_stripped,
+            "verified_urls": sorted(trace.verified_urls),
+            "unverified_urls_in_answer": trace.unverified_urls_in_answer,
+            "final_finish_reason": trace.final_finish_reason,
+            "answer_truncated": trace.answer_truncated,
+            "elapsed_total_ms": int((time.time() - trace.started_at) * 1000),
+        }
+        response["x_adapter_agent_trace"] = trace_dict
+        self._log_agent_run(trace_dict, cfg.model, stream=False)
+        self._send_json(200, response)
+
+    def _handle_agent_chat_stream(
+        self,
+        cfg: AgentConfig,
+        registry: ToolRegistry,
+        messages: list[dict[str, Any]],
+        extra: dict[str, Any],
+    ) -> None:
+        """Stream agent events as SSE — progress chunks first, then the final
+        upstream completion chunks, then a trace chunk, then [DONE]."""
+        self._send_stream_headers()
+        final_trace: dict[str, Any] | None = None
+        try:
+            for event in _run_agent_stream(
+                messages=messages,
+                cfg=cfg,
+                registry=registry,
+                extra_payload=extra,
+            ):
+                self._write_sse_data(event)
+                # Echo server-side log mirror for debugging
+                if "x_adapter_agent_progress" in event:
+                    prog = event["x_adapter_agent_progress"]
+                    self._agent_console_progress(
+                        prog.get("stage", ""),
+                        prog.get("message", ""),
+                        {k: v for k, v in prog.items() if k not in {"stage", "message"}},
+                    )
+                if "x_adapter_agent_trace" in event:
+                    final_trace = event["x_adapter_agent_trace"]
+            self._write_sse_done()
+            self._finish_chunked()
+            self.close_connection = True
+            if final_trace is not None:
+                self._log_agent_run(final_trace, cfg.model, stream=True)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:2000]
+            self._write_sse_error(f"upstream HTTP {exc.code}: {detail}")
+            self._write_sse_done()
+            self._finish_chunked()
+            self.close_connection = True
+        except Exception as exc:  # noqa: BLE001
+            self._write_sse_error(f"{type(exc).__name__}: {exc}")
+            self._write_sse_done()
+            self._finish_chunked()
+            self.close_connection = True
+
     def do_POST(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(content_length) if content_length else b""
         path_only = self.path.split("?", 1)[0]
+        # Agentic endpoint — separate from the passive /web/v1 path
+        if path_only.startswith("/v1/agent/") and path_only.endswith("/chat/completions"):
+            self._handle_agent_chat(body)
+            return
         if path_only.endswith("/chat/completions") or path_only.endswith("/responses"):
             try:
                 payload = json.loads(body.decode("utf-8"))
@@ -2083,8 +2698,11 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(
-        f"adapter listening on http://{HOST}:{PORT}/v1 and /web/v1 -> {UPSTREAM} "
-        f"(document=true web={WEB_ENABLED} search_provider={WEB_SEARCH_PROVIDER})",
+        f"adapter listening on http://{HOST}:{PORT}/v1, /web/v1, /v1/agent -> {UPSTREAM} "
+        f"(document=true web={WEB_ENABLED} search_provider={WEB_SEARCH_PROVIDER} "
+        f"agentic_web=phase3 agent_model={AGENT_MODEL or '<from-payload>'} "
+        f"max_iter={AGENT_MAX_ITERATIONS} max_fetch={AGENT_MAX_FETCHES} max_search={AGENT_MAX_SEARCHES} "
+        f"web_view={'on' if AGENT_WEB_VIEW_ENABLED else 'off'} fetch_fallback_min={AGENT_FETCH_FALLBACK_MIN_CHARS})",
         flush=True,
     )
     server.serve_forever()
