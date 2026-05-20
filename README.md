@@ -22,6 +22,7 @@
 | PDF 与 Office 处理 | 可提取文本；在 LibreOffice/PyMuPDF 可用时渲染部分页面、幻灯片或表格为图片 |
 | 表格理解 | 保留工作表名、预览行、单元格坐标、公式、缓存值、合并单元格和表格范围 |
 | 联网增强 | `/web/v1` 可读取 URL、执行搜索、注入来源上下文，并要求模型引用来源链接 |
+| Agentic 联网 | `/v1/agent` 由模型驱动多轮工具调用循环：搜索、抓取、浏览器截图，自带预算控制和引用合规校验 |
 | 流式响应 | 保留 SSE streaming，可在模型生成前输出简短进度信息 |
 | 安全防护 | 联网读取时阻断 localhost、私有网段、link-local、metadata endpoint 等目标 |
 | 可排障性 | 行为显式，便于对比 adapter 转发链路和上游直连链路 |
@@ -32,14 +33,15 @@
 Client / SDK / Tool
         |
         v
-adapter (/v1 or /web/v1)
+adapter (/v1  |  /web/v1  |  /v1/agent)
         |
         v
 OpenAI-compatible upstream model server
 ```
 
 - `/v1` 默认关闭联网：`web_mode=off`
-- `/web/v1` 默认自动判断是否联网：`web_mode=auto`
+- `/web/v1` 默认自动判断是否联网（被动注入）：`web_mode=auto`
+- `/v1/agent` agentic 联网：模型自主多轮工具调用循环
 
 ### API 形态
 
@@ -101,7 +103,7 @@ adapter 接受 OpenAI-style 请求。支持文件的客户端可以在 `content`
 | 功能 | 说明 |
 |---|---|
 | URL fetch | 从最新用户消息中读取显式 `http/https` URL |
-| Search | 支持 `bing_html`、`duckduckgo`、`tavily` 和 `bing` 搜索 provider |
+| Search | 支持 `searxng`、`baidu`、`bing_html`、`duckduckgo`、`tavily`、`bing` 搜索 provider，主 provider 失败可降级 |
 | Source injection | 将标题、URL、正文和检索时间作为不可信外部上下文注入 |
 | Citations | 要求模型在基于联网资料回答时列出来源 URL |
 | Progress | 流式响应中可输出简短进度提示 |
@@ -109,6 +111,33 @@ adapter 接受 OpenAI-style 请求。支持文件的客户端可以在 `content`
 | SSRF protection | 每次 fetch 和 redirect 都会校验目标地址 |
 
 当客户端已经传入 `system` 或 `developer` 消息时，adapter 会把联网检索上下文合并到第一条控制消息前部，并保留原始指令。这可以降低模型忽略联网资料、退回知识截止时间回答的概率。
+
+### Agentic 联网（`/v1/agent`）
+
+`/web/v1` 是被动联网 —— adapter 自己搜索并把资料注入上下文。`/v1/agent` 是 **agentic 联网** —— 由模型驱动一个多轮工具调用循环，自己决定查什么、查几次、读哪些页面。
+
+```text
+POST /v1/agent/chat/completions
+```
+
+循环：模型收到带 `tools` 的请求 → 发出 `tool_calls` → adapter 并行执行工具 → 结果回灌 → 循环若干轮 → 模型不再请求工具时输出最终答案。
+
+| 工具 | 作用 |
+|---|---|
+| `web_search` | 搜索引擎查询，返回标题/URL/摘要列表 |
+| `web_fetch` | 抓取 URL 正文；正文为空（如 JS 渲染的 SPA）时自动回退为截图 |
+| `web_view` | headless 浏览器（Playwright + Chromium）渲染页面并截图，适合图表、SPA、扫描件，截图作为多模态 `image_url` 回传 |
+
+特性：
+
+- **N 轮预算控制** —— 迭代数 / 搜索数 / 抓取数三类上限，防止失控
+- **并行工具调用** —— 单轮多个工具并发执行
+- **SSE 流式** —— 实时进度事件 + 最终答案 token 流
+- **引用合规校验** —— 标记答案中工具未实际访问过的 URL，识别伪造引用
+- **当前日期注入** —— 让模型知道"今天"，避免凭过时记忆作答
+- **并发闸** —— 限制同时在飞的 agent 请求，超限返回 HTTP 429
+
+`web_view` 需要镜像内安装 Chromium。agentic 相关环境变量、SearXNG 部署、上线 checklist 见 `DEPLOYMENT.md`。
 
 ### 环境变量
 
@@ -152,7 +181,7 @@ curl http://127.0.0.1:8000/health
 
 ### Docker
 
-Docker 镜像包含 Python 3.12、LibreOffice、中文字体和 Python 解析依赖。
+Docker 镜像包含 Python 3.12、LibreOffice、中文字体、Python 解析依赖，以及 agentic `web_view` 工具所需的 Playwright + Chromium。
 
 ```bash
 docker build -t adapter:local .
@@ -199,9 +228,11 @@ docker run --rm adapter:check python -m py_compile /app/adapter.py
 | 文件 | 说明 |
 |---|---|
 | `adapter.py` | 主 adapter 服务 |
+| `agentic_web.py` | agentic 联网模块：工具 schema、N 轮循环、流式 |
 | `Dockerfile` | 生产容器镜像 |
 | `requirements.txt` | Python 依赖 |
 | `CAPABILITIES.md` | 详细能力矩阵 |
+| `DEPLOYMENT.md` | 部署指南：环境变量、SearXNG、上线 checklist |
 | `AGENTS.md` | coding agent 协作说明 |
 | `scripts/build_remote_image.sh` | 通用远端 registry 构建辅助脚本 |
 
@@ -224,6 +255,7 @@ The project is deployment-neutral by default. It does not include company-specif
 | Office and PDF handling | Extracts text and can render selected pages/slides/sheets visually when LibreOffice/PyMuPDF are available |
 | Spreadsheet understanding | Preserves sheet names, preview rows, cell coordinates, formulas, cached values, merged ranges, and table ranges |
 | Web augmentation | `/web/v1` can fetch URLs, search the web, inject source context, and ask the model to cite source URLs |
+| Agentic web | `/v1/agent` runs a model-driven tool-calling loop: search, fetch, browser screenshot — with budget control and a citation guard |
 | Streaming | Preserves SSE streaming and can emit short progress messages before model generation |
 | Safety | Blocks localhost, private networks, link-local, metadata endpoints, and other internal targets during web fetches |
 | Debuggability | Keeps adapter behavior explicit so deployments can compare adapter-routed requests with direct upstream calls |
@@ -234,14 +266,15 @@ The project is deployment-neutral by default. It does not include company-specif
 Client / SDK / Tool
         |
         v
-adapter (/v1 or /web/v1)
+adapter (/v1  |  /web/v1  |  /v1/agent)
         |
         v
 OpenAI-compatible upstream model server
 ```
 
 - `/v1` defaults to `web_mode=off`.
-- `/web/v1` defaults to `web_mode=auto`.
+- `/web/v1` defaults to `web_mode=auto` (passive context injection).
+- `/v1/agent` runs an agentic, model-driven tool-calling loop.
 
 ### API Shape
 
@@ -303,7 +336,7 @@ For web-enabled calls:
 | Feature | Description |
 |---|---|
 | URL fetch | Fetches explicit `http/https` URLs from the latest user request |
-| Search | Supports `bing_html`, `duckduckgo`, `tavily`, and `bing` providers |
+| Search | Supports `searxng`, `baidu`, `bing_html`, `duckduckgo`, `tavily`, `bing` providers, with fallback when the primary fails |
 | Source injection | Adds untrusted web context with title, URL, content, and retrieval time |
 | Citations | Instructs the model to list source URLs when answering from web context |
 | Progress | Optional visible progress in SSE streams |
@@ -311,6 +344,38 @@ For web-enabled calls:
 | SSRF protection | Validates target URLs and redirects before every fetch |
 
 If the client already sends `system` or `developer` messages, the adapter prepends web context to the first control message while preserving the original instruction. This helps prevent the model from ignoring retrieved sources and falling back to knowledge-cutoff answers.
+
+### Agentic Web (`/v1/agent`)
+
+`/web/v1` is passive — the adapter searches and injects context itself. `/v1/agent`
+is **agentic** — the model drives a multi-iteration tool-calling loop and decides
+for itself what to search, how many times, and which pages to read.
+
+```text
+POST /v1/agent/chat/completions
+```
+
+Loop: the model receives a request with `tools` → emits `tool_calls` → the adapter
+runs the tools in parallel → results are fed back → repeat for several iterations
+→ the model produces a final answer once it no longer requests tools.
+
+| Tool | Purpose |
+|---|---|
+| `web_search` | Search-engine query; returns a list of title / URL / snippet |
+| `web_fetch` | Fetches page text; auto-falls back to a screenshot when text is empty (e.g. JS-rendered SPAs) |
+| `web_view` | Headless browser (Playwright + Chromium) renders a page and screenshots it — for charts, SPAs, scanned pages; the screenshot is returned as a multimodal `image_url` |
+
+Features:
+
+- **N-iteration budget** — caps on iterations / searches / fetches
+- **Parallel tool calls** — multiple tools dispatched concurrently per turn
+- **SSE streaming** — live progress events plus token-level answer streaming
+- **Citation guard** — flags answer URLs the tools never actually visited
+- **Current-date injection** — tells the model "today" so stale memory is not trusted
+- **Concurrency gate** — caps in-flight agent requests; excess returns HTTP 429
+
+`web_view` requires Chromium in the image. See `DEPLOYMENT.md` for agentic
+environment variables, SearXNG setup, and the deploy checklist.
 
 ### Environment Variables
 
@@ -354,7 +419,7 @@ curl http://127.0.0.1:8000/health
 
 ### Docker
 
-The Docker image includes Python 3.12, LibreOffice, Chinese fonts, and Python parsing dependencies.
+The Docker image includes Python 3.12, LibreOffice, Chinese fonts, Python parsing dependencies, and Playwright + Chromium for the agentic `web_view` tool.
 
 ```bash
 docker build -t adapter:local .
@@ -401,9 +466,11 @@ Suggested behavior checks:
 | File | Purpose |
 |---|---|
 | `adapter.py` | Main adapter service |
+| `agentic_web.py` | Agentic web module: tool schemas, N-iteration loop, streaming |
 | `Dockerfile` | Production container image |
 | `requirements.txt` | Python dependencies |
 | `CAPABILITIES.md` | Detailed capability matrix |
+| `DEPLOYMENT.md` | Deployment guide: env vars, SearXNG, deploy checklist |
 | `AGENTS.md` | Instructions for coding agents |
 | `scripts/build_remote_image.sh` | Generic remote-registry build helper |
 
