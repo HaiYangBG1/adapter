@@ -120,9 +120,11 @@ AGENT_PARALLEL_WORKERS = int(os.environ.get("ADAPTER_AGENT_PARALLEL_WORKERS", "4
 # agentic sessions; requests beyond this limit get HTTP 429 immediately.
 AGENT_MAX_CONCURRENT = int(os.environ.get("ADAPTER_AGENT_MAX_CONCURRENT", "20"))
 # Phase 2: budget control
-AGENT_MAX_ITERATIONS = int(os.environ.get("ADAPTER_AGENT_MAX_ITERATIONS", "5"))
+AGENT_MAX_ITERATIONS = int(os.environ.get("ADAPTER_AGENT_MAX_ITERATIONS", "6"))
 AGENT_MAX_FETCHES = int(os.environ.get("ADAPTER_AGENT_MAX_FETCHES", "8"))
 AGENT_MAX_SEARCHES = int(os.environ.get("ADAPTER_AGENT_MAX_SEARCHES", "8"))
+# Times the loop forces a "dig deeper" round when the answer hedges on stale data
+AGENT_MAX_PUSHBACKS = int(os.environ.get("ADAPTER_AGENT_MAX_PUSHBACKS", "2"))
 # Phase 3: vision tool (web_view) — controls browser screenshot fallback
 AGENT_WEB_VIEW_ENABLED = os.environ.get("ADAPTER_AGENT_WEB_VIEW_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 AGENT_WEB_VIEW_VIEWPORT = os.environ.get("ADAPTER_AGENT_WEB_VIEW_VIEWPORT", "1280x1600")
@@ -1286,7 +1288,12 @@ def _search_baidu(query: str, max_results: int) -> list[dict[str, str]]:
         if len(results) >= max_results:
             break
     if not results:
-        raise WebError(f"No Baidu results parsed from {final_url}")
+        # Distinguish Baidu's anti-bot stub from a genuine empty result set so
+        # the failure is diagnosable in logs. Either way raise WebError (not a
+        # NameError) so _search_web's fallback path can catch it.
+        if "百度安全验证" in decoded or "wappass.baidu.com" in decoded:
+            raise WebError("Baidu returned an anti-bot verification page (scraper blocked)")
+        raise WebError(f"No Baidu results parsed from {url}")
     return results
 
 
@@ -1601,6 +1608,7 @@ def _build_agent_config(model_from_payload: str) -> AgentConfig:
         max_iterations=AGENT_MAX_ITERATIONS,
         max_fetches=AGENT_MAX_FETCHES,
         max_searches=AGENT_MAX_SEARCHES,
+        max_pushbacks=AGENT_MAX_PUSHBACKS,
     )
 
 
@@ -2589,6 +2597,7 @@ class Handler(BaseHTTPRequestHandler):
             "fetches_used": trace_dict.get("fetches_used"),
             "duplicate_calls_skipped": trace_dict.get("duplicate_calls_skipped"),
             "tool_call_leaks_stripped": trace_dict.get("tool_call_leaks_stripped"),
+            "pushbacks_used": trace_dict.get("pushbacks_used"),
             "unverified_url_count": len(trace_dict.get("unverified_urls_in_answer", []) or []),
             "answer_truncated": trace_dict.get("answer_truncated"),
             "final_finish_reason": trace_dict.get("final_finish_reason"),
@@ -2689,6 +2698,7 @@ class Handler(BaseHTTPRequestHandler):
             "fetches_used": trace.fetches_used,
             "duplicate_calls_skipped": trace.duplicate_calls_skipped,
             "tool_call_leaks_stripped": trace.tool_call_leaks_stripped,
+            "pushbacks_used": trace.pushbacks_used,
             "verified_urls": sorted(trace.verified_urls),
             "unverified_urls_in_answer": trace.unverified_urls_in_answer,
             "final_finish_reason": trace.final_finish_reason,

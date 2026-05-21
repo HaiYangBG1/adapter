@@ -221,9 +221,14 @@ DEFAULT_TOOLS: list[dict[str, Any]] = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, WEB_VIEW
 DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
     "你是一个具备联网检索 + 视觉读图能力的助手。\n"
     "\n"
-    "【当前时间】{current_date}（{current_weekday}）。\n"
-    "你的训练语料截止日期早于这一天，因此对**任何涉及具体日期、版本号、"
-    "公司动态、产品发布、官方信息**的问题，你的训练记忆很可能已经过时。\n"
+    "【当前时间】现在是 {current_date}（{current_weekday}），这是**真实世界的今天**。\n"
+    "- 你的训练数据比今天旧，所以 {current_date} 在你的直觉里可能「像是未来」—— "
+    "但它就是现在，请完全接受这一点。\n"
+    "- 「今天」「明天」「本周」「最近」一律以 {current_date} 为基准。明天、后天都是"
+    "**近期、可正常查询**的日期（天气预报、新闻都查得到），**绝不能**因为年份数字较大、"
+    "或感觉「太遥远」「属于未来」就拒绝回答或说查不到。\n"
+    "- 任何涉及具体日期、版本号、公司动态、产品发布、价格、天气、官方信息的问题，"
+    "你的训练记忆很可能已经过时，必须以工具查到的结果为准。\n"
     "\n"
     "工具使用规则（必须严格遵守）：\n"
     "1. 对以下任一类问题，你**必须**先调用 web_search，**绝对禁止**凭记忆回答：\n"
@@ -249,6 +254,17 @@ DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
     "**一律以工具结果为准**，不要用「这可能是网站模板默认值」「应该是未来规划」"
     "之类的理由去推翻工具查到的事实。\n"
     "- 你的训练数据已经过时，工具查到的就是当前现实。\n"
+    "\n"
+    "信息时效性原则（极其重要）：\n"
+    "- 用户问「现在 / 最新 / 当前」的信息时，你必须尽力拿到**尽可能新**的数据。\n"
+    "- 如果你只搜了一两次、或只看到明显过时（比当前日期早很多）的数据 —— "
+    "这是**任务没完成**，不是可接受的答案。\n"
+    "- **严禁**用「可能已增长」「尚未发布最新」「建议查阅官方」「数据持续变化」"
+    "这类免责声明来代替继续努力。出现这种情况时，你应当继续：换不同的关键词重新"
+    "web_search（加上「财报」「年报」「最新」「官方」等词，或拆成子问题），"
+    "并 web_fetch 抓取更权威的来源（官网、财报、近期新闻报道）。\n"
+    "- 只有在确实换了多个角度搜索、也抓取了像样的来源之后仍找不到更新的数据时，"
+    "才可以给出「目前能查到的最新是 X（截至 X 时间）」并说明检索过程。\n"
     "\n"
     "答案规范（极其重要）：\n"
     "- 引用规则：在句末用 [1][2] 标注来源。编号按来源在你**答案中首次出现的先后顺序**，"
@@ -342,9 +358,10 @@ class AgentConfig:
     max_tool_result_chars: int = 8000
     parallel_dispatch_workers: int = 4
     # Phase 2: budget control
-    max_iterations: int = 5          # hard cap on agent turns
+    max_iterations: int = 6          # hard cap on agent turns (room for dig-deeper pushbacks)
     max_fetches: int = 8             # cap on web_fetch + web_view calls per session
     max_searches: int = 8            # cap on web_search calls per session
+    max_pushbacks: int = 2           # times the loop forces "dig deeper" on a stale/hedged answer
 
 
 @dataclass
@@ -359,6 +376,7 @@ class AgentTrace:
     fetches_used: int = 0
     duplicate_calls_skipped: int = 0
     tool_call_leaks_stripped: int = 0    # safety-net cleanup of leaked <tool_call> markup
+    pushbacks_used: int = 0              # times the loop forced "dig deeper" on a stale/hedged answer
     # Hotfix P0-2: citation guard
     verified_urls: set[str] = field(default_factory=set)  # URLs actually touched by tools this session
     unverified_urls_in_answer: list[str] = field(default_factory=list)  # URLs in final content that weren't touched
@@ -663,6 +681,53 @@ FORCE_ANSWER_SYSTEM_HINT = (
 )
 
 
+# Loop-level "dig deeper" pushback (v0.2.2). When the model finishes with an
+# answer that hedges on stale/incomplete data instead of digging, the loop
+# injects DIG_DEEPER_HINT and runs another iteration (bounded by max_pushbacks).
+DIG_DEEPER_HINT = (
+    "你刚才的回答承认了数据可能过时、不完整、不是用户要的精确信息，"
+    "或者以为某个日期太遥远而查不到。\n"
+    "你的工具预算还很充足 —— 不要用免责声明或「这是未来日期」搪塞过去。\n"
+    "请注意：系统提示里的【当前时间】就是真实的今天，用户问的「明天」「最近」"
+    "都是近期、可以正常查到的日期 —— 搜索结果里与之匹配的天气/新闻就是答案。\n"
+    "现在请立刻继续深挖：\n"
+    "① 换不同的关键词重新 web_search（加上「财报」「年报」「最新」「2026」「官方」"
+    "等限定词，或把问题拆成更具体的子问题）；\n"
+    "② web_fetch 抓取更权威的来源 —— 官网、财报/年报、近期新闻报道，而不是百科条目；\n"
+    "尽力拿到尽可能新的数据，然后再给最终答案。"
+)
+
+# Substrings that signal the answer is hedging with stale/incomplete data
+# rather than having dug for the current figure.
+_HEDGE_PHRASES = (
+    "可能已增长", "可能已经增长", "可能有所增长", "可能进一步", "可能已进一步",
+    "尚未发布", "尚未公布", "尚未更新", "暂未发布", "未发布最新", "尚无最新", "尚无官方",
+    "未找到最新", "没找到最新", "未能找到最新", "未查到", "没有找到关于", "没有查到",
+    "并非最新", "不是最新", "可能并非", "可能不是最新", "未必是最新",
+    "建议查阅", "建议关注", "建议访问", "请查阅", "查阅其官方", "以官方",
+    "无法确认", "无法查询到", "无法获取", "无法提供", "暂无最新", "暂时没有",
+    "再查询", "稍后查询", "自行查询", "自行核实", "建议您查询",
+    "可能已经发生变化", "可能已发生变化", "持续动态变化", "动态变化", "持续增长",
+    "需要查阅", "需查阅", "最新精确数字", "确切.*数据", "可能并不准确",
+)
+
+
+def _answer_needs_more_digging(content: str, searches_used: int = 0) -> bool:
+    """Heuristic: does the assistant's final answer hedge with stale/incomplete
+    data — or give up — instead of having dug for the current figure? Triggers
+    the loop's bounded 'dig deeper' pushback."""
+    if not isinstance(content, str) or not content:
+        return False
+    # Self-contradiction: the model ran searches this turn yet still appended the
+    # "based on training data, not verified online" disclaimer. It searched, came
+    # up short, and punted instead of digging deeper — a clear under-dig signal.
+    if searches_used > 0 and ("未联网核实" in content or "本回答基于训练数据" in content):
+        return True
+    if any(p in content for p in _HEDGE_PHRASES if "." not in p):
+        return True
+    return bool(re.search("|".join(p for p in _HEDGE_PHRASES if "." in p), content))
+
+
 def _audit_final_citations(content: str, trace: AgentTrace) -> None:
     """Find URLs in final content that weren't actually visited by tools.
 
@@ -712,7 +777,180 @@ def _annotate_final_message(message: dict[str, Any], trace: AgentTrace) -> None:
     # 2) Citation audit (Hotfix P0-2)
     _audit_final_citations(content, trace)
     content = content + _citation_warning_text(trace.unverified_urls_in_answer)
+    # 3) Empty-answer safety net — never ship an empty final answer (can happen
+    # if the model emitted only leaked <tool_call> markup that got stripped).
+    if not content.strip():
+        content = "（抱歉，本轮未能整理出最终答案，检索过程可能未收敛。请重试或换一种问法。）"
+        trace.stopped_reason = "answered_empty_fallback"
     message["content"] = content
+
+
+# When the forced-answer iteration fails to produce real prose — the model
+# emits only <tool_call> markup (stripped to nothing) or narrates its next
+# action instead of answering — we fall back to a RAG-style synthesis call.
+# It is a FRESH request that contains no tool-call scaffolding at all: just the
+# conversation, a plain-text digest of everything the tools found, and an
+# instruction to answer. With no <tool_call>/tool-result pairs in context the
+# model has no pattern to imitate, so it reliably writes prose instead of
+# trying to keep digging.
+SYNTHESIS_SYSTEM_PROMPT = (
+    "你是一个严谨的中文助理。下面会给你一段对话，以及为回答用户最后一个问题"
+    "而检索到的【资料】。你已经没有任何工具可用，唯一的任务就是基于这些资料"
+    "写出最终答案。\n"
+    "要求：\n"
+    "- 开门见山给出结论和关键数据，**禁止**写「我将」「我会」「接下来」「让我」"
+    "「为了回答」之类描述下一步动作的话 —— 直接给答案本身。\n"
+    "- 句末用 [1][2] 标注来源，编号按其在答案中首次出现的顺序从 [1] 起连续递增。\n"
+    "- 答案末尾追加 'Sources:'，逐行列出每个编号对应的 URL，只能用【资料】中"
+    "真实出现过的 URL。\n"
+    "- 资料不足以给出精确答案时，明确说明你能确认什么、还缺什么，"
+    "并给出资料里能查到的最接近的信息。\n"
+    "- **绝对禁止**输出 <tool_call> 标签或任何 JSON 工具调用语法。"
+)
+
+SYNTHESIS_USER_PREFIX = "【为回答上面最后一个问题，已检索到以下资料】\n\n"
+SYNTHESIS_USER_SUFFIX = "\n\n请立即依据以上资料，用中文写出完整、直接的最终答案。"
+SYNTHESIS_NO_EVIDENCE = "（本次没有成功检索到外部资料，请基于你已知的信息谨慎作答并说明未联网核实。）"
+
+# Short, first-person phrases that signal the model is narrating its NEXT
+# action instead of answering ("我将尝试访问…官网"). Treated as a leak — not a
+# real answer — only when the whole message is short.
+_INTENT_LEAD_PHRASES = (
+    "我将", "我会去", "我会先", "我会尝试", "我现在", "我先", "我需要先",
+    "我需要查", "我打算", "我准备", "我马上", "我去查", "我来查", "让我",
+    "接下来我", "接下来，我", "下一步", "我接下来", "首先我", "我要先",
+    "我应该先", "为了回答", "为了获取", "为了找到", "为了查",
+)
+
+
+def _looks_like_intent_not_answer(text: str) -> bool:
+    """The model sometimes narrates its next tool action instead of answering
+    ('我将尝试访问麦当劳的投资者关系页面…'). A short message that opens with a
+    first-person intent phrase is such a leak, not a real final answer."""
+    t = (text or "").strip()
+    if not t or len(t) >= 160:
+        return False
+    head = t[:20]
+    return any(p in head for p in _INTENT_LEAD_PHRASES)
+
+
+def _collect_tool_evidence(
+    augmented: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Pull every tool result out of the loop conversation into a plain-text
+    digest plus a list of image content-parts (from web_view / vision fallback).
+
+    The digest deliberately drops all tool-call scaffolding so a fresh
+    synthesis call sees only evidence — no <tool_call>/tool-result pattern to
+    imitate.
+    """
+    text_chunks: list[str] = []
+    image_parts: list[dict[str, Any]] = []
+    idx = 0
+    for m in augmented:
+        if m.get("role") != "tool":
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            texts: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text" and part.get("text"):
+                    texts.append(str(part["text"]))
+                elif part.get("type") == "image_url":
+                    image_parts.append(part)
+            content = "\n".join(texts)
+        if isinstance(content, str) and content.strip():
+            idx += 1
+            text_chunks.append(f"【资料{idx}】\n{content.strip()}")
+    return "\n\n".join(text_chunks), image_parts
+
+
+def _build_synthesis_messages(
+    augmented: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build a fresh, tool-free message list for the synthesis call: our own
+    system prompt, the plain user/assistant turns (scaffolding stripped), and a
+    final user turn carrying the evidence digest (plus any screenshots)."""
+    msgs: list[dict[str, Any]] = [
+        {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT}
+    ]
+    for m in augmented:
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        if role == "assistant" and m.get("tool_calls"):
+            continue  # drop tool-call requests — keep only plain prose turns
+        content = m.get("content")
+        if role == "assistant" and isinstance(content, str):
+            content, _ = _strip_tool_call_leaks(content)
+        if content in (None, "") or (isinstance(content, str) and not content.strip()):
+            continue
+        msgs.append({"role": role, "content": content})
+    digest, image_parts = _collect_tool_evidence(augmented)
+    user_text = SYNTHESIS_USER_PREFIX + (digest or SYNTHESIS_NO_EVIDENCE) + SYNTHESIS_USER_SUFFIX
+    if image_parts:
+        msgs.append(
+            {"role": "user", "content": [{"type": "text", "text": user_text}, *image_parts]}
+        )
+    else:
+        msgs.append({"role": "user", "content": user_text})
+    return msgs
+
+
+def _synthesize_answer(
+    cfg: AgentConfig,
+    augmented: list[dict[str, Any]],
+    extra_payload: Optional[dict[str, Any]],
+    trace: AgentTrace,
+) -> str:
+    """RAG-style fallback: answer from a digest of tool results in a fresh,
+    tool-free request. Reliable because the request carries no tool-call
+    scaffolding for the model to imitate. Returns cleaned prose (empty only if
+    the upstream call itself fails)."""
+    msgs = _build_synthesis_messages(augmented)
+    t0 = time.time()
+    try:
+        resp = _call_upstream(cfg, msgs, [], extra_payload)
+    except Exception:  # noqa: BLE001
+        return ""
+    trace.upstream_latencies_ms.append(int((time.time() - t0) * 1000))
+    choices = resp.get("choices", [])
+    if not choices:
+        return ""
+    content = (choices[0].get("message", {}) or {}).get("content") or ""
+    cleaned, _ = _strip_tool_call_leaks(content)
+    return cleaned.strip()
+
+
+def _finalize_answer(
+    msg: dict[str, Any],
+    cfg: AgentConfig,
+    augmented: list[dict[str, Any]],
+    extra_payload: Optional[dict[str, Any]],
+    trace: AgentTrace,
+) -> None:
+    """Ensure the final assistant message carries a real answer, then annotate.
+
+    The forced-answer iteration sometimes comes back unusable — either empty
+    (the model emitted only <tool_call> markup, stripped to nothing) or a
+    leaked intent fragment ('我将尝试访问…'). In both cases we run ONE
+    synthesis pass (RAG-style, tool-free) which reliably produces prose. If
+    that upstream call also fails, the raw unusable content is dropped so the
+    empty-answer safety net in _annotate_final_message takes over.
+    """
+    raw = msg.get("content") or ""
+    stripped, _ = _strip_tool_call_leaks(raw)
+    needs_synthesis = (not stripped.strip()) or _looks_like_intent_not_answer(stripped)
+    if needs_synthesis:
+        synthesized = _synthesize_answer(cfg, augmented, extra_payload, trace)
+        if synthesized:
+            msg["content"] = synthesized
+            trace.stopped_reason = "answered_synthesized"
+        else:
+            msg["content"] = ""  # let _annotate_final_message ship the safety-net text
+    _annotate_final_message(msg, trace)
 
 
 def _is_final_message(choice: dict[str, Any]) -> bool:
@@ -773,11 +1011,28 @@ def run_agent(
 
         choice = choices[0]
         if _is_final_message(choice):
+            msg = choice.get("message", {}) or {}
+            # Loop-level "dig deeper" pushback: if the answer hedges on stale/
+            # incomplete data and there is room left to both dig AND answer
+            # (>= 2 iterations remaining), push for another round.
+            if (
+                iteration <= cfg.max_iterations - 2
+                and trace.pushbacks_used < cfg.max_pushbacks
+                and _answer_needs_more_digging(msg.get("content") or "", trace.searches_used)
+            ):
+                trace.pushbacks_used += 1
+                _emit(
+                    progress_cb,
+                    "agent_dig_deeper",
+                    f"答案疑似过时/不完整，要求继续深挖（第 {trace.pushbacks_used} 次）",
+                    pushback=trace.pushbacks_used,
+                )
+                augmented = augmented + [msg, {"role": "system", "content": DIG_DEEPER_HINT}]
+                continue
             trace.stopped_reason = "answered"
             trace.final_finish_reason = str(choice.get("finish_reason") or "")
             trace.answer_truncated = trace.final_finish_reason == "length"
-            msg = choice.get("message", {}) or {}
-            _annotate_final_message(msg, trace)
+            _finalize_answer(msg, cfg, augmented, extra_payload, trace)
             if trace.tool_call_leaks_stripped:
                 _emit(
                     progress_cb,
@@ -852,6 +1107,7 @@ def _sse_trace_chunk(model: str, trace: AgentTrace) -> dict[str, Any]:
             "fetches_used": trace.fetches_used,
             "duplicate_calls_skipped": trace.duplicate_calls_skipped,
             "tool_call_leaks_stripped": trace.tool_call_leaks_stripped,
+            "pushbacks_used": trace.pushbacks_used,
             "verified_urls": sorted(trace.verified_urls),
             "unverified_urls_in_answer": trace.unverified_urls_in_answer,
             "final_finish_reason": trace.final_finish_reason,
@@ -935,7 +1191,7 @@ def run_agent_stream(
             trace.final_finish_reason = str(choice.get("finish_reason") or "")
             trace.answer_truncated = trace.final_finish_reason == "length"
             msg = choice.get("message", {}) or {}
-            _annotate_final_message(msg, trace)
+            _finalize_answer(msg, cfg, augmented, extra_payload, trace)
             cleaned = msg.get("content") or ""
             trace.stopped_reason = trace.stopped_reason or "answered_forced"
             yield {
@@ -958,23 +1214,13 @@ def run_agent_stream(
             yield _sse_trace_chunk(model, trace)
             return
 
-        # Intermediate iterations: stream the upstream call so the model's
-        # answer (when it answers) reaches the client token-by-token. When the
-        # turn is a tool-call turn instead, no content is produced (Qwen3-VL
-        # emits either content OR tool_calls, never both), so forwarding
-        # content deltas live is safe.
+        # Intermediate iterations: non-streaming call so the answer can be
+        # inspected (citation audit, dig-deeper pushback) before it reaches the
+        # client. Progress events still stream live; the accepted final answer
+        # is emitted as content chunk(s) once the loop decides to keep it.
         t0 = time.time()
-        streamed_content = ""
-        tool_calls: list[dict[str, Any]] = []
-        finish_reason = ""
         try:
-            for item in _stream_upstream_iteration(
-                cfg, current_messages, current_tools, extra_payload
-            ):
-                if item[0] == "content":
-                    yield item[1]  # forward token delta to client immediately
-                else:  # ("final", content, tool_calls, finish_reason)
-                    streamed_content, tool_calls, finish_reason = item[1], item[2], item[3]
+            resp = _call_upstream(cfg, current_messages, current_tools, extra_payload)
         except Exception as exc:  # noqa: BLE001
             yield _sse_progress_chunk(model, "agent_error", f"upstream error: {exc}", iteration=iteration)
             trace.stopped_reason = "upstream_error"
@@ -983,39 +1229,61 @@ def run_agent_stream(
         trace.upstream_latencies_ms.append(int((time.time() - t0) * 1000))
         trace.iterations = iteration
 
-        if finish_reason != "tool_calls" or not tool_calls:
-            # Model answered directly — content already streamed live above.
+        choices = resp.get("choices", [])
+        if not choices:
+            trace.stopped_reason = "no_choices"
+            yield _sse_progress_chunk(model, "agent_warn", "upstream returned no choices")
+            yield _sse_trace_chunk(model, trace)
+            return
+
+        choice = choices[0]
+        if _is_final_message(choice):
+            msg = choice.get("message", {}) or {}
+            # Loop-level "dig deeper" pushback — only when there is room left
+            # to both dig AND answer (>= 2 iterations remaining).
+            if (
+                iteration <= cfg.max_iterations - 2
+                and trace.pushbacks_used < cfg.max_pushbacks
+                and _answer_needs_more_digging(msg.get("content") or "", trace.searches_used)
+            ):
+                trace.pushbacks_used += 1
+                progress_cb(
+                    "agent_dig_deeper",
+                    f"答案疑似过时/不完整，要求继续深挖（第 {trace.pushbacks_used} 次）",
+                    {"pushback": trace.pushbacks_used},
+                )
+                yield from _drain_queue()
+                augmented = augmented + [msg, {"role": "system", "content": DIG_DEEPER_HINT}]
+                continue
+            # Accept — annotate and emit the answer as content chunks.
             trace.stopped_reason = "answered"
-            trace.final_finish_reason = finish_reason
-            trace.answer_truncated = finish_reason == "length"
-            # Citation audit: content was already sent, so we can't edit it —
-            # surface any warning as a trailing content chunk instead.
-            _audit_final_citations(streamed_content, trace)
-            warning = _citation_warning_text(trace.unverified_urls_in_answer)
-            if warning:
-                yield {
-                    "id": "agent-citation-warn",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": warning}, "finish_reason": None}],
-                }
+            trace.final_finish_reason = str(choice.get("finish_reason") or "")
+            trace.answer_truncated = trace.final_finish_reason == "length"
+            _finalize_answer(msg, cfg, augmented, extra_payload, trace)
+            content = msg.get("content") or ""
             yield {
-                "id": "agent-final",
+                "id": resp.get("id", "agent-final"),
                 "object": "chat.completion.chunk",
-                "created": int(time.time()),
+                "created": resp.get("created", int(time.time())),
+                "model": model,
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None}
+                ],
+            }
+            yield {
+                "id": resp.get("id", "agent-final"),
+                "object": "chat.completion.chunk",
+                "created": resp.get("created", int(time.time())),
                 "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": resp.get("usage"),
             }
             yield _sse_trace_chunk(model, trace)
             return
 
         # Tool calls present — dispatch and continue
-        message = {
-            "role": "assistant",
-            "content": streamed_content or None,
-            "tool_calls": tool_calls,
-        }
+        message = choice.get("message", {}) or {}
+        tool_calls = message.get("tool_calls") or []
         progress_cb(
             "tools_dispatch",
             f"模型请求 {len(tool_calls)} 个工具调用",
@@ -1029,60 +1297,8 @@ def run_agent_stream(
         augmented = augmented + [message] + tool_messages
 
 
-def _stream_upstream_iteration(
-    cfg: AgentConfig,
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]],
-    extra: Optional[dict[str, Any]],
-):
-    """Generator over one streaming upstream call (Phase 4 P3 — true streaming).
-
-    Yields:
-      ("content", <openai chunk dict>)  — for each delta carrying text content
-      ("final", content_str, tool_calls, finish_reason)  — once, at the end
-
-    Streaming tool_calls arrive fragmented across chunks (the ``arguments``
-    string is split); we accumulate them by ``index`` and reassemble.
-    """
-    req = _build_upstream_request(cfg, messages, tools, extra, stream=True)
-    content_parts: list[str] = []
-    tc_acc: dict[int, dict[str, Any]] = {}
-    finish_reason = ""
-    with urllib.request.urlopen(req, timeout=cfg.request_timeout) as resp:
-        for raw_line in resp:
-            line = raw_line.strip()
-            if not line.startswith(b"data:"):
-                continue
-            payload = line[5:].strip()
-            if payload == b"[DONE]":
-                break
-            try:
-                chunk = json.loads(payload.decode("utf-8"))
-            except json.JSONDecodeError:
-                continue
-            choices = chunk.get("choices") or []
-            if not choices:
-                continue
-            ch = choices[0]
-            if ch.get("finish_reason"):
-                finish_reason = ch["finish_reason"]
-            delta = ch.get("delta") or {}
-            text = delta.get("content")
-            if text:
-                content_parts.append(text)
-                yield ("content", chunk)
-            for tc in delta.get("tool_calls") or []:
-                idx = tc.get("index", 0)
-                slot = tc_acc.setdefault(
-                    idx,
-                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
-                )
-                if tc.get("id"):
-                    slot["id"] = tc["id"]
-                fn = tc.get("function") or {}
-                if fn.get("name"):
-                    slot["function"]["name"] = fn["name"]
-                if fn.get("arguments"):
-                    slot["function"]["arguments"] += fn["arguments"]
-    tool_calls = [tc_acc[i] for i in sorted(tc_acc)]
-    yield ("final", "".join(content_parts), tool_calls, finish_reason)
+# Note: an earlier variant streamed each intermediate iteration's tokens to
+# the client live. That was replaced by non-streaming iteration calls so the
+# loop can inspect an answer (citation audit + dig-deeper pushback) before it
+# reaches the client. Progress events still stream; the accepted final answer
+# is emitted as content chunk(s).
