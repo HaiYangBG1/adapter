@@ -1117,6 +1117,34 @@ def _sse_trace_chunk(model: str, trace: AgentTrace) -> dict[str, Any]:
     }
 
 
+def _stream_final_answer(model: str, content: str, resp: dict[str, Any]):
+    """Emit a finalized answer string as a canonical OpenAI streaming sequence:
+    one role-only opening chunk, then small content chunks, then the stop chunk.
+
+    Splitting role and content into *separate* chunks — and the content into
+    small pieces — matches the token-by-token shape that proxies (e.g. LiteLLM)
+    and chat UIs reliably render. A single combined {"role","content"} delta can
+    have its content silently dropped by a proxy, surfacing as an empty reply.
+    """
+    chunk_id = resp.get("id") or "agent-final"
+    created = resp.get("created") or int(time.time())
+    base = {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model}
+    # 1) opening chunk carries only the role
+    yield {**base, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+    # 2) the answer text, in small content-only chunks
+    step = 64
+    for i in range(0, len(content), step):
+        yield {
+            **base,
+            "choices": [{"index": 0, "delta": {"content": content[i:i + step]}, "finish_reason": None}],
+        }
+    # 3) terminal stop chunk
+    stop = {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+    if resp.get("usage"):
+        stop["usage"] = resp["usage"]
+    yield stop
+
+
 def run_agent_stream(
     messages: list[dict[str, Any]],
     cfg: AgentConfig,
@@ -1194,23 +1222,7 @@ def run_agent_stream(
             _finalize_answer(msg, cfg, augmented, extra_payload, trace)
             cleaned = msg.get("content") or ""
             trace.stopped_reason = trace.stopped_reason or "answered_forced"
-            yield {
-                "id": resp.get("id", "agent-final"),
-                "object": "chat.completion.chunk",
-                "created": resp.get("created", int(time.time())),
-                "model": model,
-                "choices": [
-                    {"index": 0, "delta": {"role": "assistant", "content": cleaned}, "finish_reason": None}
-                ],
-            }
-            yield {
-                "id": resp.get("id", "agent-final"),
-                "object": "chat.completion.chunk",
-                "created": resp.get("created", int(time.time())),
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": resp.get("usage"),
-            }
+            yield from _stream_final_answer(model, cleaned, resp)
             yield _sse_trace_chunk(model, trace)
             return
 
@@ -1261,23 +1273,7 @@ def run_agent_stream(
             trace.answer_truncated = trace.final_finish_reason == "length"
             _finalize_answer(msg, cfg, augmented, extra_payload, trace)
             content = msg.get("content") or ""
-            yield {
-                "id": resp.get("id", "agent-final"),
-                "object": "chat.completion.chunk",
-                "created": resp.get("created", int(time.time())),
-                "model": model,
-                "choices": [
-                    {"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None}
-                ],
-            }
-            yield {
-                "id": resp.get("id", "agent-final"),
-                "object": "chat.completion.chunk",
-                "created": resp.get("created", int(time.time())),
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": resp.get("usage"),
-            }
+            yield from _stream_final_answer(model, content, resp)
             yield _sse_trace_chunk(model, trace)
             return
 
