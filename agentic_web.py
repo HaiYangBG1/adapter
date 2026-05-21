@@ -417,7 +417,8 @@ def _build_upstream_request(
         payload["parallel_tool_calls"] = True
     if extra:
         for key, value in extra.items():
-            if key in {"messages", "tools", "tool_choice", "stream", "model"}:
+            # `stream`/`stream_options` excluded: internal agentic calls are non-streaming.
+            if key in {"messages", "tools", "tool_choice", "stream", "stream_options", "model"}:
                 continue
             payload[key] = value
     headers = {
