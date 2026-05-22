@@ -72,6 +72,16 @@ OFFICE_RENDER_TIMEOUT = int(os.environ.get("ADAPTER_OFFICE_RENDER_TIMEOUT", "45"
 OFFICE_RENDER_ENABLED = os.environ.get("ADAPTER_ENABLE_OFFICE_RENDER", "1").lower() not in {"0", "false", "no", "off"}
 LIBREOFFICE_BIN = os.environ.get("ADAPTER_LIBREOFFICE_BIN", "")
 
+# POST /render —— 把 office 文档(pptx/docx/xlsx)逐页渲染成图片,供多模态
+# 理解(让视觉模型直接「看」页面,而非抽文字)。与 chat 路径的 office 渲染
+# (MAX_RENDER_PAGES / MAX_OFFICE_IMAGES,为内联进对话而设的小上限)互不影响。
+RENDER_MAX_PAGES = int(os.environ.get("ADAPTER_RENDER_MAX_PAGES", "60"))
+RENDER_JPEG_QUALITY = int(os.environ.get("ADAPTER_RENDER_JPEG_QUALITY", "85"))
+RENDER_MAX_LONG_SIDE = int(os.environ.get("ADAPTER_RENDER_MAX_LONG_SIDE", "1920"))
+RENDER_MAX_BYTES = int(os.environ.get("ADAPTER_RENDER_MAX_BYTES", str(50 * 1024 * 1024)))
+RENDER_CONCURRENCY = int(os.environ.get("ADAPTER_RENDER_CONCURRENCY", "2"))
+_render_sem = threading.Semaphore(RENDER_CONCURRENCY)
+
 WEB_ENABLED = os.environ.get("ADAPTER_WEB_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 WEB_SEARCH_PROVIDER = os.environ.get("ADAPTER_WEB_SEARCH_PROVIDER", "bing_html").lower()
 # SearXNG self-hosted metasearch — free, no API key. Typically an internal
@@ -1963,13 +1973,14 @@ def _find_libreoffice() -> str | None:
     return None
 
 
-def _render_office_pages(filename: str, data: bytes) -> tuple[list[dict[str, Any]], str]:
+def _office_to_pdf(filename: str, data: bytes) -> tuple[bytes | None, str]:
+    """用 LibreOffice 把 office 文档转成 PDF 字节。返回 (pdf_bytes 或 None, note)。"""
     if not OFFICE_RENDER_ENABLED:
-        return [], "disabled by ADAPTER_ENABLE_OFFICE_RENDER"
+        return None, "disabled by ADAPTER_ENABLE_OFFICE_RENDER"
 
     binary = _find_libreoffice()
     if not binary:
-        return [], "unavailable: LibreOffice/soffice is not installed in this runtime"
+        return None, "unavailable: LibreOffice/soffice is not installed in this runtime"
 
     suffix = pathlib.Path(filename).suffix.lower() or ".xlsx"
     with tempfile.TemporaryDirectory(prefix="adapter-office-render-") as tmp:
@@ -2004,24 +2015,61 @@ def _render_office_pages(filename: str, data: bytes) -> tuple[list[dict[str, Any
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            return [], f"timeout after {OFFICE_RENDER_TIMEOUT}s"
+            return None, f"timeout after {OFFICE_RENDER_TIMEOUT}s"
         except Exception as exc:
-            return [], f"failed to start LibreOffice: {exc}"
+            return None, f"failed to start LibreOffice: {exc}"
 
         if completed.returncode != 0:
             stderr = completed.stderr.decode("utf-8", errors="replace").strip()
             stdout = completed.stdout.decode("utf-8", errors="replace").strip()
             detail = (stderr or stdout or f"exit code {completed.returncode}")[:300]
-            return [], f"failed: {detail}"
+            return None, f"failed: {detail}"
 
         pdf_candidates = sorted(output_dir.glob("*.pdf"))
         if not pdf_candidates:
-            return [], "failed: no PDF output produced"
+            return None, "failed: no PDF output produced"
+        return pdf_candidates[0].read_bytes(), "ok"
 
-        rendered = _render_pdf_pages(pdf_candidates[0].read_bytes())
-        if rendered:
-            return [{"type": "text", "text": f"Rendered spreadsheet visual pages via LibreOffice: {filename}"}] + rendered, "rendered"
-        return [], "PDF produced but no pages could be rendered"
+
+def _render_office_pages(filename: str, data: bytes) -> tuple[list[dict[str, Any]], str]:
+    pdf_bytes, note = _office_to_pdf(filename, data)
+    if pdf_bytes is None:
+        return [], note
+    rendered = _render_pdf_pages(pdf_bytes)
+    if rendered:
+        return [{"type": "text", "text": f"Rendered spreadsheet visual pages via LibreOffice: {filename}"}] + rendered, "rendered"
+    return [], "PDF produced but no pages could be rendered"
+
+
+def _render_office_to_jpegs(filename: str, data: bytes) -> tuple[list[tuple[bytes, str]], int, str]:
+    """把 office 文档(pptx 等)逐页渲染成 JPEG。
+
+    返回 (页图列表[(bytes, mime)], 总页数, note)。总页数 > RENDER_MAX_PAGES 时
+    只渲前 N 页(调用方据「总页数 vs 列表长度」判断是否截断)。供 /render 端点。
+    """
+    pdf_bytes, note = _office_to_pdf(filename, data)
+    if pdf_bytes is None:
+        return [], 0, note
+    try:
+        import fitz  # type: ignore
+    except Exception:
+        return [], 0, "PyMuPDF (fitz) unavailable"
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:  # noqa: BLE001
+        return [], 0, f"failed to open rendered PDF: {exc}"
+    total = len(doc)
+    matrix = fitz.Matrix(max(PDF_RENDER_DPI / 72.0, 1.0), max(PDF_RENDER_DPI / 72.0, 1.0))
+    pages: list[tuple[bytes, str]] = []
+    for index in range(min(total, RENDER_MAX_PAGES)):
+        try:
+            pix = doc[index].get_pixmap(matrix=matrix, alpha=False)
+            img, mime, _size = _compress_screenshot(
+                pix.tobytes("png"), RENDER_MAX_LONG_SIDE, RENDER_JPEG_QUALITY)
+            pages.append((img, mime))
+        except Exception:  # noqa: BLE001
+            continue
+    return pages, total, "ok"
 
 
 def _handle_pdf(filename: str, data: bytes) -> list[dict[str, Any]]:
@@ -2540,6 +2588,41 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(502, {"error": {"message": str(exc), "type": "adapter_proxy_error"}})
 
+    def _handle_render(self, body: bytes) -> None:
+        """POST /render —— 把 office 文档(pptx 等)逐页渲染成图片。
+
+        请求体 = 文件原始字节;文件名经 X-Filename 头传入(决定 LibreOffice
+        按什么格式解析)。响应 = {count,total_pages,truncated,note,pages:[data-url]}。
+        """
+        if not body:
+            self._send_json(400, {"error": {"message": "empty request body", "type": "bad_request"}})
+            return
+        filename = self.headers.get("X-Filename") or "input.pptx"
+        if not _render_sem.acquire(blocking=False):
+            self._send_json(429, {"error": {"message": "render service busy, retry later", "type": "rate_limited"}})
+            return
+        try:
+            pages, total, note = _render_office_to_jpegs(filename, body)
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"error": {"message": f"render failed: {exc}", "type": "render_error"}})
+            return
+        finally:
+            _render_sem.release()
+        if not pages:
+            self._send_json(502, {"error": {"message": f"render produced no pages: {note}", "type": "render_error"}})
+            return
+        data_urls = [
+            f"data:{mime};base64," + base64.b64encode(img).decode("ascii")
+            for img, mime in pages
+        ]
+        self._send_json(200, {
+            "count": len(data_urls),
+            "total_pages": total,
+            "truncated": total > len(data_urls),
+            "note": note,
+            "pages": data_urls,
+        })
+
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -2560,6 +2643,7 @@ class Handler(BaseHTTPRequestHandler):
                     "upstream": UPSTREAM,
                     "capabilities": {
                         "document": True,
+                        "office_render": OFFICE_RENDER_ENABLED,
                         "web": WEB_ENABLED,
                         "web_search_provider": WEB_SEARCH_PROVIDER,
                         "searxng_configured": bool(SEARXNG_URL),
@@ -2757,8 +2841,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(content_length) if content_length else b""
         path_only = self.path.split("?", 1)[0]
+        # POST /render —— office 文档逐页渲染成图片(多模态理解 PPT/幻灯片)
+        if path_only in ("/render", "/v1/render"):
+            if content_length > RENDER_MAX_BYTES:
+                limit_mb = RENDER_MAX_BYTES // (1024 * 1024)
+                self._send_json(413, {"error": {"message": f"file too large (limit {limit_mb}MB)", "type": "too_large"}})
+                return
+            self._handle_render(self.rfile.read(content_length) if content_length else b"")
+            return
+        body = self.rfile.read(content_length) if content_length else b""
         # Agentic endpoint — separate from the passive /web/v1 path
         if path_only.startswith("/v1/agent/") and path_only.endswith("/chat/completions"):
             self._handle_agent_chat(body)
