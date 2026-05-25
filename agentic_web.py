@@ -452,10 +452,15 @@ class AgentConfig:
     # 引用合规审计只对 web 检索有意义;数据类请求(带 excel 数据集)关掉它 ——
     # 否则模型为工具调用编造的占位 URL 会被审计当真、给用户弹"引用合规警告"。
     citation_guard: bool = True
-    # Force-answer 前的 prompt 字数预算:工具结果会累积,Qwen3.5 上下文 256K 但
-    # tokens ≠ chars,中英混合粗算 ~1.5-2 char/token。留出输出预留 + 安全余量后,
-    # 约 ~600K char 比较稳。超阈值时丢最早 role=tool 消息为占位(_truncate_messages_for_budget)。
-    max_context_chars: int = 600_000
+    # Force-answer 前的 prompt 字数预算:工具结果会累积,实测 EAS Qwen3.5 在
+    # 6 轮 search/fetch + force_answer 时会撞 input 上限(HTTP 400 21ms 立刻拒),
+    # 比纸面 256K context 紧得多。v0.2.16 把默认从 600K(基本=disabled)降到 100K:
+    # 100K char × 1.5 token/char ≈ 150K token,留 ~100K token 给输出和模板。
+    # 超阈值时丢最早 role=tool 消息为占位(_truncate_messages_for_budget)。
+    max_context_chars: int = 100_000
+    # force_answer 单独的更紧预算(留更多输出空间)。默认 = max_context_chars * 0.6。
+    # 0 表示沿用 max_context_chars。
+    force_answer_max_context_chars: int = 60_000
     # v0.2.14 空响应兜底:上游 Qwen thinking 模式偶发"只发 reasoning_content,content
     # 为空或只有 \\n\\n,finish_reason 已结束"的 case。检测到这种空响应时,**自动
     # 重试一次**,带 chat_template_kwargs.enable_thinking=false 强制模型直出 content。
@@ -560,9 +565,25 @@ def _stream_upstream(
     OpenAI 标准 dict。``data: [DONE]`` 触发正常退出。
 
     调用方负责处理 ``urllib.error.HTTPError`` / 连接异常(包在 try/except)。
+
+    v0.2.16: HTTPError 抛出前,**把 response body 头 500 char 拼到异常 message**,
+    上层 ``agent_error`` 事件就能看到 EAS 的实际报错(context too long / 鉴权失败
+    等),不再像之前那样只看到一句"HTTP Error 400: Bad Request"。
     """
     req = _build_upstream_request(cfg, messages, tools, extra, stream=True)
-    with urllib.request.urlopen(req, timeout=cfg.request_timeout) as resp:
+    try:
+        resp = urllib.request.urlopen(req, timeout=cfg.request_timeout)
+    except urllib.error.HTTPError as exc:
+        # 读取 response body 拼进异常,方便上层定位 EAS 拒因
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:  # noqa: BLE001
+            body = ""
+        # 重新抛一个带 body 的 HTTPError 给上层 try/except 捕获
+        raise urllib.error.HTTPError(
+            exc.url, exc.code, f"{exc.reason} | body: {body}", exc.headers, None
+        ) from None
+    with resp:
         buffer = b""
         while True:
             try:
@@ -1720,9 +1741,29 @@ def run_agent_stream(
 
         yield from _drain_queue()
 
-        # Context 预算裁剪:超 ~600K char 时丢早期 role=tool 消息,避免 force_answer
-        # 把整段 history 喂上游撑爆 256K 输入(_truncate_messages_for_budget)。
-        current_messages = _truncate_messages_for_budget(current_messages, cfg.max_context_chars)
+        # Context 预算裁剪:超预算时丢早期 role=tool 消息,避免 force_answer 把
+        # 整段 history 喂上游撑爆 EAS 输入上限(实测远低于纸面 256K context)。
+        # v0.2.16: force_answer 单独用更紧 budget(默认 max_context * 0.6),给输出
+        # 留更多空间 —— 这是最容易撞 400 的轮次。
+        budget = cfg.max_context_chars
+        if is_last and cfg.force_answer_max_context_chars:
+            budget = cfg.force_answer_max_context_chars
+        before_chars = _estimate_messages_size(current_messages)
+        current_messages = _truncate_messages_for_budget(current_messages, budget)
+        after_chars = _estimate_messages_size(current_messages)
+        if before_chars != after_chars:
+            progress_cb(
+                "agent_context_trimmed",
+                f"上下文超预算,裁剪早期工具结果({before_chars} → {after_chars} char)",
+                {
+                    "before": before_chars,
+                    "after": after_chars,
+                    "budget": budget,
+                    "iteration": iteration,
+                    "force_answer": is_last,
+                },
+            )
+            yield from _drain_queue()
 
         # ── 主尝试:投机式真流式 ───────────────────────────────────────
         t0 = time.time()
