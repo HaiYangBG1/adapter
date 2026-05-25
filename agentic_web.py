@@ -466,6 +466,14 @@ class AgentConfig:
     # 重试一次**,带 chat_template_kwargs.enable_thinking=false 强制模型直出 content。
     # 仍空就用 reasoning_buf 作兜底答案。0 关闭重试,纯走 reasoning 兜底。
     max_empty_retries: int = 1
+    # v0.2.17 thinking 策略:agentic 循环每轮单独决定是否启用 thinking。
+    # - intermediate(前 N-1 轮,主要任务是"决策调哪个工具"):默认**关**,因为模型
+    #   有 tool_call 这个外置思考机制,内置 chain-of-thought 在 tool-call 决策场景
+    #   下基本是浪费输出 token + 拖慢推理 + 增加触发"只输出 reasoning 忘了 content"
+    #   bug 的概率。关掉直接消灭 v0.2.14 兜底的整类场景。
+    # - force_answer(最后一轮综合所有工具结果作答):默认**开**,质量优先。
+    intermediate_thinking_enabled: bool = False
+    force_answer_thinking_enabled: bool = True
 
 
 @dataclass
@@ -1647,6 +1655,25 @@ def _build_no_thinking_extra(
     return out
 
 
+def _build_iteration_extra(
+    cfg: AgentConfig,
+    is_last: bool,
+    base_extra: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """v0.2.17: 按 cfg 的 thinking 策略,给每轮上游调用注入 enable_thinking 开关。
+
+    intermediate 默认 ``enable_thinking=False``、force_answer 默认开 —— 在每轮
+    `_stream_upstream` 之前调,跟 ``_build_no_thinking_extra`` 共享底层 key 形态。
+    """
+    enabled = (
+        cfg.force_answer_thinking_enabled if is_last else cfg.intermediate_thinking_enabled
+    )
+    if enabled:
+        # 上游默认就是 thinking on,直接返回原 extra 即可
+        return base_extra
+    return _build_no_thinking_extra(base_extra)
+
+
 def run_agent_stream(
     messages: list[dict[str, Any]],
     cfg: AgentConfig,
@@ -1766,9 +1793,12 @@ def run_agent_stream(
             yield from _drain_queue()
 
         # ── 主尝试:投机式真流式 ───────────────────────────────────────
+        # v0.2.17: 按 cfg.intermediate_thinking_enabled / force_answer_thinking_enabled
+        # 注入 enable_thinking 开关 —— 默认中间迭代关、force_answer 开。
+        iter_extra = _build_iteration_extra(cfg, is_last, extra_payload)
         t0 = time.time()
         state: dict[str, Any] = {}
-        for kind, payload in _run_attempt(current_messages, current_tools, extra_payload):
+        for kind, payload in _run_attempt(current_messages, current_tools, iter_extra):
             if kind == "chunk":
                 yield payload
             else:
