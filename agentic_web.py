@@ -94,6 +94,47 @@ def _collect_verified_urls_from_result(result: Any, target: set[str]) -> None:
             _collect_verified_urls_from_result(item, target)
 
 
+def _shape_web_search_sources(result: Any) -> list[dict[str, Any]] | None:
+    """Pull search results out of a web_search tool output and shape them for
+    the SSE ``x_adapter_sources`` event.
+
+    Returns None when the tool errored / returned nothing / shape is unexpected.
+    Each item carries title / url / domain / favicon / snippet — enough for
+    the frontend to render a coral cite chip + hover preview without parsing
+    the markdown ``Sources:`` footer.
+    """
+    if not isinstance(result, dict):
+        return None
+    raw_items = result.get("results")
+    if not isinstance(raw_items, list) or not raw_items:
+        return None
+    out: list[dict[str, Any]] = []
+    for r in raw_items:
+        if not isinstance(r, dict):
+            continue
+        url = str(r.get("url") or "").strip()
+        if not url:
+            continue
+        title = str(r.get("title") or "").strip()
+        snippet = str(r.get("snippet") or r.get("text") or "").strip()
+        try:
+            host = (urllib.parse.urlparse(url).hostname or "").lower()
+        except Exception:  # noqa: BLE001
+            host = ""
+        domain = host[4:] if host.startswith("www.") else host
+        favicon = f"https://{domain}/favicon.ico" if domain else ""
+        if len(snippet) > 240:
+            snippet = snippet[:240].rstrip() + "…"
+        out.append({
+            "title": title or domain or url,
+            "url": url,
+            "domain": domain,
+            "favicon": favicon,
+            "snippet": snippet,
+        })
+    return out or None
+
+
 # Patterns for stripping tool-call markup that leaks into content text when
 # the upstream parser is bypassed (e.g. when tools=[] is sent but the model
 # still tries to invoke tools — see Phase 2 testing).
@@ -212,6 +253,52 @@ WEB_VIEW_TOOL: dict[str, Any] = {
 }
 
 DEFAULT_TOOLS: list[dict[str, Any]] = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, WEB_VIEW_TOOL]
+
+# excel_query —— 仅在请求带有表格数据集时由调用方按需注册(非默认工具)。实现
+# (调后端代码执行服务)由 adapter.py 注入,见 ToolRegistry.register()。
+EXCEL_QUERY_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "excel_query",
+        "description": (
+            "对用户已上传的表格数据集做精确计算与统计 —— 求和、计数、分组、"
+            "排名、占比、多表关联对比等。传入一个用自然语言描述的、要计算的"
+            "具体子问题;工具会写 SQL 在沙箱中执行,返回真实的计算结果(含所用 "
+            "SQL)。\n"
+            "凡涉及具体数字、统计口径、排名或对比,**必须**调用本工具取真实"
+            "结果,不要凭记忆、看图估算或心算。一次只问一个明确的子问题;需要"
+            "多个口径时分多次调用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "要计算的子问题,自然语言描述,尽量具体并自带口径。"
+                        "例:「按城市分组,统计每个城市的门店数量与平均日均"
+                        "销售额,按门店数量降序排列」。"
+                    ),
+                },
+            },
+            "required": ["question"],
+        },
+    },
+}
+
+# 带表格数据集的请求,用这套系统提示词**取代**联网导向的 DEFAULT 提示词。
+# 由来:联网那套的「必搜 / 没调工具就加"未联网核实"免责声明」对 Excel 分析
+# 不适用,会把模型带偏;且数据集内容不在上下文里(在 excel_query 工具后面),
+# 必须明确告诉模型这点,否则它会误以为「没材料」而拒答。
+EXCEL_AGENT_SYSTEM_PROMPT = """你是严谨的数据分析助手。本次对话用户提供了一个表格数据集(Excel),你有一个 excel_query 工具,可对它做精确计算。
+
+工作方式:
+1. 数据集的内容**不在对话上下文里** —— 必须通过 excel_query 工具去查。任何涉及具体数字、统计、计数、分组、排名、占比、对比的结论,都必须先调用 excel_query 取真实计算结果,再据此作答。禁止心算、估算、编造,禁止凭记忆作答。
+2. 面对宽泛的请求(如「帮我详细分析一下」),先调用 excel_query 了解数据集有哪些表、各表的列与概况,再据此规划要分析哪些维度、逐个查询并展开 —— **不要**因为「没有具体问题」就拒答或要求用户补充材料(数据集已经提供了,就在工具后面)。查询要抓重点:优先分析最关键的几个维度,不要把每一列都查一遍。给最终结论时,综合已查到的全部结果作结构化总结,**禁止**在结尾宣告「接下来我将查询…」这类未完成的动作 —— 要么把它查了,要么就此收尾。
+3. 一次 excel_query 只问一个明确的子问题;需要多个口径就分多次调用。
+4. 禁止声称调用了某工具而实际没有调用 —— 回答只能如实反映你真正执行过的操作。
+5. 若 excel_query 的结果表明数据集中没有所需的列 / 维度 / 口径,如实说明「数据集中没有这项数据,无法据此分析」并指出需补充什么,不得用其他列硬凑。
+6. 本次分析的数据来自 excel_query 工具(不是网页)—— 回答中**不要**编造 URL、**不要**追加「Sources」/「参考来源」章节、**不要**用 [1][2] 之类的引用编号。需要说明出处时,直接写「据 excel_query 查询」即可。"""
 
 
 # =============================================================================
@@ -362,6 +449,9 @@ class AgentConfig:
     max_fetches: int = 8             # cap on web_fetch + web_view calls per session
     max_searches: int = 8            # cap on web_search calls per session
     max_pushbacks: int = 2           # times the loop forces "dig deeper" on a stale/hedged answer
+    # 引用合规审计只对 web 检索有意义;数据类请求(带 excel 数据集)关掉它 ——
+    # 否则模型为工具调用编造的占位 URL 会被审计当真、给用户弹"引用合规警告"。
+    citation_guard: bool = True
 
 
 @dataclass
@@ -387,6 +477,9 @@ class AgentTrace:
 
 ProgressCallback = Callable[[str, str, dict[str, Any]], None]
 # stage, message, meta
+
+SourcesCallback = Callable[[str, list[dict[str, Any]]], None]
+# query, items —— 调用一次 = 一次 web_search 的结构化结果。前端累加去重。
 
 
 def _emit(cb: Optional[ProgressCallback], stage: str, message: str, **meta: Any) -> None:
@@ -567,6 +660,7 @@ def _dispatch_tool_calls_parallel(
     progress_cb: Optional[ProgressCallback],
     trace: AgentTrace,
     seen_signatures: set[str],
+    sources_cb: Optional[SourcesCallback] = None,
 ) -> list[dict[str, Any]]:
     """Execute tool_calls in parallel, deduping by signature and enforcing budgets.
 
@@ -634,6 +728,15 @@ def _dispatch_tool_calls_parallel(
         result = registry.dispatch(name, args)
         elapsed_ms = int((time.time() - t0) * 1000)
         ok = "error" not in str(result)[:50] if not isinstance(result, dict) else not result.get("error")
+        # web_search → emit structured sources to the SSE stream for the
+        # frontend cite chips / hover preview (零干扰主对话上下文)。
+        if sources_cb is not None and name == "web_search" and ok:
+            shaped = _shape_web_search_sources(result)
+            if shaped:
+                try:
+                    sources_cb(str(args.get("query") or ""), shaped)
+                except Exception:  # noqa: BLE001 — emission failure must not break the loop
+                    pass
         is_image = isinstance(result, dict) and result.get("content_type") == "image"
         # Citation guard: record URLs the tool actually touched (args + result)
         if name in ("web_fetch", "web_view"):
@@ -761,11 +864,14 @@ def _citation_warning_text(unverified: list[str]) -> str:
     return "\n" + "\n".join(lines)
 
 
-def _annotate_final_message(message: dict[str, Any], trace: AgentTrace) -> None:
+def _annotate_final_message(
+    message: dict[str, Any], trace: AgentTrace, citation_guard: bool = True
+) -> None:
     """Post-process the assistant's final message: leak cleanup + citation audit.
 
-    The two passes are idempotent and only mutate ``message['content']`` when
-    something needs fixing.
+    Idempotent — only mutates ``message['content']`` when something needs fixing.
+    ``citation_guard=False`` 时跳过引用审计 —— 数据类请求(如 excel)没有 URL
+    概念,审计会把模型为工具调用编造的占位 URL 当真、误报。
     """
     content = message.get("content")
     if not isinstance(content, str):
@@ -775,9 +881,10 @@ def _annotate_final_message(message: dict[str, Any], trace: AgentTrace) -> None:
     if removed:
         content = cleaned
         trace.tool_call_leaks_stripped += removed
-    # 2) Citation audit (Hotfix P0-2)
-    _audit_final_citations(content, trace)
-    content = content + _citation_warning_text(trace.unverified_urls_in_answer)
+    # 2) Citation audit (Hotfix P0-2)—— 仅 web 检索场景。
+    if citation_guard:
+        _audit_final_citations(content, trace)
+        content = content + _citation_warning_text(trace.unverified_urls_in_answer)
     # 3) Empty-answer safety net — never ship an empty final answer (can happen
     # if the model emitted only leaked <tool_call> markup that got stripped).
     if not content.strip():
@@ -809,6 +916,22 @@ SYNTHESIS_SYSTEM_PROMPT = (
     "- **绝对禁止**输出 <tool_call> 标签或任何 JSON 工具调用语法。"
 )
 
+# 数据类请求(如 excel)的合成提示词 —— 去掉 URL 引用要求,否则 synthesis 会
+# 为 excel_query 结果编造 example.com 之类的占位 URL + Sources 章节。
+EXCEL_SYNTHESIS_SYSTEM_PROMPT = (
+    "你是一个严谨的数据分析助理。下面会给你一段对话,以及为回答用户最后一个"
+    "问题而通过 excel_query 工具查到的【资料】。你已经没有任何工具可用,唯一"
+    "的任务就是基于这些查询结果写出最终的分析结论。\n"
+    "要求:\n"
+    "- 开门见山给出结论和关键数据,**禁止**写「我将」「我会」「接下来」「让我」"
+    "「为了回答」之类描述下一步动作的话 —— 直接给完整分析,把已查到的结果综合"
+    "成结构化总结。\n"
+    "- 数据来自 excel_query 工具(不是网页)—— **不要**编造 URL、**不要**追加"
+    "「Sources」/「参考来源」章节、**不要**用 [1][2] 之类的引用编号。\n"
+    "- 资料不足以给出精确答案时,明确说明你能确认什么、还缺什么。\n"
+    "- **绝对禁止**输出 <tool_call> 标签或任何 JSON 工具调用语法。"
+)
+
 SYNTHESIS_USER_PREFIX = "【为回答上面最后一个问题，已检索到以下资料】\n\n"
 SYNTHESIS_USER_SUFFIX = "\n\n请立即依据以上资料，用中文写出完整、直接的最终答案。"
 SYNTHESIS_NO_EVIDENCE = "（本次没有成功检索到外部资料，请基于你已知的信息谨慎作答并说明未联网核实。）"
@@ -833,6 +956,26 @@ def _looks_like_intent_not_answer(text: str) -> bool:
         return False
     head = t[:20]
     return any(p in head for p in _INTENT_LEAD_PHRASES)
+
+
+# 强制收尾时,模型有时不给结论、而在结尾宣告「接下来我将查询X」这类下一步动作
+# —— agent 迭代预算耗尽、答案被截在半路的信号。命中 → 走 synthesis 兜底,把
+# 已查到的结果整理成完整结论。只认**第一人称**意图(「我将…查询」),不误伤
+# 「建议下一步关注X」这类给用户的建议。
+_DANGLING_INTENT_RE = re.compile(
+    r"(我将|我会|我先|我来|我打算|我继续|我需要再?|让我|接下来我|下一步我)"
+    r"[^。\n]{0,48}"
+    r"(查询|查一下|查看|分析|分组|统计|计算|核对|检查|了解一下)"
+)
+
+
+def _ends_with_dangling_intent(text: str) -> bool:
+    """长答案结尾若是『接下来我将查询…』这类宣告下一步、其后没有结果跟着 ——
+    说明 agent 迭代预算耗尽、答案被截在半路,需走 synthesis 兜底重新作答。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(_DANGLING_INTENT_RE.search(t[-150:]))
 
 
 def _collect_tool_evidence(
@@ -870,12 +1013,17 @@ def _collect_tool_evidence(
 
 def _build_synthesis_messages(
     augmented: list[dict[str, Any]],
+    citation_mode: bool = True,
 ) -> list[dict[str, Any]]:
     """Build a fresh, tool-free message list for the synthesis call: our own
     system prompt, the plain user/assistant turns (scaffolding stripped), and a
-    final user turn carrying the evidence digest (plus any screenshots)."""
+    final user turn carrying the evidence digest (plus any screenshots).
+
+    ``citation_mode=False``(数据类请求,如 excel)用不带 URL 引用的合成提示词
+    —— 否则 synthesis 会为 excel_query 结果编造占位 URL。"""
+    sys_prompt = SYNTHESIS_SYSTEM_PROMPT if citation_mode else EXCEL_SYNTHESIS_SYSTEM_PROMPT
     msgs: list[dict[str, Any]] = [
-        {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT}
+        {"role": "system", "content": sys_prompt}
     ]
     for m in augmented:
         role = m.get("role")
@@ -910,7 +1058,8 @@ def _synthesize_answer(
     tool-free request. Reliable because the request carries no tool-call
     scaffolding for the model to imitate. Returns cleaned prose (empty only if
     the upstream call itself fails)."""
-    msgs = _build_synthesis_messages(augmented)
+    # cfg.citation_guard 兼作 web/数据模式信号:数据类请求用不带引用的合成提示词。
+    msgs = _build_synthesis_messages(augmented, cfg.citation_guard)
     t0 = time.time()
     try:
         resp = _call_upstream(cfg, msgs, [], extra_payload)
@@ -943,7 +1092,11 @@ def _finalize_answer(
     """
     raw = msg.get("content") or ""
     stripped, _ = _strip_tool_call_leaks(raw)
-    needs_synthesis = (not stripped.strip()) or _looks_like_intent_not_answer(stripped)
+    needs_synthesis = (
+        (not stripped.strip())
+        or _looks_like_intent_not_answer(stripped)
+        or _ends_with_dangling_intent(stripped)
+    )
     if needs_synthesis:
         synthesized = _synthesize_answer(cfg, augmented, extra_payload, trace)
         if synthesized:
@@ -951,7 +1104,7 @@ def _finalize_answer(
             trace.stopped_reason = "answered_synthesized"
         else:
             msg["content"] = ""  # let _annotate_final_message ship the safety-net text
-    _annotate_final_message(msg, trace)
+    _annotate_final_message(msg, trace, cfg.citation_guard)
 
 
 def _is_final_message(choice: dict[str, Any]) -> bool:
@@ -1092,6 +1245,26 @@ def _sse_progress_chunk(model: str, stage: str, message: str, **meta: Any) -> di
     }
 
 
+def _sse_sources_chunk(
+    model: str, query: str, items: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """OpenAI-shaped event carrying our ``x_adapter_sources`` extension —— 一次
+    web_search 工具调用的结构化结果。
+
+    模型仍按系统提示词在正文里写 ``[N]`` 和 ``Sources:`` 段;本事件**只补**
+    title / favicon / snippet 等元数据,前端用它富化引用 chip 的 hover preview。
+    前端按 url 跨多次 web_search 累加去重。
+    """
+    return {
+        "id": "agent-sources",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model or "adapter",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+        "x_adapter_sources": {"query": query, "items": items},
+    }
+
+
 def _sse_trace_chunk(model: str, trace: AgentTrace) -> dict[str, Any]:
     return {
         "id": "agent-trace",
@@ -1176,6 +1349,11 @@ def run_agent_stream(
 
     def progress_cb(stage: str, message: str, meta: dict[str, Any]) -> None:
         progress_queue.append(_sse_progress_chunk(model, stage, message, **meta))
+
+    def sources_cb(query: str, items: list[dict[str, Any]]) -> None:
+        # 共用 progress_queue:由 _drain_queue 按到达顺序排出,跟进度事件
+        # 一起流式发出去 —— 前端不要求 sources 先于正文 token。
+        progress_queue.append(_sse_sources_chunk(model, query, items))
 
     def _drain_queue():
         while progress_queue:
@@ -1288,7 +1466,8 @@ def run_agent_stream(
         )
         yield from _drain_queue()
         tool_messages = _dispatch_tool_calls_parallel(
-            tool_calls, registry, cfg, progress_cb, trace, seen_signatures
+            tool_calls, registry, cfg, progress_cb, trace, seen_signatures,
+            sources_cb=sources_cb,
         )
         yield from _drain_queue()
         augmented = augmented + [message] + tool_messages

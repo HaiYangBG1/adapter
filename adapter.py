@@ -41,6 +41,8 @@ from xml.etree import ElementTree
 
 from agentic_web import (
     AgentConfig,
+    EXCEL_AGENT_SYSTEM_PROMPT,
+    EXCEL_QUERY_TOOL,
     ToolRegistry,
     WEB_FETCH_TOOL,
     WEB_SEARCH_TOOL,
@@ -156,6 +158,12 @@ AGENT_FETCH_FALLBACK_MIN_CHARS = int(os.environ.get("ADAPTER_AGENT_FETCH_FALLBAC
 # Agentic answers (esp. vision-heavy ones) need headroom — too small a value
 # truncates the answer and the model degrades into repetition before the cut.
 AGENT_DEFAULT_MAX_TOKENS = int(os.environ.get("ADAPTER_AGENT_DEFAULT_MAX_TOKENS", "2000"))
+
+# excel_query 工具 —— 把表格数据集的精确计算交给外部「代码执行」服务。
+# 该服务地址走环境变量(开源仓库不写死内网地址);留空则不注册 excel_query。
+# 计算可能耗时(写 SQL + 沙箱执行 + 防幻觉校验),超时给得宽。
+EXCEL_BACKEND_URL = os.environ.get("ADAPTER_EXCEL_BACKEND_URL", "")
+EXCEL_QUERY_TIMEOUT = int(os.environ.get("ADAPTER_EXCEL_QUERY_TIMEOUT", "240"))
 
 PYTHONPATH_EXTRA = os.environ.get("ADAPTER_PYTHONPATH_EXTRA", "")
 if PYTHONPATH_EXTRA:
@@ -1598,6 +1606,75 @@ def _get_agent_registry() -> ToolRegistry:
     return _agent_registry_singleton
 
 
+def _call_excel_backend(dataset_id: str, question: str) -> dict[str, Any]:
+    """调外部代码执行服务对表格数据集做一次精确计算,返回精简结果。
+
+    服务以 stream=false 同步返回 {answer, sql_log, verify, ...};这里只回传
+    模型作答真正需要的部分(答案 + 所用 SQL + 校验告警),丢掉冗长的原始行集
+    —— 工具结果还会被 agent loop 的 max_tool_result_chars 兜底截断。
+    """
+    if not EXCEL_BACKEND_URL:
+        return {"error": "excel backend 未配置(ADAPTER_EXCEL_BACKEND_URL)"}
+    url = EXCEL_BACKEND_URL.rstrip("/") + "/ask"
+    payload = json.dumps(
+        {"file_id": dataset_id, "question": question, "stream": False}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=EXCEL_QUERY_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        return {"error": f"excel backend HTTP {exc.code}: {detail}"}
+    except Exception as exc:  # noqa: BLE001 — 工具错误不能掀翻 agent loop
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(data, dict):
+        return {"error": "excel backend 返回了非预期格式"}
+    out: dict[str, Any] = {"answer": data.get("answer", "")}
+    sql_log = data.get("sql_log")
+    if isinstance(sql_log, list) and sql_log:
+        out["sql"] = [
+            {"purpose": s.get("purpose", ""), "sql": s.get("sql", "")}
+            for s in sql_log
+            if isinstance(s, dict)
+        ]
+    verify = data.get("verify")
+    if isinstance(verify, dict) and verify.get("ok") is False:
+        out["verify_warning"] = verify.get("note", "")
+    return out
+
+
+def _make_excel_query_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
+    """为某个数据集生成绑定的 excel_query 实现 —— 数据集 id 由闭包捕获,模型
+    只需给出要计算的子问题,无需(也无法误传)数据集 id。"""
+
+    def _impl(args: dict[str, Any]) -> Any:
+        question = str(args.get("question") or "").strip()
+        if not question:
+            return {"error": "excel_query 需要 question 参数(要计算的子问题)"}
+        return _call_excel_backend(dataset_id, question)
+
+    return _impl
+
+
+def _build_agent_registry(excel_dataset_id: str = "") -> ToolRegistry:
+    """无表格数据集时复用 web 工具单例;带数据集时新建一个 registry —— 在 web
+    工具之上挂一个绑定该数据集的 excel_query。每请求新建开销极小(几次 dict
+    赋值),换来 excel_query 只在确有数据集时才对模型可见。"""
+    if not (excel_dataset_id and EXCEL_BACKEND_URL):
+        return _get_agent_registry()
+    reg = ToolRegistry()
+    reg.register(WEB_SEARCH_TOOL, _tool_impl_web_search)
+    reg.register(WEB_FETCH_TOOL, _tool_impl_web_fetch)
+    if AGENT_WEB_VIEW_ENABLED:
+        reg.register(WEB_VIEW_TOOL, _tool_impl_web_view)
+    reg.register(EXCEL_QUERY_TOOL, _make_excel_query_impl(excel_dataset_id))
+    return reg
+
+
 def _build_agent_config(model_from_payload: str) -> AgentConfig:
     """Resolve agent config from env + payload."""
     base = UPSTREAM.rstrip("/")
@@ -2655,6 +2732,7 @@ class Handler(BaseHTTPRequestHandler):
                         "agent_max_searches": AGENT_MAX_SEARCHES,
                         "agent_web_view_enabled": AGENT_WEB_VIEW_ENABLED,
                         "agent_fetch_fallback_min_chars": AGENT_FETCH_FALLBACK_MIN_CHARS,
+                        "agent_excel_query_enabled": bool(EXCEL_BACKEND_URL),
                     },
                 },
             )
@@ -2715,12 +2793,28 @@ class Handler(BaseHTTPRequestHandler):
         if not cfg.model:
             self._send_json(400, {"error": {"message": "'model' is required (or set ADAPTER_AGENT_MODEL)", "type": "bad_request"}})
             return
-        registry = _get_agent_registry()
+        # excel_dataset_id:调用方(playground)带表格数据集时传入 —— 据此给
+        # 本次请求挂一个绑定该数据集的 excel_query 工具。它是 adapter 私有控制
+        # 字段,不能透传给上游模型 API,故从 extra 里排除。
+        excel_dataset_id = str(payload.get("excel_dataset_id") or "").strip()
+        registry = _build_agent_registry(excel_dataset_id)
+        # 带数据集时,**整体替换**为 Excel 专用系统提示词(而非在联网提示词上追加)
+        # —— 联网那套的「必搜 / 没调工具就加未联网免责声明」会把模型带偏,且需
+        # 明确告诉模型「数据集在 excel_query 工具后面、不在上下文里」,否则它会
+        # 误判「没材料」而拒答。
+        if excel_dataset_id and EXCEL_BACKEND_URL:
+            cfg.system_prompt = EXCEL_AGENT_SYSTEM_PROMPT
+            # 数据类请求无 URL 概念 —— 关掉引用合规审计,否则模型为 excel_query
+            # 调用编造的占位 URL 会被审计误报成「疑似编造」。
+            cfg.citation_guard = False
         # Forward all non-loop-related sampling params (temperature, max_tokens, etc.)
         extra = {
             k: v
             for k, v in payload.items()
-            if k not in {"messages", "model", "stream", "tools", "tool_choice", "parallel_tool_calls"}
+            if k not in {
+                "messages", "model", "stream", "tools", "tool_choice",
+                "parallel_tool_calls", "excel_dataset_id",
+            }
         }
         # Inject a sane max_tokens default when the client didn't set one —
         # agentic answers need headroom or they truncate mid-thought.
