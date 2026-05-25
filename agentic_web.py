@@ -452,6 +452,10 @@ class AgentConfig:
     # 引用合规审计只对 web 检索有意义;数据类请求(带 excel 数据集)关掉它 ——
     # 否则模型为工具调用编造的占位 URL 会被审计当真、给用户弹"引用合规警告"。
     citation_guard: bool = True
+    # Force-answer 前的 prompt 字数预算:工具结果会累积,Qwen3.5 上下文 256K 但
+    # tokens ≠ chars,中英混合粗算 ~1.5-2 char/token。留出输出预留 + 安全余量后,
+    # 约 ~600K char 比较稳。超阈值时丢最早 role=tool 消息为占位(_truncate_messages_for_budget)。
+    max_context_chars: int = 600_000
 
 
 @dataclass
@@ -541,6 +545,75 @@ def _call_upstream(
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _stream_upstream(
+    cfg: AgentConfig,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    extra: Optional[dict[str, Any]] = None,
+):
+    """Streaming variant of ``_call_upstream``:逐 chunk yield 上游 SSE 块解出的
+    OpenAI 标准 dict。``data: [DONE]`` 触发正常退出。
+
+    调用方负责处理 ``urllib.error.HTTPError`` / 连接异常(包在 try/except)。
+    """
+    req = _build_upstream_request(cfg, messages, tools, extra, stream=True)
+    with urllib.request.urlopen(req, timeout=cfg.request_timeout) as resp:
+        buffer = b""
+        while True:
+            try:
+                chunk = resp.read1(4096) if hasattr(resp, "read1") else resp.read(4096)
+            except Exception:  # noqa: BLE001 — 连接断了,正常退出
+                break
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                raw_line, buffer = buffer.split(b"\n", 1)
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data:
+                    continue
+                if data == "[DONE]":
+                    return
+                try:
+                    yield json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+
+def _assemble_tool_calls_from_deltas(delta_fragments: list) -> list[dict[str, Any]]:
+    """从流式 ``choices[0].delta.tool_calls`` 增量片段拼出完整 tool_calls 列表。
+
+    OpenAI 流式协议:首个 fragment 给 ``index / id / type / function.name``;
+    后续 fragment 把 ``function.arguments`` 一段段拼上(并发工具按 ``index`` 区分)。
+    """
+    by_index: dict[int, dict[str, Any]] = {}
+    for fragment in delta_fragments:
+        if not isinstance(fragment, list):
+            continue
+        for tc in fragment:
+            if not isinstance(tc, dict):
+                continue
+            idx = tc.get("index", 0)
+            cur = by_index.setdefault(
+                idx,
+                {"id": "", "type": "function",
+                 "function": {"name": "", "arguments": ""}},
+            )
+            if tc.get("id"):
+                cur["id"] = tc["id"]
+            if tc.get("type"):
+                cur["type"] = tc["type"]
+            fn = tc.get("function") or {}
+            if isinstance(fn.get("name"), str):
+                cur["function"]["name"] += fn["name"]
+            if isinstance(fn.get("arguments"), str):
+                cur["function"]["arguments"] += fn["arguments"]
+    return [by_index[k] for k in sorted(by_index)]
+
+
 def _call_signature(tool_call: dict[str, Any]) -> str:
     """Stable signature for de-duplication: name + canonicalized args."""
     fn = tool_call.get("function", {}) or {}
@@ -566,6 +639,59 @@ def _truncate_tool_result(value: Any, max_chars: int) -> str:
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n[truncated, {len(text) - max_chars} more chars]"
     return text
+
+
+# ── Context 预算估算 + 裁剪(防 force_answer 把 EAS 输入撑爆 400)──────────
+# 真实问题:多轮 web_search + web_fetch 累积后,force_answer 把整段 history
+# 喂给上游,可能超 Qwen3.5 输入上限(256K - 输出预留)。每张 web_view 截图按
+# 多模态算 ~1000-2000 tokens,粗略按 2000 char 估算。
+
+_IMAGE_PSEUDO_CHARS = 2000
+
+
+def _estimate_messages_size(messages: list) -> int:
+    """估算 messages 总 char 数(图片按 _IMAGE_PSEUDO_CHARS 算)。不精确但够用。"""
+    total = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    total += len(part.get("text") or "")
+                elif part.get("type") == "image_url":
+                    total += _IMAGE_PSEUDO_CHARS
+        tcs = m.get("tool_calls") or []
+        if tcs:
+            try:
+                total += len(json.dumps(tcs, ensure_ascii=False))
+            except (TypeError, ValueError):
+                total += 200 * len(tcs)
+    return total
+
+
+def _truncate_messages_for_budget(messages: list, max_chars: int) -> list:
+    """超预算时,**只丢 role=tool 的早期消息**,替换为占位(保留对应的 assistant
+    tool_call 消息,不破坏对话结构)。system / user / assistant prose 不动。
+    """
+    if _estimate_messages_size(messages) <= max_chars:
+        return messages
+    out = list(messages)
+    placeholder = "[早期工具结果已省略以适配上下文长度限制]"
+    for i, m in enumerate(out):
+        if m.get("role") != "tool":
+            continue
+        out[i] = {
+            "role": "tool",
+            "tool_call_id": m.get("tool_call_id", ""),
+            "content": placeholder,
+        }
+        if _estimate_messages_size(out) <= max_chars:
+            break
+    return out
 
 
 def _strip_citation_scaffolding(text: str) -> str:
@@ -1246,14 +1372,15 @@ def _sse_progress_chunk(model: str, stage: str, message: str, **meta: Any) -> di
 
 
 def _sse_sources_chunk(
-    model: str, query: str, items: list[dict[str, Any]]
+    model: str, items: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """OpenAI-shaped event carrying our ``x_adapter_sources`` extension —— 一次
-    web_search 工具调用的结构化结果。
+    web_search 工具调用的结构化结果(按 BACKEND_TODO #1 协议:**扁平 array**,
+    每条 ``n`` 字段为 session 级递增 stable id)。
 
     模型仍按系统提示词在正文里写 ``[N]`` 和 ``Sources:`` 段;本事件**只补**
-    title / favicon / snippet 等元数据,前端用它富化引用 chip 的 hover preview。
-    前端按 url 跨多次 web_search 累加去重。
+    title / favicon / snippet 等元数据,前端用 url 去重 + 匹配正文 ``[N]``。
+    query 信息走 ``x_adapter_agent_progress.tool_start.args.query``,这里不重复。
     """
     return {
         "id": "agent-sources",
@@ -1261,7 +1388,7 @@ def _sse_sources_chunk(
         "created": int(time.time()),
         "model": model or "adapter",
         "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
-        "x_adapter_sources": {"query": query, "items": items},
+        "x_adapter_sources": items,
     }
 
 
@@ -1327,15 +1454,26 @@ def run_agent_stream(
 ):
     """Generator yielding dict events (each meant to become one SSE 'data:' line).
 
-    Event ordering:
-      1. Zero or more progress chunks (x_adapter_agent_progress) per iteration
-      2. The actual streamed completion chunks from the FINAL upstream call
-         (these have a populated choices[0].delta with text)
-      3. A final x_adapter_agent_trace chunk
-      4. (Caller is responsible for emitting the terminal "[DONE]" sentinel)
+    v0.2.13 投机式真流式:每轮都用 ``_stream_upstream`` 取上游 SSE chunk,**先**
+    buffer 头几块,直到第一个 ``delta.content`` 或 ``delta.tool_calls`` 才决定:
 
-    The caller (HTTP handler) is responsible for writing each event as
-    'data: <json>\\n\\n' to the wire.
+    - 看到 content → flush buffer + 持续转发(真流式,前端逐字看到)
+    - 看到 tool_calls → 丢弃 buffer,本轮静默拼工具调用,继续 agent 循环
+
+    审计在 v0.2.13 被**弱化**(BACKEND_REQUESTS_v0.11 "真流式 + 弱化审计"):
+    - DROP "dig deeper" pushback —— 已流出去的字没法收回
+    - DROP ``<tool_call>`` 泄漏剥除 —— 同上
+    - KEEP citation 审计,但**只发 ``citation_warn`` progress 事件**,不再追加警告到正文
+
+    强制作答轮(最后一轮)若模型仍然请求工具(tools=[] + 系统提示词通常拦得住),
+    走 ``_synthesize_answer`` 非流式合成兜底 —— 这是唯一保留的退化路径。
+
+    事件顺序:
+      1. progress / sources 事件(随时穿插,sources 每条带 session 级 ``n``)
+      2. 真流式 content delta(role 块 + 多个 content 块 + finish_reason 块)
+      3. citation_warn 事件(如有 unverified URL)
+      4. x_adapter_agent_trace 终结块
+      5. (调用方负责发 ``[DONE]`` 哨兵)
     """
     trace = AgentTrace()
     tools = registry.schemas()
@@ -1343,17 +1481,27 @@ def run_agent_stream(
     seen_signatures: set[str] = set()
     model = cfg.model
 
-    # Collect progress events via a callback that yields back through this generator.
-    # We can't `yield` from inside a callback, so we buffer events.
+    # session 级 source 编号:跨多轮 web_search 递增,前端用 `n` 匹配正文 [N]。
+    # 用 dict 包裹以便嵌套闭包内 mutate(nonlocal 在闭包链里有时报 SyntaxError)。
+    source_n_counter = {"v": 0}
+
+    # Collect progress/sources events via a callback. We can't `yield` from inside
+    # a callback (it's not a generator), so we buffer events in a queue and drain
+    # at safe boundaries.
     progress_queue: list[dict[str, Any]] = []
 
     def progress_cb(stage: str, message: str, meta: dict[str, Any]) -> None:
         progress_queue.append(_sse_progress_chunk(model, stage, message, **meta))
 
     def sources_cb(query: str, items: list[dict[str, Any]]) -> None:
-        # 共用 progress_queue:由 _drain_queue 按到达顺序排出,跟进度事件
-        # 一起流式发出去 —— 前端不要求 sources 先于正文 token。
-        progress_queue.append(_sse_sources_chunk(model, query, items))
+        # 给每条结果分配 session 级递增 n(BACKEND_TODO #1 协议:扁平 array + n 字段),
+        # 前端用 url 去重 + 用 n 匹配正文 [N] 引用。query 走 progress.tool_start,这里不重复。
+        enriched: list[dict[str, Any]] = []
+        for it in items or []:
+            source_n_counter["v"] += 1
+            enriched.append({**it, "n": source_n_counter["v"]})
+        if enriched:
+            progress_queue.append(_sse_sources_chunk(model, enriched))
 
     def _drain_queue():
         while progress_queue:
@@ -1372,109 +1520,163 @@ def run_agent_stream(
 
         yield from _drain_queue()
 
-        # On the final (forced) iteration the model can leak <tool_call> markup
-        # as raw text because the parser is bypassed. To handle it safely we
-        # do a non-streaming call here, sanitize, and emit the cleaned content
-        # as a single chunk. Streaming UX is only sacrificed on this fallback
-        # path; the common "model answered earlier" path still streams (see the
-        # _is_final_message branch below).
-        if is_last:
-            t_last = time.time()
-            try:
-                resp = _call_upstream(cfg, current_messages, current_tools, extra_payload)
-            except Exception as exc:  # noqa: BLE001
-                yield _sse_progress_chunk(model, "agent_error", f"upstream error: {exc}", iteration=iteration)
-                trace.stopped_reason = "upstream_error"
-                yield _sse_trace_chunk(model, trace)
-                return
-            trace.upstream_latencies_ms.append(int((time.time() - t_last) * 1000))
-            trace.iterations = iteration
-            choices = resp.get("choices", [])
-            if not choices:
-                trace.stopped_reason = "no_choices"
-                yield _sse_trace_chunk(model, trace)
-                return
-            choice = choices[0]
-            trace.final_finish_reason = str(choice.get("finish_reason") or "")
-            trace.answer_truncated = trace.final_finish_reason == "length"
-            msg = choice.get("message", {}) or {}
-            _finalize_answer(msg, cfg, augmented, extra_payload, trace)
-            cleaned = msg.get("content") or ""
-            trace.stopped_reason = trace.stopped_reason or "answered_forced"
-            yield from _stream_final_answer(model, cleaned, resp)
-            yield _sse_trace_chunk(model, trace)
-            return
+        # Context 预算裁剪:超 ~600K char 时丢早期 role=tool 消息,避免 force_answer
+        # 把整段 history 喂上游撑爆 256K 输入(_truncate_messages_for_budget)。
+        current_messages = _truncate_messages_for_budget(current_messages, cfg.max_context_chars)
 
-        # Intermediate iterations: non-streaming call so the answer can be
-        # inspected (citation audit, dig-deeper pushback) before it reaches the
-        # client. Progress events still stream live; the accepted final answer
-        # is emitted as content chunk(s) once the loop decides to keep it.
+        # ── 投机式真流式 ────────────────────────────────────────────────
+        # 头几块通常只有 role,无法判断要走 content 还是 tool_calls。先 buffer,
+        # 等第一个 content delta(→ 真流式)或第一个 tool_calls delta(→ 静默
+        # 累积)再决定。决定之后:content 路径继续转发所有 chunk,tool_calls
+        # 路径丢弃 buffer 且不再向客户端发任何 chunk(本轮只产生工具调用)。
         t0 = time.time()
+        chunk_buffer: list[dict[str, Any]] = []
+        content_started = False
+        tool_calls_started = False
+        content_buf = ""
+        tool_call_fragments: list = []
+        finish_reason = ""
+
         try:
-            resp = _call_upstream(cfg, current_messages, current_tools, extra_payload)
+            for chunk in _stream_upstream(cfg, current_messages, current_tools, extra_payload):
+                choices = chunk.get("choices") or []
+                if not choices:
+                    # usage-only / 心跳块:决定后继续转发,决定前 buffer
+                    if content_started:
+                        yield chunk
+                    elif not tool_calls_started:
+                        chunk_buffer.append(chunk)
+                    continue
+                ch0 = choices[0] or {}
+                delta = ch0.get("delta") or {}
+                fr = ch0.get("finish_reason")
+                if fr:
+                    finish_reason = str(fr)
+
+                tc_delta = delta.get("tool_calls")
+                content_delta = delta.get("content")
+
+                # tool_calls delta:Qwen 偶尔会同时给"思考过程"content + tool_calls,
+                # 我们以 tool_calls 为准,丢弃思考过程(不让用户看到工具调用前的 think)。
+                if tc_delta:
+                    if not content_started and not tool_calls_started:
+                        tool_calls_started = True
+                        chunk_buffer = []  # 这一轮不会有正文流给前端
+                    if tool_calls_started:
+                        tool_call_fragments.append(tc_delta)
+                    continue
+
+                # 正文 delta
+                if isinstance(content_delta, str) and content_delta:
+                    if not content_started and not tool_calls_started:
+                        content_started = True
+                        # flush 之前 buffer 的 role 块等
+                        for buffered in chunk_buffer:
+                            yield buffered
+                        chunk_buffer = []
+                    if content_started:
+                        yield chunk
+                        content_buf += content_delta
+                    # tool_calls_started + 后续 content delta:静默丢弃(已决定走工具调用)
+                    continue
+
+                # role-only / finish-only / 心跳块
+                if content_started:
+                    yield chunk  # 转发 finish_reason / usage chunk 给前端
+                elif not tool_calls_started:
+                    chunk_buffer.append(chunk)
+                # tool_calls_started 但本 chunk 没 tc_delta:静默丢弃
         except Exception as exc:  # noqa: BLE001
-            yield _sse_progress_chunk(model, "agent_error", f"upstream error: {exc}", iteration=iteration)
+            yield _sse_progress_chunk(
+                model, "agent_error", f"upstream error: {exc}", iteration=iteration
+            )
             trace.stopped_reason = "upstream_error"
             yield _sse_trace_chunk(model, trace)
             return
+
         trace.upstream_latencies_ms.append(int((time.time() - t0) * 1000))
         trace.iterations = iteration
 
-        choices = resp.get("choices", [])
-        if not choices:
-            trace.stopped_reason = "no_choices"
-            yield _sse_progress_chunk(model, "agent_warn", "upstream returned no choices")
+        # ── 真流式正文路径:弱化审计 + 终结 ─────────────────────────────
+        if content_started:
+            trace.final_finish_reason = finish_reason or "stop"
+            trace.answer_truncated = finish_reason == "length"
+            trace.stopped_reason = trace.stopped_reason or (
+                "answered_forced" if is_last else "answered_streamed"
+            )
+            # KEEP citation audit —— 只发警告事件,不改正文(正文已流出)
+            if cfg.citation_guard and content_buf:
+                _audit_final_citations(content_buf, trace)
+                if trace.unverified_urls_in_answer:
+                    yield _sse_progress_chunk(
+                        model,
+                        "citation_warn",
+                        "检测到正文 URL 未被工具访问过(可能编造)",
+                        unverified=trace.unverified_urls_in_answer,
+                    )
             yield _sse_trace_chunk(model, trace)
             return
 
-        choice = choices[0]
-        if _is_final_message(choice):
-            msg = choice.get("message", {}) or {}
-            # Loop-level "dig deeper" pushback — only when there is room left
-            # to both dig AND answer (>= 2 iterations remaining).
-            if (
-                iteration <= cfg.max_iterations - 2
-                and trace.pushbacks_used < cfg.max_pushbacks
-                and _answer_needs_more_digging(msg.get("content") or "", trace.searches_used)
-            ):
-                trace.pushbacks_used += 1
+        # ── tool_calls 路径:拼装 + dispatch + 进入下一轮 ─────────────────
+        if tool_calls_started:
+            assembled = _assemble_tool_calls_from_deltas(tool_call_fragments)
+            if not assembled:
+                trace.stopped_reason = "no_choices"
+                yield _sse_progress_chunk(model, "agent_warn", "tool_calls 流式拼装失败")
+                yield _sse_trace_chunk(model, trace)
+                return
+
+            # is_last 时不应进这一支(tools=[] + FORCE_ANSWER_SYSTEM_HINT 通常拦得住),
+            # 但模型偶尔无视提示词继续请求工具 —— 走非流式合成兜底,然后切片仿真流式
+            # 发出去(这是 v0.2.13 唯一保留的退化路径)。
+            if is_last:
                 progress_cb(
-                    "agent_dig_deeper",
-                    f"答案疑似过时/不完整，要求继续深挖（第 {trace.pushbacks_used} 次）",
-                    {"pushback": trace.pushbacks_used},
+                    "agent_force_answer_fallback",
+                    "强制作答轮仍请求工具,退化到合成兜底",
+                    {"iteration": iteration},
                 )
                 yield from _drain_queue()
-                augmented = augmented + [msg, {"role": "system", "content": DIG_DEEPER_HINT}]
-                continue
-            # Accept — annotate and emit the answer as content chunks.
-            trace.stopped_reason = "answered"
-            trace.final_finish_reason = str(choice.get("finish_reason") or "")
-            trace.answer_truncated = trace.final_finish_reason == "length"
-            _finalize_answer(msg, cfg, augmented, extra_payload, trace)
-            content = msg.get("content") or ""
-            yield from _stream_final_answer(model, content, resp)
-            yield _sse_trace_chunk(model, trace)
-            return
+                synthesized = _synthesize_answer(cfg, augmented, extra_payload, trace)
+                if not synthesized:
+                    synthesized = (
+                        "（抱歉，本轮未能整理出最终答案，检索过程可能未收敛。请重试或换一种问法。）"
+                    )
+                    trace.stopped_reason = "answered_empty_fallback"
+                else:
+                    trace.stopped_reason = "answered_synthesized"
+                trace.final_finish_reason = "stop"
+                fake_resp = {"id": "agent-final-synth", "created": int(time.time())}
+                yield from _stream_final_answer(model, synthesized, fake_resp)
+                yield _sse_trace_chunk(model, trace)
+                return
 
-        # Tool calls present — dispatch and continue
-        message = choice.get("message", {}) or {}
-        tool_calls = message.get("tool_calls") or []
-        progress_cb(
-            "tools_dispatch",
-            f"模型请求 {len(tool_calls)} 个工具调用",
-            {"count": len(tool_calls), "iteration": iteration},
-        )
-        yield from _drain_queue()
-        tool_messages = _dispatch_tool_calls_parallel(
-            tool_calls, registry, cfg, progress_cb, trace, seen_signatures,
-            sources_cb=sources_cb,
-        )
-        yield from _drain_queue()
-        augmented = augmented + [message] + tool_messages
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": assembled,
+            }
+            progress_cb(
+                "tools_dispatch",
+                f"模型请求 {len(assembled)} 个工具调用",
+                {"count": len(assembled), "iteration": iteration},
+            )
+            yield from _drain_queue()
+            tool_messages = _dispatch_tool_calls_parallel(
+                assembled, registry, cfg, progress_cb, trace, seen_signatures,
+                sources_cb=sources_cb,
+            )
+            yield from _drain_queue()
+            augmented = augmented + [assistant_message] + tool_messages
+            continue
+
+        # 既没 content 也没 tool_calls:空响应
+        trace.stopped_reason = "no_choices"
+        yield _sse_progress_chunk(model, "agent_warn", "upstream returned no choices")
+        yield _sse_trace_chunk(model, trace)
+        return
 
 
-# Note: an earlier variant streamed each intermediate iteration's tokens to
-# the client live. That was replaced by non-streaming iteration calls so the
-# loop can inspect an answer (citation audit + dig-deeper pushback) before it
-# reaches the client. Progress events still stream; the accepted final answer
-# is emitted as content chunk(s).
+# Note: v0.2.13 把每轮调用都改成 _stream_upstream + 投机式判定 content/tool_calls,
+# 真流式直接转发上游 delta;之前的"非流式 inspection + _stream_final_answer 切片
+# 仿真流"路径只在强制作答轮模型仍请求工具的兜底场景保留。同步弱化了审计 ——
+# 流出去的字符没法收回,citation 警告改成单独的 progress 事件,不再追加到正文。
