@@ -475,16 +475,22 @@ class AgentConfig:
     # 重试一次**,带 chat_template_kwargs.enable_thinking=false 强制模型直出 content。
     # 仍空就用 reasoning_buf 作兜底答案。0 关闭重试,纯走 reasoning 兜底。
     max_empty_retries: int = 1
-    # v0.2.17 / v0.2.20 thinking 策略:agentic 循环每轮单独决定是否启用 thinking。
-    # - intermediate(前 N-1 轮,决策调哪个工具):默认**关**,模型有 tool_call 这个
-    #   外置思考机制,内置 chain-of-thought 在工具决策场景是浪费 + 易出 v0.2.14 bug。
-    # - force_answer(最后一轮综合所有工具结果作答):v0.2.17 默认开;**v0.2.20 改默认关**
-    #   —— 实测 thinking 产生的 reasoning_content delta 透传给前端会被当成噪音
-    #   (前端识别 delta.content 不识别 reasoning_content),且 EAS 仍消耗输出 token
-    #   生成思考。关掉后:答案质量经验证没退化、流更干净、节省 token、彻底消灭
-    #   "force_answer 也偶发 thinking-only 空 content"潜在 bug。
+    # v0.2.17 / v0.2.20 / v0.2.22 thinking 策略:agentic 循环每轮单独决定。
+    # - intermediate(前 N-1 轮,决策调哪个工具):默认**关**,模型有 tool_call
+    #   这个外置思考机制,内置 chain-of-thought 在工具决策场景是浪费 + 易出
+    #   v0.2.14 类 bug。这个是硬约束,client 也覆盖不了(对应前端无 chip)。
+    # - force_answer(最后一轮综合所有工具结果作答):**passthrough**(v0.2.22)。
+    #   v0.2.17 默认 True、v0.2.20 默认 False 都过于一刀切。前端有「深度思考」chip,
+    #   通过 extra_body.chat_template_kwargs.enable_thinking 表达用户意图,adapter
+    #   应该尊重:client 给 True 就让 EAS 跑 thinking、reasoning_content delta
+    #   照常透传给前端(前端会渲染思考过程面板);未指定/给 False 就跟中间轮一样
+    #   注入 enable_thinking=false。
+    #
+    #   ``force_answer_thinking_enabled`` 三态:
+    #     None         = passthrough(默认,跟前端 chip 走)
+    #     True/False   = 硬覆盖(测试 / 临时压问题用)
     intermediate_thinking_enabled: bool = False
-    force_answer_thinking_enabled: bool = False
+    force_answer_thinking_enabled: Optional[bool] = None
 
 
 @dataclass
@@ -1727,22 +1733,54 @@ def _build_no_thinking_extra(
     return out
 
 
+def _client_wants_thinking(extra: Optional[dict[str, Any]]) -> bool:
+    """v0.2.22:看 client 在 extra payload 里有没有显式要求 thinking on。
+
+    前端「深度思考」chip 通过 ``extra_body.chat_template_kwargs.enable_thinking``
+    或顶层 ``enable_thinking`` 表达意图(双 key 兼容老/新 Qwen 模板);两者任一
+    为 True 视为「开」。其他情况(False / 未设置 / 类型不对)视为「关」。
+    """
+    if not extra:
+        return False
+    ct = extra.get("chat_template_kwargs")
+    if isinstance(ct, dict) and ct.get("enable_thinking") is True:
+        return True
+    return extra.get("enable_thinking") is True
+
+
 def _build_iteration_extra(
     cfg: AgentConfig,
     is_last: bool,
     base_extra: Optional[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
-    """v0.2.17: 按 cfg 的 thinking 策略,给每轮上游调用注入 enable_thinking 开关。
+    """v0.2.17 / v0.2.22:按 cfg 的 thinking 策略,给每轮上游调用注入开关。
 
-    intermediate 默认 ``enable_thinking=False``、force_answer 默认开 —— 在每轮
-    `_stream_upstream` 之前调,跟 ``_build_no_thinking_extra`` 共享底层 key 形态。
+    - intermediate: 始终注入 ``enable_thinking=False``(``cfg.intermediate_thinking_enabled``
+      可改 True,但 99% 场景应该保持 False)。
+    - force_answer: 看 ``cfg.force_answer_thinking_enabled``:
+        - None(default,passthrough):**尊重 client** —— 前端 chip 开 → 保留 True、
+          关/未指定 → 注入 False
+        - True/False:硬覆盖,忽略 client 意图
     """
-    enabled = (
-        cfg.force_answer_thinking_enabled if is_last else cfg.intermediate_thinking_enabled
-    )
-    if enabled:
-        # 上游默认就是 thinking on,直接返回原 extra 即可
-        return base_extra
+    if is_last:
+        mode = cfg.force_answer_thinking_enabled
+        if mode is None:
+            keep = _client_wants_thinking(base_extra)
+        else:
+            keep = mode
+    else:
+        keep = cfg.intermediate_thinking_enabled
+
+    if keep:
+        # 保留 thinking on:确保 ``enable_thinking=True`` 双 key 都设上,client 没
+        # 设过但 cfg 硬开的场景(罕见)也能跑通。已设过的会被覆盖为 True(等价)。
+        out = dict(base_extra or {})
+        ct = dict(out.get("chat_template_kwargs") or {})
+        ct["enable_thinking"] = True
+        out["chat_template_kwargs"] = ct
+        out["enable_thinking"] = True
+        return out
+    # 关 thinking:用现有的 _build_no_thinking_extra(确保双 key=False)
     return _build_no_thinking_extra(base_extra)
 
 
