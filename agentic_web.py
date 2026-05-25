@@ -456,6 +456,11 @@ class AgentConfig:
     # tokens ≠ chars,中英混合粗算 ~1.5-2 char/token。留出输出预留 + 安全余量后,
     # 约 ~600K char 比较稳。超阈值时丢最早 role=tool 消息为占位(_truncate_messages_for_budget)。
     max_context_chars: int = 600_000
+    # v0.2.14 空响应兜底:上游 Qwen thinking 模式偶发"只发 reasoning_content,content
+    # 为空或只有 \\n\\n,finish_reason 已结束"的 case。检测到这种空响应时,**自动
+    # 重试一次**,带 chat_template_kwargs.enable_thinking=false 强制模型直出 content。
+    # 仍空就用 reasoning_buf 作兜底答案。0 关闭重试,纯走 reasoning 兜底。
+    max_empty_retries: int = 1
 
 
 @dataclass
@@ -1446,6 +1451,141 @@ def _stream_final_answer(model: str, content: str, resp: dict[str, Any]):
     yield stop
 
 
+def _speculative_iteration(
+    cfg: AgentConfig,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    extra: Optional[dict[str, Any]] = None,
+):
+    """Drive one upstream streaming call with speculative content/tool_calls/empty detection.
+
+    Yields a stream of ``("chunk", dict)`` tuples for client-bound SSE chunks
+    (these should be forwarded as-is to the wire). When the upstream ends,
+    yields a single terminal ``("done", state)`` where ``state['path']`` is:
+      - ``'content'``  → answer streamed live (state['content_buf'] has the text)
+      - ``'tool_calls'`` → assistant requested tools; assembled fragments in state
+      - ``'empty'``    → no usable output (often just reasoning_content)
+      - ``'upstream_error'`` → HTTP/network exception (state['error'] populated)
+
+    v0.2.14 关键改动:**``content_started`` 只在出现非空白 content 才承诺**。
+    上游若先发一串 ``reasoning_content`` 再发 ``\\n\\n`` 然后结束(Qwen thinking
+    模式空答案 bug,见 BACKEND_REQUESTS_v0.11),不会被误判为 'content' 路径 ——
+    那些空白 chunk 留在 ``pre_decision_chunks`` 里,流结束后归入 'empty',
+    供调用方决定 retry / reasoning fallback。
+    """
+    pre_decision_chunks: list[dict[str, Any]] = []
+    content_started = False
+    tool_calls_started = False
+    content_buf = ""              # 累积所有 content delta(含空白,用于 empty 检测)
+    reasoning_buf = ""            # 累积所有 reasoning_content delta
+    tool_call_fragments: list = []
+    finish_reason = ""
+
+    try:
+        for chunk in _stream_upstream(cfg, messages, tools, extra):
+            choices = chunk.get("choices") or []
+            if not choices:
+                # usage-only / 心跳块:承诺后转发,未承诺前 buffer
+                if content_started:
+                    yield ("chunk", chunk)
+                elif not tool_calls_started:
+                    pre_decision_chunks.append(chunk)
+                continue
+            ch0 = choices[0] or {}
+            delta = ch0.get("delta") or {}
+            fr = ch0.get("finish_reason")
+            if fr:
+                finish_reason = str(fr)
+
+            tc_delta = delta.get("tool_calls")
+            content_delta = delta.get("content")
+            reasoning_delta = delta.get("reasoning_content")
+
+            # reasoning 累积(不影响路径承诺)
+            if isinstance(reasoning_delta, str) and reasoning_delta:
+                reasoning_buf += reasoning_delta
+
+            # tool_calls delta:承诺 tool_calls 路径
+            if tc_delta:
+                if not content_started and not tool_calls_started:
+                    tool_calls_started = True
+                    pre_decision_chunks = []  # 工具调用轮不向前端发任何 chunk
+                if tool_calls_started:
+                    tool_call_fragments.append(tc_delta)
+                continue
+
+            # content delta:v0.2.14 只在非空白时承诺
+            if isinstance(content_delta, str) and content_delta:
+                content_buf += content_delta  # 始终累积,用于 empty 检测
+                if not content_started and not tool_calls_started:
+                    if content_delta.strip():
+                        # 真正承诺 content 路径:flush pre_decision_chunks + 转发当前 chunk
+                        content_started = True
+                        for buffered in pre_decision_chunks:
+                            yield ("chunk", buffered)
+                        pre_decision_chunks = []
+                        yield ("chunk", chunk)
+                    else:
+                        # 空白 content delta(如 "\\n\\n"):尚未承诺,buffer 起来
+                        pre_decision_chunks.append(chunk)
+                elif content_started:
+                    yield ("chunk", chunk)
+                # tool_calls_started + 后续 content delta:静默丢弃
+                continue
+
+            # role-only / finish-only chunk
+            if content_started:
+                yield ("chunk", chunk)
+            elif not tool_calls_started:
+                pre_decision_chunks.append(chunk)
+            # tool_calls_started 但本 chunk 没 tc_delta:静默丢弃
+    except Exception as exc:  # noqa: BLE001 — 报告给调用方处理
+        yield ("done", {
+            "path": "upstream_error",
+            "error": str(exc),
+            "content_buf": content_buf,
+            "reasoning_buf": reasoning_buf,
+            "tool_call_fragments": tool_call_fragments,
+            "finish_reason": finish_reason,
+        })
+        return
+
+    # 决定最终 path
+    if content_started:
+        path = "content"
+    elif tool_calls_started:
+        # 工具调用承诺了但 fragments 拼不出来 —— 算 empty
+        assembled = _assemble_tool_calls_from_deltas(tool_call_fragments)
+        path = "tool_calls" if assembled else "empty"
+    else:
+        # 既没真 content,也没 tool_calls。可能只有 whitespace content + reasoning。
+        path = "empty"
+
+    yield ("done", {
+        "path": path,
+        "content_buf": content_buf,
+        "reasoning_buf": reasoning_buf,
+        "tool_call_fragments": tool_call_fragments,
+        "finish_reason": finish_reason,
+    })
+
+
+def _build_no_thinking_extra(
+    extra: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Patch ``extra`` so upstream skips thinking mode on the retry.
+
+    Qwen 各版本认的 key 不一样:新版走 ``chat_template_kwargs.enable_thinking``,
+    旧版直接吃 top-level ``enable_thinking``。两边都塞,谁认谁用。
+    """
+    out = dict(extra or {})
+    ct = dict(out.get("chat_template_kwargs") or {})
+    ct["enable_thinking"] = False
+    out["chat_template_kwargs"] = ct
+    out["enable_thinking"] = False
+    return out
+
+
 def run_agent_stream(
     messages: list[dict[str, Any]],
     cfg: AgentConfig,
@@ -1455,10 +1595,16 @@ def run_agent_stream(
     """Generator yielding dict events (each meant to become one SSE 'data:' line).
 
     v0.2.13 投机式真流式:每轮都用 ``_stream_upstream`` 取上游 SSE chunk,**先**
-    buffer 头几块,直到第一个 ``delta.content`` 或 ``delta.tool_calls`` 才决定:
+    buffer 头几块,直到第一个**非空白** content 或 tool_calls 才决定:
 
-    - 看到 content → flush buffer + 持续转发(真流式,前端逐字看到)
+    - 看到非空白 content → flush buffer + 持续转发(真流式,前端逐字看到)
     - 看到 tool_calls → 丢弃 buffer,本轮静默拼工具调用,继续 agent 循环
+    - 都没等到(只有 reasoning / 只有空白 content)→ **empty 兜底**(v0.2.14)
+
+    v0.2.14 空响应兜底(变种 1/2 from BACKEND_REQUESTS_v0.11):
+    - 上游 Qwen thinking 模式有时只输出 reasoning_content,content 为空或仅 ``\\n\\n``
+    - 检测到 empty 时,**自动重试一次**带 ``enable_thinking=false`` 的请求
+    - 重试也失败 → 用 ``reasoning_buf`` 当兜底答案,加 prefix 提示用户重试
 
     审计在 v0.2.13 被**弱化**(BACKEND_REQUESTS_v0.11 "真流式 + 弱化审计"):
     - DROP "dig deeper" pushback —— 已流出去的字没法收回
@@ -1471,7 +1617,7 @@ def run_agent_stream(
     事件顺序:
       1. progress / sources 事件(随时穿插,sources 每条带 session 级 ``n``)
       2. 真流式 content delta(role 块 + 多个 content 块 + finish_reason 块)
-      3. citation_warn 事件(如有 unverified URL)
+      3. citation_warn / empty_answer_recovered 事件(如有)
       4. x_adapter_agent_trace 终结块
       5. (调用方负责发 ``[DONE]`` 哨兵)
     """
@@ -1484,6 +1630,7 @@ def run_agent_stream(
     # session 级 source 编号:跨多轮 web_search 递增,前端用 `n` 匹配正文 [N]。
     # 用 dict 包裹以便嵌套闭包内 mutate(nonlocal 在闭包链里有时报 SyntaxError)。
     source_n_counter = {"v": 0}
+    empty_retries_used = 0
 
     # Collect progress/sources events via a callback. We can't `yield` from inside
     # a callback (it's not a generator), so we buffer events in a queue and drain
@@ -1507,6 +1654,19 @@ def run_agent_stream(
         while progress_queue:
             yield progress_queue.pop(0)
 
+    def _run_attempt(msgs, current_tools, extra):
+        """Forward chunks from one _speculative_iteration to client; capture state.
+
+        Returns the final state dict (path/content_buf/reasoning_buf/...) via
+        the special ('state', dict) sentinel. Caller iterates and forwards.
+        """
+        for kind, payload in _speculative_iteration(cfg, msgs, current_tools, extra):
+            if kind == "chunk":
+                yield ("chunk", payload)
+            elif kind == "done":
+                yield ("state", payload)
+                return
+
     for iteration in range(1, cfg.max_iterations + 1):
         is_last = iteration == cfg.max_iterations
         if is_last:
@@ -1524,81 +1684,74 @@ def run_agent_stream(
         # 把整段 history 喂上游撑爆 256K 输入(_truncate_messages_for_budget)。
         current_messages = _truncate_messages_for_budget(current_messages, cfg.max_context_chars)
 
-        # ── 投机式真流式 ────────────────────────────────────────────────
-        # 头几块通常只有 role,无法判断要走 content 还是 tool_calls。先 buffer,
-        # 等第一个 content delta(→ 真流式)或第一个 tool_calls delta(→ 静默
-        # 累积)再决定。决定之后:content 路径继续转发所有 chunk,tool_calls
-        # 路径丢弃 buffer 且不再向客户端发任何 chunk(本轮只产生工具调用)。
+        # ── 主尝试:投机式真流式 ───────────────────────────────────────
         t0 = time.time()
-        chunk_buffer: list[dict[str, Any]] = []
-        content_started = False
-        tool_calls_started = False
-        content_buf = ""
-        tool_call_fragments: list = []
-        finish_reason = ""
+        state: dict[str, Any] = {}
+        for kind, payload in _run_attempt(current_messages, current_tools, extra_payload):
+            if kind == "chunk":
+                yield payload
+            else:
+                state = payload
+        trace.upstream_latencies_ms.append(int((time.time() - t0) * 1000))
+        trace.iterations = iteration
 
-        try:
-            for chunk in _stream_upstream(cfg, current_messages, current_tools, extra_payload):
-                choices = chunk.get("choices") or []
-                if not choices:
-                    # usage-only / 心跳块:决定后继续转发,决定前 buffer
-                    if content_started:
-                        yield chunk
-                    elif not tool_calls_started:
-                        chunk_buffer.append(chunk)
-                    continue
-                ch0 = choices[0] or {}
-                delta = ch0.get("delta") or {}
-                fr = ch0.get("finish_reason")
-                if fr:
-                    finish_reason = str(fr)
-
-                tc_delta = delta.get("tool_calls")
-                content_delta = delta.get("content")
-
-                # tool_calls delta:Qwen 偶尔会同时给"思考过程"content + tool_calls,
-                # 我们以 tool_calls 为准,丢弃思考过程(不让用户看到工具调用前的 think)。
-                if tc_delta:
-                    if not content_started and not tool_calls_started:
-                        tool_calls_started = True
-                        chunk_buffer = []  # 这一轮不会有正文流给前端
-                    if tool_calls_started:
-                        tool_call_fragments.append(tc_delta)
-                    continue
-
-                # 正文 delta
-                if isinstance(content_delta, str) and content_delta:
-                    if not content_started and not tool_calls_started:
-                        content_started = True
-                        # flush 之前 buffer 的 role 块等
-                        for buffered in chunk_buffer:
-                            yield buffered
-                        chunk_buffer = []
-                    if content_started:
-                        yield chunk
-                        content_buf += content_delta
-                    # tool_calls_started + 后续 content delta:静默丢弃(已决定走工具调用)
-                    continue
-
-                # role-only / finish-only / 心跳块
-                if content_started:
-                    yield chunk  # 转发 finish_reason / usage chunk 给前端
-                elif not tool_calls_started:
-                    chunk_buffer.append(chunk)
-                # tool_calls_started 但本 chunk 没 tc_delta:静默丢弃
-        except Exception as exc:  # noqa: BLE001
+        # upstream_error 短路
+        if state.get("path") == "upstream_error":
             yield _sse_progress_chunk(
-                model, "agent_error", f"upstream error: {exc}", iteration=iteration
+                model, "agent_error",
+                f"upstream error: {state.get('error', '')}",
+                iteration=iteration,
             )
             trace.stopped_reason = "upstream_error"
             yield _sse_trace_chunk(model, trace)
             return
 
-        trace.upstream_latencies_ms.append(int((time.time() - t0) * 1000))
-        trace.iterations = iteration
+        # ── v0.2.14 空响应识别 + 禁 thinking 重试 ──────────────────────
+        # Qwen thinking 模式有时只发 reasoning,content 全空或仅 \n\n(BACKEND_REQUESTS
+        # variant 1)。或 finish_reason=tool_calls 但 fragments 拼不出工具调用
+        # (variant 2)。两者都归入 path='empty',这里做一次 enable_thinking=false 的
+        # 重试 —— 大多数情况下能拿回真 content 或真 tool_calls。
+        if state.get("path") == "empty" and empty_retries_used < cfg.max_empty_retries:
+            empty_retries_used += 1
+            progress_cb(
+                "agent_empty_answer_retry",
+                "上游本轮仅输出思考过程,以禁用 thinking 重试",
+                {
+                    "iteration": iteration,
+                    "reasoning_chars": len(state.get("reasoning_buf", "")),
+                    "finish_reason": state.get("finish_reason", ""),
+                },
+            )
+            yield from _drain_queue()
+            retry_extra = _build_no_thinking_extra(extra_payload)
+            t_retry = time.time()
+            for kind, payload in _run_attempt(current_messages, current_tools, retry_extra):
+                if kind == "chunk":
+                    yield payload
+                else:
+                    # 保留 reasoning_buf:retry 也可能仅给 reasoning,合并最新的
+                    prev_reasoning = state.get("reasoning_buf", "")
+                    state = payload
+                    if not state.get("reasoning_buf"):
+                        state["reasoning_buf"] = prev_reasoning
+            trace.upstream_latencies_ms.append(int((time.time() - t_retry) * 1000))
+
+            if state.get("path") == "upstream_error":
+                yield _sse_progress_chunk(
+                    model, "agent_error",
+                    f"empty-answer retry upstream error: {state.get('error', '')}",
+                    iteration=iteration,
+                )
+                trace.stopped_reason = "upstream_error"
+                yield _sse_trace_chunk(model, trace)
+                return
+
+        path = state.get("path")
 
         # ── 真流式正文路径:弱化审计 + 终结 ─────────────────────────────
-        if content_started:
+        if path == "content":
+            content_buf = state.get("content_buf", "")
+            finish_reason = state.get("finish_reason", "")
             trace.final_finish_reason = finish_reason or "stop"
             trace.answer_truncated = finish_reason == "length"
             trace.stopped_reason = trace.stopped_reason or (
@@ -1618,18 +1771,15 @@ def run_agent_stream(
             return
 
         # ── tool_calls 路径:拼装 + dispatch + 进入下一轮 ─────────────────
-        if tool_calls_started:
-            assembled = _assemble_tool_calls_from_deltas(tool_call_fragments)
+        if path == "tool_calls":
+            assembled = _assemble_tool_calls_from_deltas(state.get("tool_call_fragments", []))
+            # 双保险:_speculative_iteration 已检查 assembled 非空,但 retry path
+            # 可能合并状态时丢失,这里再保护一次。
             if not assembled:
-                trace.stopped_reason = "no_choices"
-                yield _sse_progress_chunk(model, "agent_warn", "tool_calls 流式拼装失败")
-                yield _sse_trace_chunk(model, trace)
-                return
+                path = "empty"
 
-            # is_last 时不应进这一支(tools=[] + FORCE_ANSWER_SYSTEM_HINT 通常拦得住),
-            # 但模型偶尔无视提示词继续请求工具 —— 走非流式合成兜底,然后切片仿真流式
-            # 发出去(这是 v0.2.13 唯一保留的退化路径)。
-            if is_last:
+            elif is_last:
+                # 强制作答轮模型仍请求工具:走合成兜底
                 progress_cb(
                     "agent_force_answer_fallback",
                     "强制作答轮仍请求工具,退化到合成兜底",
@@ -1650,33 +1800,116 @@ def run_agent_stream(
                 yield _sse_trace_chunk(model, trace)
                 return
 
-            assistant_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": assembled,
-            }
-            progress_cb(
-                "tools_dispatch",
-                f"模型请求 {len(assembled)} 个工具调用",
-                {"count": len(assembled), "iteration": iteration},
-            )
-            yield from _drain_queue()
-            tool_messages = _dispatch_tool_calls_parallel(
-                assembled, registry, cfg, progress_cb, trace, seen_signatures,
-                sources_cb=sources_cb,
-            )
-            yield from _drain_queue()
-            augmented = augmented + [assistant_message] + tool_messages
-            continue
+            else:
+                # 正常 dispatch
+                assistant_message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": assembled,
+                }
+                progress_cb(
+                    "tools_dispatch",
+                    f"模型请求 {len(assembled)} 个工具调用",
+                    {"count": len(assembled), "iteration": iteration},
+                )
+                yield from _drain_queue()
+                tool_messages = _dispatch_tool_calls_parallel(
+                    assembled, registry, cfg, progress_cb, trace, seen_signatures,
+                    sources_cb=sources_cb,
+                )
+                yield from _drain_queue()
+                augmented = augmented + [assistant_message] + tool_messages
+                continue
 
-        # 既没 content 也没 tool_calls:空响应
+        # ── 空响应兜底:重试已用完或仍空 → reasoning 当答案 ───────────────
+        if path == "empty":
+            reasoning_buf = state.get("reasoning_buf", "") or ""
+            finish_reason = state.get("finish_reason", "")
+            # is_last 时优先走合成兜底(已有 system prompt + 工具结果摘要,更可能产出正经答案)
+            if is_last:
+                progress_cb(
+                    "agent_force_answer_fallback",
+                    f"强制作答轮上游空响应(finish={finish_reason or 'unknown'}),走合成兜底",
+                    {
+                        "iteration": iteration,
+                        "reasoning_chars": len(reasoning_buf),
+                    },
+                )
+                yield from _drain_queue()
+                synthesized = _synthesize_answer(cfg, augmented, extra_payload, trace)
+                if synthesized:
+                    trace.stopped_reason = "answered_synthesized"
+                    payload_text = synthesized
+                elif reasoning_buf.strip():
+                    trace.stopped_reason = "answered_from_reasoning"
+                    payload_text = (
+                        "（以下是模型的思考过程作为兜底答案，可能不是最终结论；"
+                        "建议点「重新生成」再试一次。）\n\n"
+                        + reasoning_buf.strip()
+                    )
+                else:
+                    trace.stopped_reason = "answered_empty_fallback"
+                    payload_text = (
+                        "（抱歉，本轮模型未输出有效内容，请重新生成或换一种问法。）"
+                    )
+                trace.final_finish_reason = "stop"
+                fake_resp = {"id": "agent-final-empty", "created": int(time.time())}
+                yield from _stream_final_answer(model, payload_text, fake_resp)
+                yield _sse_trace_chunk(model, trace)
+                return
+
+            # 非最后一轮的 empty:reasoning 兜底 + 结束(不强行进入下一轮 —— 模型已经
+            # 表态没东西可输出,继续循环只会重复同样的空响应)
+            if reasoning_buf.strip():
+                progress_cb(
+                    "agent_empty_answer_recovered",
+                    "上游本轮 content 为空,展示思考过程作为兜底答案",
+                    {
+                        "iteration": iteration,
+                        "reasoning_chars": len(reasoning_buf),
+                        "finish_reason": finish_reason,
+                    },
+                )
+                yield from _drain_queue()
+                trace.stopped_reason = "answered_from_reasoning"
+                trace.final_finish_reason = "stop"
+                payload_text = (
+                    "（以下是模型的思考过程作为兜底答案，可能不是最终结论；"
+                    "建议点「重新生成」再试一次。）\n\n"
+                    + reasoning_buf.strip()
+                )
+                fake_resp = {"id": "agent-final-reasoning", "created": int(time.time())}
+                yield from _stream_final_answer(model, payload_text, fake_resp)
+                yield _sse_trace_chunk(model, trace)
+                return
+
+            # 连 reasoning 都没有 —— 最终兜底
+            progress_cb(
+                "agent_empty_answer_recovered",
+                f"上游本轮完全空响应(finish={finish_reason or 'unknown'}),使用固定兜底文案",
+                {"iteration": iteration, "finish_reason": finish_reason},
+            )
+            yield from _drain_queue()
+            trace.stopped_reason = "answered_empty_fallback"
+            trace.final_finish_reason = "stop"
+            fake_resp = {"id": "agent-final-empty", "created": int(time.time())}
+            yield from _stream_final_answer(
+                model,
+                "（抱歉，本轮模型未输出有效内容，请重新生成或换一种问法。）",
+                fake_resp,
+            )
+            yield _sse_trace_chunk(model, trace)
+            return
+
+        # 防御性:未知 path
         trace.stopped_reason = "no_choices"
-        yield _sse_progress_chunk(model, "agent_warn", "upstream returned no choices")
+        yield _sse_progress_chunk(model, "agent_warn", f"unexpected path: {path}")
         yield _sse_trace_chunk(model, trace)
         return
 
 
-# Note: v0.2.13 把每轮调用都改成 _stream_upstream + 投机式判定 content/tool_calls,
-# 真流式直接转发上游 delta;之前的"非流式 inspection + _stream_final_answer 切片
-# 仿真流"路径只在强制作答轮模型仍请求工具的兜底场景保留。同步弱化了审计 ——
-# 流出去的字符没法收回,citation 警告改成单独的 progress 事件,不再追加到正文。
+# Note: v0.2.14 在 v0.2.13 投机式真流式基础上加了空响应识别 + 兜底 ——
+# 1. content_started 只在非空白 content delta 时才承诺(避免 \n\n 把路径锁死)
+# 2. 流结束后若仍未承诺,标记 path=empty,自动重试一次禁 thinking 的请求
+# 3. 重试也失败就用 reasoning_buf 当兜底答案,加 prefix 提示用户重试
+# 4. 强制作答轮的 empty 优先走 _synthesize_answer 合成,失败才退到 reasoning
