@@ -830,6 +830,32 @@ def _ensure_system_prompt(
     return head + list(messages)
 
 
+def _inject_force_answer_hint(
+    messages: list[dict[str, Any]],
+    hint: str,
+) -> list[dict[str, Any]]:
+    """合并 force_answer hint 进**头部** system 消息,而不是在末尾另开一条。
+
+    v0.2.19 修复:EAS upstream 严校验「System message must be at the beginning」,
+    之前 ``augmented + [{role:system, ...}]`` 把第二条 system 追加在末尾会触发
+    HTTP 400(只在 force_answer 那一轮、且历史很长时才容易撞 —— 短会话碰巧没
+    被严校验拦下来)。
+
+    合并策略:把 hint 拼到原 system 末尾(分隔双换行),其余消息原样保留。
+    上下文末尾顺势是 user/tool 消息,符合 EAS 期望的"system 在前,对话在后"形态。
+    若历史里没有 system(理论上 _ensure_system_prompt 保证有),退化为开头插一条。
+    """
+    if not hint:
+        return list(messages)
+    out = list(messages)
+    if out and out[0].get("role") == "system":
+        existing = str(out[0].get("content") or "")
+        merged = existing + ("\n\n" if existing else "") + hint
+        out[0] = {**out[0], "content": merged}
+        return out
+    return [{"role": "system", "content": hint}] + out
+
+
 def _make_tool_message(
     tc: dict[str, Any],
     result: Any,
@@ -1347,7 +1373,9 @@ def run_agent(
         if is_last:
             # On the final iteration, hide the tools to force the model to answer.
             current_tools: list[dict[str, Any]] = []
-            current_messages = augmented + [{"role": "system", "content": FORCE_ANSWER_SYSTEM_HINT}]
+            # v0.2.19: 合并 hint 进头部 system,不在末尾另开一条 ——
+            # EAS upstream 严校验「System message must be at the beginning」。
+            current_messages = _inject_force_answer_hint(augmented, FORCE_ANSWER_SYSTEM_HINT)
             _emit(progress_cb, "agent_force_answer", "最后一轮，强制模型作答", iteration=iteration)
         else:
             current_tools = tools
@@ -1768,7 +1796,9 @@ def run_agent_stream(
         is_last = iteration == cfg.max_iterations
         if is_last:
             current_tools: list[dict[str, Any]] = []
-            current_messages = augmented + [{"role": "system", "content": FORCE_ANSWER_SYSTEM_HINT}]
+            # v0.2.19: 合并 hint 进头部 system,不在末尾另开一条 ——
+            # EAS upstream 严校验「System message must be at the beginning」。
+            current_messages = _inject_force_answer_hint(augmented, FORCE_ANSWER_SYSTEM_HINT)
             progress_cb("agent_force_answer", "最后一轮，强制模型作答", {"iteration": iteration})
         else:
             current_tools = tools
