@@ -157,7 +157,35 @@ with `jq` / Loki / equivalent.
 
 - `baidu` provider returns Baidu redirect URLs (`baidu.com/link?url=...`);
   they resolve correctly when fetched but look opaque in citations.
-- The final forced-answer iteration is non-streaming (it must be sanitized
-  for leaked tool-call markup).
 - `/v1/agent` performs no authentication of its own — deploy it behind a
   trusted gateway or network boundary.
+- Real-streaming mode (v0.2.13+) cannot rewrite content once it leaves the
+  wire, so the `<tool_call>` leak strip and "dig deeper" pushback paths
+  are bypassed in the streaming endpoint. The non-streaming JSON endpoint
+  still runs the full audit. Citation audit still runs and surfaces as a
+  separate `citation_warn` progress event after the answer streams.
+
+## Streaming Protocol (`/v1/agent/chat/completions`, `stream: true`)
+
+The agent emits OpenAI-compatible chunks interleaved with these extension
+fields:
+
+| Field | When | Shape |
+|---|---|---|
+| `x_adapter_agent_progress` | every loop boundary / tool call / warning | `{stage, message, ...meta}` |
+| `x_adapter_sources` | after each successful `web_search` tool call | **flat array** `[{url, title, favicon, snippet, n}]` — `n` is session-level monotonic id |
+| `x_adapter_agent_trace` | once, immediately before `data: [DONE]` | full run trace |
+
+Frontend matches inline `[N]` citations against `x_adapter_sources[*].n`.
+The same source URL surfacing in multiple `web_search` calls gets distinct
+`n` values (sources event fires per call) — dedup by `url` on the frontend
+to render one chip per source.
+
+Real-streaming behaviour (v0.2.13+): for every iteration, the adapter
+forwards upstream `delta.content` chunks live the moment the model starts
+writing prose. If the model instead emits `delta.tool_calls`, the adapter
+swallows those silently, dispatches the tools, and continues the loop —
+the frontend never sees partial tool-call markup. Only the forced-answer
+fallback path (final iteration still requesting tools, rare) buffers the
+synthesized answer and slices it artificially; it is announced with an
+`agent_force_answer_fallback` progress event.
