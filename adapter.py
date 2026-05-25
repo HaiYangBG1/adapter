@@ -54,6 +54,10 @@ from agentic_web import (
 
 HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
+# 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
+# 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.20")
+ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
 UPSTREAM_AUTH_HEADER = os.environ.get("ADAPTER_UPSTREAM_AUTH_HEADER", "Authorization")
@@ -2717,6 +2721,8 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "status": "ok",
+                    "version": ADAPTER_VERSION,
+                    "git_sha": ADAPTER_GIT_SHA or None,
                     "upstream": UPSTREAM,
                     "capabilities": {
                         "document": True,
