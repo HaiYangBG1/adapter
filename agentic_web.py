@@ -619,6 +619,39 @@ def _assemble_tool_calls_from_deltas(delta_fragments: list) -> list[dict[str, An
     return [by_index[k] for k in sorted(by_index)]
 
 
+def _filter_valid_tool_calls(
+    assembled: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """过滤掉 ``arguments`` 不合法的 tool_call(真流式拼装"半成品")。
+
+    问题来源:Qwen 真流式 tool_calls 偶尔同时 emit 多个调用,但只发完其中一个
+    的 ``function.arguments`` fragments 就 ``finish_reason=tool_calls``,留下
+    其他的 ``arguments=""``。这种 tool_call 一旦塞进 assistant_message 喂回上游,
+    EAS 会**立刻 HTTP 400**(OpenAI 协议:``arguments`` 必须是合法 JSON 字符串)。
+
+    过滤规则:``arguments`` 必须是非空字符串且能 ``json.loads``。``arguments=="{}"``
+    是合法的(代表"无参数调用"),保留 —— 让 dispatcher 报错给模型,模型下一轮
+    能自行修正;直接 drop 会让模型看不到自己的失败。
+
+    Returns: (valid_list, dropped_count)
+    """
+    valid: list[dict[str, Any]] = []
+    dropped = 0
+    for tc in assembled:
+        fn = tc.get("function") or {}
+        raw = fn.get("arguments", "")
+        if not isinstance(raw, str) or not raw.strip():
+            dropped += 1
+            continue
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError:
+            dropped += 1
+            continue
+        valid.append(tc)
+    return valid, dropped
+
+
 def _call_signature(tool_call: dict[str, Any]) -> str:
     """Stable signature for de-duplication: name + canonicalized args."""
     fn = tool_call.get("function", {}) or {}
@@ -1551,11 +1584,16 @@ def _speculative_iteration(
         return
 
     # 决定最终 path
+    assembled: list[dict[str, Any]] = []
+    dropped_invalid = 0
     if content_started:
         path = "content"
     elif tool_calls_started:
-        # 工具调用承诺了但 fragments 拼不出来 —— 算 empty
+        # 拼装 + v0.2.15 过滤 args 不合法的"半成品" tool_call。全没了归 empty,
+        # 让调用方触发 retry / reasoning 兜底,而不是 dispatch 一堆空 args 调用
+        # 然后把 history 喂坏 EAS 触发 400。
         assembled = _assemble_tool_calls_from_deltas(tool_call_fragments)
+        assembled, dropped_invalid = _filter_valid_tool_calls(assembled)
         path = "tool_calls" if assembled else "empty"
     else:
         # 既没真 content,也没 tool_calls。可能只有 whitespace content + reasoning。
@@ -1566,6 +1604,8 @@ def _speculative_iteration(
         "content_buf": content_buf,
         "reasoning_buf": reasoning_buf,
         "tool_call_fragments": tool_call_fragments,
+        "assembled_tool_calls": assembled,        # v0.2.15: 已过滤的 tool_calls
+        "dropped_invalid_tool_calls": dropped_invalid,  # 供主循环发 progress
         "finish_reason": finish_reason,
     })
 
@@ -1706,6 +1746,20 @@ def run_agent_stream(
             yield _sse_trace_chunk(model, trace)
             return
 
+        # v0.2.15: 提前发 filter progress 事件 —— 不管最终 path 是 tool_calls
+        # 还是 empty(全过滤光),前端都该知道"有一些 tool_call 被丢了"
+        if state.get("dropped_invalid_tool_calls", 0) > 0:
+            progress_cb(
+                "agent_tool_calls_filtered",
+                f"丢弃 {state['dropped_invalid_tool_calls']} 个 args 不合法的工具调用(上游真流式拼装失败)",
+                {
+                    "dropped": state["dropped_invalid_tool_calls"],
+                    "remaining": len(state.get("assembled_tool_calls") or []),
+                    "iteration": iteration,
+                },
+            )
+            yield from _drain_queue()
+
         # ── v0.2.14 空响应识别 + 禁 thinking 重试 ──────────────────────
         # Qwen thinking 模式有时只发 reasoning,content 全空或仅 \n\n(BACKEND_REQUESTS
         # variant 1)。或 finish_reason=tool_calls 但 fragments 拼不出工具调用
@@ -1770,11 +1824,17 @@ def run_agent_stream(
             yield _sse_trace_chunk(model, trace)
             return
 
-        # ── tool_calls 路径:拼装 + dispatch + 进入下一轮 ─────────────────
+        # ── tool_calls 路径:dispatch + 进入下一轮 ────────────────────────
         if path == "tool_calls":
-            assembled = _assemble_tool_calls_from_deltas(state.get("tool_call_fragments", []))
-            # 双保险:_speculative_iteration 已检查 assembled 非空,但 retry path
-            # 可能合并状态时丢失,这里再保护一次。
+            # v0.2.15: _speculative_iteration 已经过滤过 args 不合法的工具调用,
+            # 这里直接用 state["assembled_tool_calls"]。
+            assembled = state.get("assembled_tool_calls") or []
+            # 双保险:retry path 合并状态时可能丢失 assembled,fallback 拼一次
+            if not assembled:
+                assembled = _assemble_tool_calls_from_deltas(
+                    state.get("tool_call_fragments", [])
+                )
+                assembled, _ = _filter_valid_tool_calls(assembled)
             if not assembled:
                 path = "empty"
 
