@@ -475,14 +475,16 @@ class AgentConfig:
     # 重试一次**,带 chat_template_kwargs.enable_thinking=false 强制模型直出 content。
     # 仍空就用 reasoning_buf 作兜底答案。0 关闭重试,纯走 reasoning 兜底。
     max_empty_retries: int = 1
-    # v0.2.17 thinking 策略:agentic 循环每轮单独决定是否启用 thinking。
-    # - intermediate(前 N-1 轮,主要任务是"决策调哪个工具"):默认**关**,因为模型
-    #   有 tool_call 这个外置思考机制,内置 chain-of-thought 在 tool-call 决策场景
-    #   下基本是浪费输出 token + 拖慢推理 + 增加触发"只输出 reasoning 忘了 content"
-    #   bug 的概率。关掉直接消灭 v0.2.14 兜底的整类场景。
-    # - force_answer(最后一轮综合所有工具结果作答):默认**开**,质量优先。
+    # v0.2.17 / v0.2.20 thinking 策略:agentic 循环每轮单独决定是否启用 thinking。
+    # - intermediate(前 N-1 轮,决策调哪个工具):默认**关**,模型有 tool_call 这个
+    #   外置思考机制,内置 chain-of-thought 在工具决策场景是浪费 + 易出 v0.2.14 bug。
+    # - force_answer(最后一轮综合所有工具结果作答):v0.2.17 默认开;**v0.2.20 改默认关**
+    #   —— 实测 thinking 产生的 reasoning_content delta 透传给前端会被当成噪音
+    #   (前端识别 delta.content 不识别 reasoning_content),且 EAS 仍消耗输出 token
+    #   生成思考。关掉后:答案质量经验证没退化、流更干净、节省 token、彻底消灭
+    #   "force_answer 也偶发 thinking-only 空 content"潜在 bug。
     intermediate_thinking_enabled: bool = False
-    force_answer_thinking_enabled: bool = True
+    force_answer_thinking_enabled: bool = False
 
 
 @dataclass
@@ -655,6 +657,32 @@ def _assemble_tool_calls_from_deltas(delta_fragments: list) -> list[dict[str, An
             if isinstance(fn.get("arguments"), str):
                 cur["function"]["arguments"] += fn["arguments"]
     return [by_index[k] for k in sorted(by_index)]
+
+
+def _tool_args_preview(tc: dict[str, Any]) -> str:
+    """v0.2.20: 给 ``tools_dispatch`` 事件用,提取工具调用最关键的可读字段。
+
+    web_search → query;web_fetch/web_view → url;excel_query → question;
+    其他 → 整段 arguments JSON 截 60 char。前端拿来在 pending 步骤上预显示
+    "搜索: <query>" / "抓取: <url>" / "查询: <question>"。
+    """
+    fn = tc.get("function") or {}
+    name = fn.get("name") or ""
+    raw = fn.get("arguments") or "{}"
+    try:
+        args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return str(raw)[:60]
+    if not isinstance(args, dict):
+        return str(args)[:60]
+    if name == "web_search":
+        return str(args.get("query") or "")[:120]
+    if name in ("web_fetch", "web_view"):
+        return str(args.get("url") or "")[:160]
+    if name == "excel_query":
+        return str(args.get("question") or "")[:160]
+    # 通用兜底
+    return json.dumps(args, ensure_ascii=False)[:80]
 
 
 def _filter_valid_tool_calls(
@@ -951,7 +979,12 @@ def _dispatch_tool_calls_parallel(
         fresh.append((idx, tc, name, args))
 
     def _run_one(idx: int, tc: dict[str, Any], name: str, args: dict[str, Any]) -> None:
-        _emit(progress_cb, "tool_start", f"调用 {name}", name=name, args=args)
+        # v0.2.20: 带 tool_call_id —— 前端用它把 tool_start / tool_end
+        # 精确配对(并发场景下两个 tool_start 紧挨着,如果不带 id 没法知道
+        # 后续的 tool_end 对应哪一个,会让"检索过程"步骤列表 active/done 乱掉)
+        tc_id = tc.get("id", "") or f"tc_{idx}"
+        _emit(progress_cb, "tool_start", f"调用 {name}",
+              tool_call_id=tc_id, name=name, args=args)
         t0 = time.time()
         result = registry.dispatch(name, args)
         elapsed_ms = int((time.time() - t0) * 1000)
@@ -985,8 +1018,10 @@ def _dispatch_tool_calls_parallel(
             progress_cb,
             "tool_end",
             f"{name} 完成 ({elapsed_ms}ms{', 图片' if is_image else ''})",
+            tool_call_id=tc_id,    # v0.2.20: 跟 tool_start 配对
             name=name,
             elapsed_ms=elapsed_ms,
+            ok=ok,                  # v0.2.20: 失败时前端可标 step 为 error 态
             modality="image" if is_image else "text",
         )
         indexed[idx] = _make_tool_message(tc, result, cfg.max_tool_result_chars)
@@ -1977,10 +2012,25 @@ def run_agent_stream(
                     "content": "",
                     "tool_calls": assembled,
                 }
+                # v0.2.20: 带每个工具的 id + name + 摘要参数,让前端在 dispatch
+                # 那一刻就能预渲染 N 个 pending step 占位(状态条),后续的
+                # tool_start / tool_end(也带 tool_call_id)按 id 配对推进状态。
+                tc_meta = [
+                    {
+                        "tool_call_id": tc.get("id", "") or f"tc_{i}",
+                        "name": (tc.get("function") or {}).get("name", ""),
+                        "args_preview": _tool_args_preview(tc),
+                    }
+                    for i, tc in enumerate(assembled)
+                ]
                 progress_cb(
                     "tools_dispatch",
                     f"模型请求 {len(assembled)} 个工具调用",
-                    {"count": len(assembled), "iteration": iteration},
+                    {
+                        "count": len(assembled),
+                        "iteration": iteration,
+                        "tool_calls": tc_meta,
+                    },
                 )
                 yield from _drain_queue()
                 tool_messages = _dispatch_tool_calls_parallel(
