@@ -752,34 +752,26 @@ def _truncate_tool_result(value: Any, max_chars: int) -> str:
 
 
 # ── Context 预算估算 + 裁剪(防 force_answer 把 EAS 输入撑爆 400)──────────
-# 真实问题:多轮 web_search + web_fetch 累积后,force_answer 把整段 history
-# 喂给上游,可能超 Qwen3.5 输入上限(256K - 输出预留)。每张 web_view 截图按
-# 多模态算 ~1000-2000 tokens,粗略按 2000 char 估算。
-
-_IMAGE_PSEUDO_CHARS = 2000
+# 真实问题:多轮 web_search + web_fetch + web_view 累积后,force_answer 把整段
+# history 喂给上游,容易撞 EAS 输入上限。早期版本按 image_url 占 2000 char 估算,
+# 但 base64 image data 的 JSON 表示通常 100KB+,严重低估 —— 含图历史的真实 body
+# 可能 300KB+ 而 estimator 只算 30K,导致 truncate 不触发。
+# v0.2.23 修正:直接对每条 message 做 ``json.dumps`` 取其序列化长度。准确反映
+# 即将送上游的实际字节数,代价是每次裁剪检查多一次 dump(可接受)。
 
 
 def _estimate_messages_size(messages: list) -> int:
-    """估算 messages 总 char 数(图片按 _IMAGE_PSEUDO_CHARS 算)。不精确但够用。"""
+    """估算 messages 总 char 数 —— 用真实 JSON 序列化长度。
+
+    含 multimodal content (image_url base64) 的消息按真实 base64 体积算,不再
+    低估。失败的消息按 200 char 兜底。
+    """
     total = 0
     for m in messages:
-        c = m.get("content")
-        if isinstance(c, str):
-            total += len(c)
-        elif isinstance(c, list):
-            for part in c:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") == "text":
-                    total += len(part.get("text") or "")
-                elif part.get("type") == "image_url":
-                    total += _IMAGE_PSEUDO_CHARS
-        tcs = m.get("tool_calls") or []
-        if tcs:
-            try:
-                total += len(json.dumps(tcs, ensure_ascii=False))
-            except (TypeError, ValueError):
-                total += 200 * len(tcs)
+        try:
+            total += len(json.dumps(m, ensure_ascii=False))
+        except (TypeError, ValueError):
+            total += 200
     return total
 
 
