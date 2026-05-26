@@ -56,7 +56,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.22")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.23")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -2814,14 +2814,23 @@ class Handler(BaseHTTPRequestHandler):
             # 调用编造的占位 URL 会被审计误报成「疑似编造」。
             cfg.citation_guard = False
         # Forward all non-loop-related sampling params (temperature, max_tokens, etc.)
+        # 同时解包客户端 `extra_body`(OpenAI / litellm SDK 标准放扩展参数的字段)
+        # 到顶层 —— 否则诸如 chat_template_kwargs / enable_thinking 这种 EAS 才
+        # 认的字段会被嵌在 extra.extra_body.* 里,agent loop 拿不到。
+        # **v0.2.23 修这个长期潜伏 bug**:从 v0.2.13 起前端的「深度思考」chip 一直
+        # 不生效就是因为这层解包缺失。
+        client_extra_body = payload.get("extra_body") if isinstance(payload.get("extra_body"), dict) else {}
         extra = {
             k: v
             for k, v in payload.items()
             if k not in {
                 "messages", "model", "stream", "tools", "tool_choice",
-                "parallel_tool_calls", "excel_dataset_id",
+                "parallel_tool_calls", "excel_dataset_id", "extra_body",
             }
         }
+        # extra_body 字段不能覆盖顶层已有同名键(顶层优先 —— 保留显式控制权)
+        for _k, _v in client_extra_body.items():
+            extra.setdefault(_k, _v)
         # Inject a sane max_tokens default when the client didn't set one —
         # agentic answers need headroom or they truncate mid-thought.
         if not extra.get("max_tokens") and not extra.get("max_completion_tokens"):
