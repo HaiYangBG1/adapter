@@ -491,6 +491,15 @@ class AgentConfig:
     #     True/False   = 硬覆盖(测试 / 临时压问题用)
     intermediate_thinking_enabled: bool = False
     force_answer_thinking_enabled: Optional[bool] = None
+    # v0.2.24 plan B(Anthropic 模式):force_answer 之前把历史里的 assistant
+    # tool_calls + tool 对**重写**成 assistant narration("我已查到这些资料: ..."),
+    # 消除模型自己 emit 过的 tool_call JSON 痕迹。原因:Qwen3.5 在 force_answer
+    # 看到前 N 轮 tool_call history 时容易被 prime 走 tool_call mimicking path,
+    # 即使 enable_thinking=true 也常不激活 thinking(实测 chip ON 激活率 ~10%)。
+    # Anthropic Claude 4 模型对自己历史 robust 不需要这步;Qwen3.5 不行,得 adapter
+    # 层来扛。True = 重写(更好的 chip ON 激活率,但 KV cache miss 多 1-2s 延迟)。
+    # v0.2.24 默认 True,实验后若激活率提升不达预期可回切。
+    force_answer_rewrite_history: bool = True
 
 
 @dataclass
@@ -854,6 +863,173 @@ def _ensure_system_prompt(
         head = [{"role": "system", "content": rendered + "\n\n" + str(existing)}]
         return head + list(messages[1:])
     return head + list(messages)
+
+
+def _extract_tool_result_parts(content: Any) -> tuple[str, list[dict[str, Any]]]:
+    """从 tool message 的 content 抽出 (纯文本摘要, 多模态 image_url 部分列表)。
+
+    支持 OpenAI 多模态 content list:``[{"type":"text",...}, {"type":"image_url",...}]``
+    (web_view 截图就是这种形态)。返回 (文本, 图片 parts),用于 rewrite history。
+    """
+    if isinstance(content, str):
+        return content, []
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        image_parts: list[dict[str, Any]] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype == "text":
+                text_parts.append(str(part.get("text") or ""))
+            elif ptype == "image_url":
+                image_parts.append(part)
+        return "\n".join(p for p in text_parts if p), image_parts
+    return str(content) if content is not None else "", []
+
+
+_REWRITE_TOOL_RESULT_PREVIEW_CHARS = 1500  # 每条 tool 结果在 narration 中保留长度
+
+
+def _rewrite_history_for_force_answer(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """v0.2.24 plan B(Anthropic 模式):把 history 里的 assistant tool_calls 和
+    tool result 对**重写**成普通 assistant narration,消除 tool_call JSON 痕迹。
+
+    输入(典型 force_answer 之前的 messages):
+        [
+          {role:system, content:"<merged hint>"},
+          {role:user,   content:"<原问题>"},
+          {role:assistant, tool_calls:[ws,ws], content:""},
+          {role:tool,    tool_call_id, content:"..."},
+          {role:tool,    tool_call_id, content:"..."},
+          {role:assistant, tool_calls:[wf,wv], ...},
+          {role:tool,    tool_call_id, content:"..."},
+          {role:tool,    tool_call_id, content:[multimodal img]},
+          ... 5+ 轮
+        ]
+
+    输出:
+        [
+          {role:system, content:"<merged hint>"},
+          {role:user,   content:"<原问题>"},
+          {role:assistant, content:"以下是我已经收集到的资料:\\n1. 【web_search】query → ...\\n2. ..."},
+          {role:user,   content:[{type:"text","text":"以下是截图供参考:"}, image, image]}  # 仅在有截图时
+        ]
+
+    为什么这样:Qwen3.5 看到自己历史里的 tool_call JSON 会被 prime 走 mimicking
+    path,即使 enable_thinking=true 也常不激活 thinking。Anthropic Claude 在多轮
+    extended-thinking + tool use 时服务端自动 strip thinking blocks;Qwen3.5 模型
+    本身不像 Claude 4 那样 robust,我们需要更激进的 history cleanup。
+    """
+    if not messages:
+        return messages
+
+    out: list[dict[str, Any]] = []
+    pending: dict[str, dict[str, Any]] = {}  # tool_call_id -> {name, args_preview}
+    narration_entries: list[dict[str, Any]] = []
+    multimodal_parts: list[dict[str, Any]] = []
+
+    def _flush() -> None:
+        """把累积的 narration 输出成 assistant message + 可选的 user image message。"""
+        if not narration_entries and not multimodal_parts:
+            return
+        if narration_entries:
+            lines = ["以下是我已经通过工具收集到的资料(按调用顺序):", ""]
+            for i, entry in enumerate(narration_entries, 1):
+                args = entry["args_preview"]
+                args_str = f" {args}" if args else ""
+                ok_mark = "" if entry["ok"] else "  ⚠️[调用失败]"
+                lines.append(f"{i}. 【{entry['name']}】{args_str}{ok_mark}")
+                if entry["result_preview"]:
+                    # 缩进显示结果摘要
+                    result_lines = entry["result_preview"].splitlines()
+                    for rl in result_lines[:30]:  # 单条最多 30 行
+                        lines.append(f"   {rl}")
+                lines.append("")
+            out.append({
+                "role": "assistant",
+                "content": "\n".join(lines).rstrip(),
+            })
+        if multimodal_parts:
+            # OpenAI 协议:multimodal content 只允许在 user/tool message,assistant
+            # 必须是 string。所以截图单独放一条 user message。
+            out.append({
+                "role": "user",
+                "content": [
+                    {"type": "text",
+                     "text": "(以下是上述工具调用过程中截取的页面截图,供综合作答参考)"},
+                    *multimodal_parts,
+                ],
+            })
+        narration_entries.clear()
+        multimodal_parts.clear()
+        pending.clear()
+
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            out.append(m)
+            continue
+        if role == "user":
+            # 用户消息前先 flush 之前累积的工具叙事
+            _flush()
+            out.append(m)
+            continue
+        if role == "assistant":
+            tcs = m.get("tool_calls") or []
+            if tcs:
+                # 记录这些 tool_calls,等对应 tool result 来匹配
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    tcid = tc.get("id") or ""
+                    fn = tc.get("function") or {}
+                    pending[tcid] = {
+                        "name": str(fn.get("name") or ""),
+                        "args_preview": _tool_args_preview(tc),
+                    }
+                # assistant tool_call message 本身**不进 out**,等被 narrate
+                continue
+            # 普通 assistant content(罕见,agent loop 中间通常不会有)
+            if m.get("content"):
+                _flush()
+                out.append(m)
+            continue
+        if role == "tool":
+            tcid = m.get("tool_call_id") or ""
+            meta = pending.pop(tcid, None)
+            if meta is None:
+                # 找不到对应 assistant tool_call:可能历史结构异常,直接跳过
+                continue
+            text, images = _extract_tool_result_parts(m.get("content"))
+            ok = True
+            # 简单失败检测:tool 结果以 "{"error" 开头 / 含 "blocked:"
+            t_strip = text.lstrip()
+            if t_strip.startswith('{"error"') or t_strip.startswith("[blocked"):
+                ok = False
+            # 截到预览长度
+            preview = text
+            if len(preview) > _REWRITE_TOOL_RESULT_PREVIEW_CHARS:
+                preview = (
+                    preview[:_REWRITE_TOOL_RESULT_PREVIEW_CHARS]
+                    + f"\n... [截断, 原文还有 {len(text) - _REWRITE_TOOL_RESULT_PREVIEW_CHARS} 字符]"
+                )
+            narration_entries.append({
+                "name": meta["name"],
+                "args_preview": meta["args_preview"],
+                "result_preview": preview,
+                "ok": ok,
+            })
+            multimodal_parts.extend(images)
+            continue
+        # 其他 role 原样保留
+        out.append(m)
+
+    # 收尾 flush
+    _flush()
+    return out
 
 
 def _inject_force_answer_hint(
@@ -1864,7 +2040,19 @@ def run_agent_stream(
             # v0.2.19: 合并 hint 进头部 system,不在末尾另开一条 ——
             # EAS upstream 严校验「System message must be at the beginning」。
             current_messages = _inject_force_answer_hint(augmented, FORCE_ANSWER_SYSTEM_HINT)
-            progress_cb("agent_force_answer", "最后一轮，强制模型作答", {"iteration": iteration})
+            # v0.2.24 plan B(Anthropic 模式):rewrite history 消除 tool_call JSON 痕迹,
+            # 让 Qwen3.5 在 force_answer 时更可能激活 thinking(尤其 chip ON 场景)。
+            # 默认关 — 通过 cfg 或 extra_body 临时开做 A/B 测试。
+            rewrote_history = False
+            if cfg.force_answer_rewrite_history:
+                before_count = len(current_messages)
+                current_messages = _rewrite_history_for_force_answer(current_messages)
+                rewrote_history = len(current_messages) != before_count
+            progress_cb(
+                "agent_force_answer",
+                "最后一轮，强制模型作答",
+                {"iteration": iteration, "history_rewritten": rewrote_history},
+            )
         else:
             current_tools = tools
             current_messages = augmented
