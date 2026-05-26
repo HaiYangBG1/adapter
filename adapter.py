@@ -56,7 +56,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.24")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.25")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -2813,6 +2813,11 @@ class Handler(BaseHTTPRequestHandler):
             # 数据类请求无 URL 概念 —— 关掉引用合规审计,否则模型为 excel_query
             # 调用编造的占位 URL 会被审计误报成「疑似编造」。
             cfg.citation_guard = False
+            # v0.2.25 L1:第一轮强制 tool_choice 指向 excel_query。修 Qwen3.5
+            # 在 Excel 大表场景偶发的"describe but don't call"退化(模型说"我需要
+            # 先查询一下..."然后没真 emit tool_call,用户看到空话要点重新生成)。
+            # 协议层强制:首轮必须 emit tool_call,不允许直接给文本叙述。
+            cfg.force_first_tool_name = "excel_query"
         # Forward all non-loop-related sampling params (temperature, max_tokens, etc.)
         # 同时解包客户端 `extra_body`(OpenAI / litellm SDK 标准放扩展参数的字段)
         # 到顶层 —— 否则诸如 chat_template_kwargs / enable_thinking 这种 EAS 才
