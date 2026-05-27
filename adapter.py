@@ -56,7 +56,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.25")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.26")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -141,6 +141,15 @@ AGENT_MAX_FETCHES = int(os.environ.get("ADAPTER_AGENT_MAX_FETCHES", "8"))
 AGENT_MAX_SEARCHES = int(os.environ.get("ADAPTER_AGENT_MAX_SEARCHES", "8"))
 # Times the loop forces a "dig deeper" round when the answer hedges on stale data
 AGENT_MAX_PUSHBACKS = int(os.environ.get("ADAPTER_AGENT_MAX_PUSHBACKS", "2"))
+# v0.2.26: agent loop 的 message context 字符预算。100K 是 EAS 262K context 时代
+# 的保守值;EAS 用 YaRN 扩到 1.01M token 后,500K char(~250K token)留 75% buffer
+# 给输出 + 系统模板,且远离 YaRN 高风险区(> 600K token)。
+# 触发裁剪时**只丢早期 role=tool 消息**,user / system 不动,所以提升这个值
+# 主要影响"多轮 web_search/excel_query 累积 tool 结果"的保留度,跟 PPT 看图
+# 多模态那条路径(走 /v1/chat/completions 直转 EAS)无关。
+AGENT_MAX_CONTEXT_CHARS = int(os.environ.get("ADAPTER_AGENT_MAX_CONTEXT_CHARS", "500000"))
+# force_answer 轮单独的更紧预算。0 表示沿用 AGENT_MAX_CONTEXT_CHARS。
+AGENT_FORCE_ANSWER_MAX_CONTEXT_CHARS = int(os.environ.get("ADAPTER_AGENT_FORCE_ANSWER_MAX_CONTEXT_CHARS", "300000"))
 # Phase 3: vision tool (web_view) — controls browser screenshot fallback
 AGENT_WEB_VIEW_ENABLED = os.environ.get("ADAPTER_AGENT_WEB_VIEW_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 AGENT_WEB_VIEW_VIEWPORT = os.environ.get("ADAPTER_AGENT_WEB_VIEW_VIEWPORT", "1280x1600")
@@ -161,7 +170,9 @@ AGENT_FETCH_FALLBACK_MIN_CHARS = int(os.environ.get("ADAPTER_AGENT_FETCH_FALLBAC
 # Default max_tokens injected only when the client did not specify one.
 # Agentic answers (esp. vision-heavy ones) need headroom — too small a value
 # truncates the answer and the model degrades into repetition before the cut.
-AGENT_DEFAULT_MAX_TOKENS = int(os.environ.get("ADAPTER_AGENT_DEFAULT_MAX_TOKENS", "2000"))
+# v0.2.26: 2000 → 8000,EAS 升 1M context 后留更长输出空间,长 PPT/多文档
+# 总结这种场景不再因输出 token 不够被截。
+AGENT_DEFAULT_MAX_TOKENS = int(os.environ.get("ADAPTER_AGENT_DEFAULT_MAX_TOKENS", "8000"))
 
 # excel_query 工具 —— 把表格数据集的精确计算交给外部「代码执行」服务。
 # 该服务地址走环境变量(开源仓库不写死内网地址);留空则不注册 excel_query。
@@ -1700,6 +1711,11 @@ def _build_agent_config(model_from_payload: str) -> AgentConfig:
         max_fetches=AGENT_MAX_FETCHES,
         max_searches=AGENT_MAX_SEARCHES,
         max_pushbacks=AGENT_MAX_PUSHBACKS,
+        # v0.2.26: EAS 升 1M context 后,agent loop 预算从 100K char 默认升到
+        # 500K char(env 可覆盖)。force_answer 单独预算 300K。两个数都从 env 读,
+        # 方便后续不重 build 调阈值。
+        max_context_chars=AGENT_MAX_CONTEXT_CHARS,
+        force_answer_max_context_chars=AGENT_FORCE_ANSWER_MAX_CONTEXT_CHARS,
     )
 
 
