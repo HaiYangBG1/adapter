@@ -546,6 +546,17 @@ class AgentConfig:
     # 0 表示不限制。
     max_reasoning_chars: int = 0
 
+    # v0.2.30 streaming path intent-leak 续轮兜底:Qwen3.5 在多轮 agent 偶发
+    # "流式 content 全是'我将调用 excel_query ...'这类计划叙述、tool_calls 全空"
+    # 的 silent failure(_speculative_iteration 判 path='content' 直接收尾)。
+    # EXCEL_AGENT_SYSTEM_PROMPT v0.2.29 已经在 prompt 层严禁(行 314-318),
+    # 实测仍偶发 → 架构层兜底。命中 _looks_like_intent_not_answer 或
+    # _ends_with_dangling_intent + 有迭代预算 → 流分隔符 + 把 leak content
+    # append 进 history + 加 system 纠正 hint + 进下一轮(下一轮也 force
+    # tool_choice 若 force_first_tool_name 配置)。
+    # 0 = 关闭(等同 < v0.2.30 行为);1 = 推荐默认。
+    max_intent_leak_retries: int = 0
+
     # v0.2.25 L1:带数据集(Excel)的请求,**第一轮**强制 tool_choice 指向唯一
     # 的查询工具(force_first_tool_name),协议层保证模型不能直接给文本叙述。
     # 修的是 Qwen3.5 在 Excel 大表 + 多工具场景偶发的"describe but don't call"
@@ -2122,6 +2133,12 @@ def run_agent_stream(
     # 用 dict 包裹以便嵌套闭包内 mutate(nonlocal 在闭包链里有时报 SyntaxError)。
     source_n_counter = {"v": 0}
     empty_retries_used = 0
+    # v0.2.30 streaming path intent-leak 续轮兜底状态(per-session):
+    # - intent_leak_retries_used: 已续轮次,封顶 cfg.max_intent_leak_retries
+    # - force_tool_choice_next: 上一轮命中 intent leak → 下一轮强制 tool_choice
+    #   (一次性,触发后立即清,防模型连续两轮都"只说不做")
+    intent_leak_retries_used = 0
+    force_tool_choice_next = False
 
     # Collect progress/sources events via a callback. We can't `yield` from inside
     # a callback (it's not a generator), so we buffer events in a queue and drain
@@ -2223,8 +2240,13 @@ def run_agent_stream(
         # 让模型能从工具结果走 final answer 文本路径。force_answer(is_last)
         # tools=[] 时 tool_choice 不生效,无需特判。
         iter_tool_choice: Any = None
+        # v0.2.30:除首轮外,intent-leak 续轮也强制 tool_choice —— 防模型连续两轮
+        # 都"只说不做"(实测:第 1 轮探表 → 第 2 轮 leak → 第 3 轮若不 force 又
+        # 是 leak)。force_tool_choice_next 是 path=="content" intent leak 分支
+        # 置位的一次性 flag,触发后立即清。
+        _force_this_turn = iteration == 1 or force_tool_choice_next
         if (
-            iteration == 1
+            _force_this_turn
             and not is_last
             and cfg.force_first_tool_name
             and current_tools
@@ -2237,9 +2259,19 @@ def run_agent_stream(
                 "type": "function",
                 "function": {"name": cfg.force_first_tool_name},
             }
+            if force_tool_choice_next:
+                _force_msg = (
+                    f"intent-leak 续轮:强制调用 {cfg.force_first_tool_name}"
+                    f"(已续 {intent_leak_retries_used} 次)"
+                )
+                force_tool_choice_next = False  # 一次性,用完立即清
+            else:
+                _force_msg = (
+                    f"首轮强制调用 {cfg.force_first_tool_name}(防模型仅叙述不调工具)"
+                )
             progress_cb(
                 "agent_first_turn_tool_forced",
-                f"首轮强制调用 {cfg.force_first_tool_name}(防模型仅叙述不调工具)",
+                _force_msg,
                 {"iteration": iteration, "tool_name": cfg.force_first_tool_name},
             )
             yield from _drain_queue()
@@ -2330,6 +2362,70 @@ def run_agent_stream(
         if path == "content":
             content_buf = state.get("content_buf", "")
             finish_reason = state.get("finish_reason", "")
+
+            # ── v0.2.30 intent-leak 续轮兜底 ───────────────────────────────
+            # Qwen3.5 偶发"流出 content 全是'我将调用 excel_query...'计划叙述、
+            # tool_calls 全空"的 silent failure。EXCEL_AGENT_SYSTEM_PROMPT
+            # v0.2.29 已经在 prompt 层严禁,实测仍 4 次 2 次复现 → 架构兜底。
+            # 复用 final-message 兜底已用的 _looks_like_intent_not_answer /
+            # _ends_with_dangling_intent 检测器(行 1481 / 1520),命中 + 有
+            # 迭代预算时 emit 分隔符 + 续一轮(下一轮也 force tool_choice)。
+            # 已流给前端的字撤不回,但用户能看到真答案接在分隔符后。
+            looks_intent = (
+                _looks_like_intent_not_answer(content_buf)
+                or _ends_with_dangling_intent(content_buf)
+            )
+            can_intent_retry = (
+                looks_intent
+                and not is_last
+                and intent_leak_retries_used < cfg.max_intent_leak_retries
+                and iteration < cfg.max_iterations - 1  # 留至少 1 轮给真 answer
+            )
+            if can_intent_retry:
+                intent_leak_retries_used += 1
+                force_tool_choice_next = True  # 下一轮强制 tool_choice(若配置了)
+                progress_cb(
+                    "agent_intent_leak_recovering",
+                    f"检测到上一段只是计划叙述、未触发工具调用,续一轮强制执行(第 {intent_leak_retries_used} 次)",
+                    {
+                        "iteration": iteration,
+                        "content_chars": len(content_buf),
+                        "retries_used": intent_leak_retries_used,
+                    },
+                )
+                yield from _drain_queue()
+                # 流一个可视分隔符:让用户知道上文是计划、下文才是真答案
+                divider = (
+                    "\n\n---\n\n_（上文仅为模型的计划描述,未触发实际查询;"
+                    "正在继续执行真正的工具调用…）_\n\n"
+                )
+                yield {
+                    "id": "agent-intent-leak-divider",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": divider},
+                        "finish_reason": None,
+                    }],
+                }
+                # 把 leak content 作为 assistant message append,加 system 纠正 hint
+                leak_assistant_msg = {"role": "assistant", "content": content_buf}
+                leak_recover_hint = {
+                    "role": "system",
+                    "content": (
+                        "【纠正 — v0.2.30 intent-leak guard】你上一条 assistant 消息"
+                        "只用自然语言宣告了下一步动作,**没有真正 emit tool_calls** ——"
+                        "这正是系统提示词反复禁止的最严重 bug,等于浪费一轮 budget。\n"
+                        "本轮你必须立刻 emit 真正的 tool_calls(在 assistant.tool_calls "
+                        "数组里),不要再写'我将...''接下来...''下面我来...'之类的"
+                        "叙述。content 必须是空字符串,工具调用必须用结构化协议发出。"
+                    ),
+                }
+                augmented = augmented + [leak_assistant_msg, leak_recover_hint]
+                continue
+
             trace.final_finish_reason = finish_reason or "stop"
             trace.answer_truncated = finish_reason == "length"
             trace.stopped_reason = trace.stopped_reason or (

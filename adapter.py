@@ -56,7 +56,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.29")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.30")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -141,6 +141,21 @@ AGENT_MAX_FETCHES = int(os.environ.get("ADAPTER_AGENT_MAX_FETCHES", "8"))
 AGENT_MAX_SEARCHES = int(os.environ.get("ADAPTER_AGENT_MAX_SEARCHES", "8"))
 # Times the loop forces a "dig deeper" round when the answer hedges on stale data
 AGENT_MAX_PUSHBACKS = int(os.environ.get("ADAPTER_AGENT_MAX_PUSHBACKS", "2"))
+# v0.2.30 streaming path intent-leak 续轮兜底次数 ────────────────────────
+# 修的 silent failure:Qwen3.5 在 Excel agent 多轮场景偶发"流出 content 全是
+# '我将调用 excel_query 查询...'这类计划叙述、tool_calls 全空"。这是 streaming
+# 路径(real chat 走的)上**已承诺 content path 后**的 silent failure ——
+# `path == "content"` 分支直接 return,前端看到一段空话就结束,等于浪费一轮。
+# EXCEL_AGENT_SYSTEM_PROMPT v0.2.29 已经在 prompt 层用最严厉的措辞禁过(行
+# 314-318 "绝对禁止只说计划不 emit" + "错 vs 对示范"),实测仍 4 次 2 次复现
+# → 证明 prompt-level 已到极限,必须架构层兜底。
+# 命中检测(_looks_like_intent_not_answer / _ends_with_dangling_intent)且
+# 还有迭代预算时:emit 一个分隔符 + recovery 提示给前端,把 leak content
+# 作为 assistant message append 进 history + 加 system 纠正 hint + 进下一轮
+# (intent-leak 续轮也强制 tool_choice,防模型连续两轮都只说不做)。
+# 0 = 关闭(等同 < v0.2.30 行为);1 = 推荐默认(>1 没意义,真有持续 leak
+# 应该走 force_answer 而不是无限续)。
+AGENT_MAX_INTENT_LEAK_RETRIES = int(os.environ.get("ADAPTER_AGENT_MAX_INTENT_LEAK_RETRIES", "1"))
 # v0.2.26: agent loop 的 message context 字符预算。100K 是 EAS 262K context 时代
 # 的保守值;EAS 用 YaRN 扩到 1.01M token 后,500K char(~250K token)留 75% buffer
 # 给输出 + 系统模板,且远离 YaRN 高风险区(> 600K token)。
@@ -1736,6 +1751,9 @@ def _build_agent_config(model_from_payload: str) -> AgentConfig:
         max_fetches=AGENT_MAX_FETCHES,
         max_searches=AGENT_MAX_SEARCHES,
         max_pushbacks=AGENT_MAX_PUSHBACKS,
+        # v0.2.30 streaming path intent-leak 续轮兜底次数(见 adapter.py
+        # AGENT_MAX_INTENT_LEAK_RETRIES 注释)。
+        max_intent_leak_retries=AGENT_MAX_INTENT_LEAK_RETRIES,
         # v0.2.26: EAS 升 1M context 后,agent loop 预算从 100K char 默认升到
         # 500K char(env 可覆盖)。force_answer 单独预算 300K。两个数都从 env 读,
         # 方便后续不重 build 调阈值。
@@ -2799,6 +2817,7 @@ class Handler(BaseHTTPRequestHandler):
                         "agent_max_iterations": AGENT_MAX_ITERATIONS,
                         "agent_max_fetches": AGENT_MAX_FETCHES,
                         "agent_max_searches": AGENT_MAX_SEARCHES,
+                        "agent_max_intent_leak_retries": AGENT_MAX_INTENT_LEAK_RETRIES,  # v0.2.30
                         "agent_web_view_enabled": AGENT_WEB_VIEW_ENABLED,
                         "agent_fetch_fallback_min_chars": AGENT_FETCH_FALLBACK_MIN_CHARS,
                         "agent_excel_query_enabled": bool(EXCEL_BACKEND_URL),
