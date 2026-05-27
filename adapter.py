@@ -42,7 +42,9 @@ from xml.etree import ElementTree
 from agentic_web import (
     AgentConfig,
     EXCEL_AGENT_SYSTEM_PROMPT,
+    EXCEL_AGENT_PLAN_PROMPT,  # v0.3.0 D Phase 1
     EXCEL_QUERY_TOOL,
+    SUBMIT_ANALYSIS_PLAN_TOOL,  # v0.3.0 D Phase 1
     ToolRegistry,
     WEB_FETCH_TOOL,
     WEB_SEARCH_TOOL,
@@ -56,7 +58,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.30")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.3.0-dev")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -156,6 +158,15 @@ AGENT_MAX_PUSHBACKS = int(os.environ.get("ADAPTER_AGENT_MAX_PUSHBACKS", "2"))
 # 0 = 关闭(等同 < v0.2.30 行为);1 = 推荐默认(>1 没意义,真有持续 leak
 # 应该走 force_answer 而不是无限续)。
 AGENT_MAX_INTENT_LEAK_RETRIES = int(os.environ.get("ADAPTER_AGENT_MAX_INTENT_LEAK_RETRIES", "1"))
+
+# v0.3.0 D 方案:Plan-and-Execute 模式开关 ───────────────────────────────
+# 仅作用于带 excel_dataset_id 的 /v1/agent 请求(Excel agent)。
+# 默认 0(关) —— Phase 1 提交时是 dead path,代码到位但不影响生产。
+# Phase 2 dispatcher 实现 + 实测 OK 后,改默认 1。
+# Phase 4 切量稳定 + Plan 模式默认开启后,可选删除 v0.2.30 intent-leak guard
+# (Plan 模式架构上消除了 "说计划不 emit" 这类 silent failure)。
+# 详见 lxj-adapter-deploy/design/2026-05-28-D-plan-and-execute-architecture.md
+ADAPTER_ENABLE_PLAN_EXEC_EXCEL = os.environ.get("ADAPTER_ENABLE_PLAN_EXEC_EXCEL", "0").lower() not in {"0", "false", "no", "off"}
 # v0.2.26: agent loop 的 message context 字符预算。100K 是 EAS 262K context 时代
 # 的保守值;EAS 用 YaRN 扩到 1.01M token 后,500K char(~250K token)留 75% buffer
 # 给输出 + 系统模板,且远离 YaRN 高风险区(> 600K token)。
@@ -1715,13 +1726,63 @@ def _make_excel_query_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
     return _impl
 
 
-def _build_agent_registry(excel_dataset_id: str = "") -> ToolRegistry:
-    """无表格数据集时复用 web 工具单例;带数据集时新建一个 registry —— 在 web
-    工具之上挂一个绑定该数据集的 excel_query。每请求新建开销极小(几次 dict
-    赋值),换来 excel_query 只在确有数据集时才对模型可见。"""
+def _make_submit_plan_impl_stub(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
+    """v0.3.0 D Phase 1 占位实现:LLM emit submit_analysis_plan 后,adapter
+    会调到这个函数。**Phase 1 不真 dispatch**,只回一个明确错误让 LLM 知道
+    Plan 路径还没接通(便于上线前 dev 验证 schema/prompt 但不会污染生产)。
+    Phase 2 实现 _dispatch_plan_steps 后,本函数会被替换为真实拓扑调度。
+    """
+
+    def _impl(args: dict[str, Any]) -> Any:
+        steps = args.get("steps") or []
+        if not isinstance(steps, list) or not steps:
+            return {"error": "submit_analysis_plan 至少需要 1 个 step"}
+        # Phase 1 stub:不真 dispatch。返回一段明确文本让 LLM 知道走不通,
+        # 它会作答"系统暂未支持",前端能看到提示。生产 env 默认关,正常用户
+        # 走旧 iterative loop 路径,本 stub 不会被触发。
+        step_summaries = [
+            f"- {s.get('id','?')}: {(s.get('question') or '')[:60]}"
+            for s in steps[:12]
+        ]
+        return {
+            "phase1_stub": True,
+            "received_plan": {
+                "step_count": len(steps),
+                "steps_preview": step_summaries,
+                "summary": args.get("summary") or "",
+            },
+            "note": (
+                "adapter v0.3.0 Phase 1 已接收 plan,但 dispatcher(Phase 2)尚未实现 ——"
+                "本环境的 Plan-and-Execute 路径暂不可用。请回退使用旧 iterative loop"
+                "(取消 ADAPTER_ENABLE_PLAN_EXEC_EXCEL,或让该请求走默认路径)。"
+            ),
+        }
+
+    return _impl
+
+
+def _build_agent_registry(excel_dataset_id: str = "", enable_plan: bool = False) -> ToolRegistry:
+    """无表格数据集时复用 web 工具单例;带数据集时新建一个 registry。
+
+    带数据集 + enable_plan=False(旧路径,v0.2.x 默认):挂 web 工具 + EXCEL_QUERY_TOOL。
+    带数据集 + enable_plan=True(v0.3.0 D Plan-and-Execute):**只挂** SUBMIT_ANALYSIS_PLAN_TOOL ——
+    第一轮 LLM 看到的工具只有这一个,tool_choice 协议层强制 emit,从架构上消除
+    "说计划不 emit" silent failure 的可能性。Web 工具在 plan 模式下不暴露
+    (Excel 任务跟联网搜索语义不同;混合用例罕见,后续真有需求再说)。
+
+    每请求新建开销极小(几次 dict 赋值),换来 tool surface 只在确有数据集
+    时才对模型可见,且能按 plan/iterative 模式精确控制。
+    """
     if not (excel_dataset_id and EXCEL_BACKEND_URL):
         return _get_agent_registry()
     reg = ToolRegistry()
+    if enable_plan:
+        # v0.3.0 D Phase 1:只挂 submit_analysis_plan,不挂 excel_query 也不挂 web
+        # 工具 —— 第一轮 LLM 只能 emit plan,无 silent failure 可能。Phase 2
+        # dispatcher 接通后,plan 内部跑的实际是 excel_query(adapter 内部调用)。
+        reg.register(SUBMIT_ANALYSIS_PLAN_TOOL, _make_submit_plan_impl_stub(excel_dataset_id))
+        return reg
+    # 旧路径(v0.2.x):web 工具 + excel_query 全挂
     reg.register(WEB_SEARCH_TOOL, _tool_impl_web_search)
     reg.register(WEB_FETCH_TOOL, _tool_impl_web_fetch)
     if AGENT_WEB_VIEW_ENABLED:
@@ -2818,6 +2879,7 @@ class Handler(BaseHTTPRequestHandler):
                         "agent_max_fetches": AGENT_MAX_FETCHES,
                         "agent_max_searches": AGENT_MAX_SEARCHES,
                         "agent_max_intent_leak_retries": AGENT_MAX_INTENT_LEAK_RETRIES,  # v0.2.30
+                        "agent_plan_and_execute_excel_enabled": ADAPTER_ENABLE_PLAN_EXEC_EXCEL,  # v0.3.0 D Phase 1
                         "agent_web_view_enabled": AGENT_WEB_VIEW_ENABLED,
                         "agent_fetch_fallback_min_chars": AGENT_FETCH_FALLBACK_MIN_CHARS,
                         "agent_excel_query_enabled": bool(EXCEL_BACKEND_URL),
@@ -2885,21 +2947,38 @@ class Handler(BaseHTTPRequestHandler):
         # 本次请求挂一个绑定该数据集的 excel_query 工具。它是 adapter 私有控制
         # 字段,不能透传给上游模型 API,故从 extra 里排除。
         excel_dataset_id = str(payload.get("excel_dataset_id") or "").strip()
-        registry = _build_agent_registry(excel_dataset_id)
+        # v0.3.0 D Phase 1:Plan-and-Execute 模式 per-request 开关 ──────────
+        # env ADAPTER_ENABLE_PLAN_EXEC_EXCEL 控制(per-request flag 可由 client
+        # extra_body.enable_plan_and_execute 覆盖,便于灰度 A/B)。仅作用于
+        # 带 excel_dataset_id 的请求 —— 没有数据集不需要 plan。
+        enable_plan_for_request = ADAPTER_ENABLE_PLAN_EXEC_EXCEL and bool(excel_dataset_id)
+        _client_extra_body_check = payload.get("extra_body") if isinstance(payload.get("extra_body"), dict) else {}
+        if isinstance(_client_extra_body_check.get("enable_plan_and_execute"), bool):
+            enable_plan_for_request = _client_extra_body_check["enable_plan_and_execute"] and bool(excel_dataset_id)
+        registry = _build_agent_registry(excel_dataset_id, enable_plan=enable_plan_for_request)
         # 带数据集时,**整体替换**为 Excel 专用系统提示词(而非在联网提示词上追加)
         # —— 联网那套的「必搜 / 没调工具就加未联网免责声明」会把模型带偏,且需
         # 明确告诉模型「数据集在 excel_query 工具后面、不在上下文里」,否则它会
         # 误判「没材料」而拒答。
         if excel_dataset_id and EXCEL_BACKEND_URL:
-            cfg.system_prompt = EXCEL_AGENT_SYSTEM_PROMPT
+            if enable_plan_for_request:
+                # v0.3.0 D Plan-and-Execute 模式:用 plan prompt,第一轮强制
+                # submit_analysis_plan(替代 excel_query)。Phase 1 stub impl
+                # 会回错让 LLM 知道服务未就绪;Phase 2 接通真 dispatcher 后
+                # 行为变成"plan emit → adapter 拓扑调度 → final synthesis"。
+                cfg.system_prompt = EXCEL_AGENT_PLAN_PROMPT
+                cfg.enable_plan_and_execute = True
+                cfg.force_first_tool_name = "submit_analysis_plan"
+            else:
+                cfg.system_prompt = EXCEL_AGENT_SYSTEM_PROMPT
+                # v0.2.25 L1:第一轮强制 tool_choice 指向 excel_query。修 Qwen3.5
+                # 在 Excel 大表场景偶发的"describe but don't call"退化(模型说"我需要
+                # 先查询一下..."然后没真 emit tool_call,用户看到空话要点重新生成)。
+                # 协议层强制:首轮必须 emit tool_call,不允许直接给文本叙述。
+                cfg.force_first_tool_name = "excel_query"
             # 数据类请求无 URL 概念 —— 关掉引用合规审计,否则模型为 excel_query
             # 调用编造的占位 URL 会被审计误报成「疑似编造」。
             cfg.citation_guard = False
-            # v0.2.25 L1:第一轮强制 tool_choice 指向 excel_query。修 Qwen3.5
-            # 在 Excel 大表场景偶发的"describe but don't call"退化(模型说"我需要
-            # 先查询一下..."然后没真 emit tool_call,用户看到空话要点重新生成)。
-            # 协议层强制:首轮必须 emit tool_call,不允许直接给文本叙述。
-            cfg.force_first_tool_name = "excel_query"
         # Forward all non-loop-related sampling params (temperature, max_tokens, etc.)
         # 同时解包客户端 `extra_body`(OpenAI / litellm SDK 标准放扩展参数的字段)
         # 到顶层 —— 否则诸如 chat_template_kwargs / enable_thinking 这种 EAS 才
