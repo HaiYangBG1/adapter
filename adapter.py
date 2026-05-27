@@ -61,7 +61,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.3.1")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.3.2")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -1935,13 +1935,21 @@ def _make_submit_plan_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
 
         # Phase 3:每个 batch 用 ctx-aware ThreadPoolExecutor,把 ContextVar
         # 透到 worker thread —— _emit_progress 在 worker 里需要 ACTIVE_PROGRESS_CB 可见。
+        # **关键**:每个 worker 必须自己 copy_context() —— Python 文档明确
+        # "Context.run raises RuntimeError when called on the same context
+        # object from more than one OS thread"。共享同一个 ctx 会让除第一个
+        # worker 外全部 raise RuntimeError(被 _run_step_with_progress 的
+        # try/except 吃掉),表现为"只第一个 step emit 事件,其他全'失败'"。
+        # v0.3.1 → v0.3.2 修这个 bug。
         for batch_idx, batch in enumerate(batches):
-            ctx = contextvars.copy_context()
             with ThreadPoolExecutor(
                 max_workers=min(AGENT_PLAN_PARALLELISM, len(batch))
             ) as pool:
                 fut_to_step = {
-                    pool.submit(ctx.run, _run_step_with_progress, s, batch_idx): s
+                    pool.submit(
+                        contextvars.copy_context().run,
+                        _run_step_with_progress, s, batch_idx,
+                    ): s
                     for s in batch
                 }
                 for fut in as_completed(fut_to_step, timeout=AGENT_PLAN_STEP_TIMEOUT + 5):

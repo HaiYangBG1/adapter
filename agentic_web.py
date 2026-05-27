@@ -2589,20 +2589,24 @@ def run_agent_stream(
                         "finish_reason": None,
                     }],
                 }
-                # 把 leak content 作为 assistant message append,加 system 纠正 hint
+                # 把 leak content 作为 assistant message append,加 system 纠正 hint。
+                # v0.3.2 修 bug:hint 是 system message,不能加在末尾(EAS 严校验
+                # "System message must be at the beginning",撞 HTTP 400)。复用
+                # _inject_force_answer_hint 把 hint 拼到头部 system,避开 EAS 校验。
+                # v0.2.30 原写法 `augmented + [leak_assistant_msg, leak_recover_hint]`
+                # 在续轮触发时会必然 400,实测 v0.3.1 Phase 3 trace 复现。
                 leak_assistant_msg = {"role": "assistant", "content": content_buf}
-                leak_recover_hint = {
-                    "role": "system",
-                    "content": (
-                        "【纠正 — v0.2.30 intent-leak guard】你上一条 assistant 消息"
-                        "只用自然语言宣告了下一步动作,**没有真正 emit tool_calls** ——"
-                        "这正是系统提示词反复禁止的最严重 bug,等于浪费一轮 budget。\n"
-                        "本轮你必须立刻 emit 真正的 tool_calls(在 assistant.tool_calls "
-                        "数组里),不要再写'我将...''接下来...''下面我来...'之类的"
-                        "叙述。content 必须是空字符串,工具调用必须用结构化协议发出。"
-                    ),
-                }
-                augmented = augmented + [leak_assistant_msg, leak_recover_hint]
+                leak_recover_hint_text = (
+                    "【纠正 — v0.2.30 intent-leak guard】你上一条 assistant 消息"
+                    "只用自然语言宣告了下一步动作,**没有真正 emit tool_calls** ——"
+                    "这正是系统提示词反复禁止的最严重 bug,等于浪费一轮 budget。\n"
+                    "本轮你必须立刻 emit 真正的 tool_calls(在 assistant.tool_calls "
+                    "数组里),不要再写'我将...''接下来...''下面我来...'之类的"
+                    "叙述。content 必须是空字符串,工具调用必须用结构化协议发出。"
+                )
+                augmented = _inject_force_answer_hint(
+                    augmented + [leak_assistant_msg], leak_recover_hint_text,
+                )
                 continue
 
             trace.final_finish_reason = finish_reason or "stop"
