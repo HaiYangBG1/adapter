@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import contextvars  # v0.3.0 D Phase 3:把 progress_cb 从 stream_agent 透到深层 tool_impl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -748,6 +749,21 @@ SourcesCallback = Callable[[str, list[dict[str, Any]]], None]
 # query, items —— 调用一次 = 一次 web_search 的结构化结果。前端累加去重。
 
 
+# v0.3.0 D Phase 3:ContextVar 把 stream_agent / run_agent 的 progress_cb
+# 透到深层 tool_impl —— 让 _make_submit_plan_impl 内部能 emit per-step
+# 细粒度进度事件(plan_step_start / plan_step_end),不用改 ToolRegistry 接口。
+#
+# **关键**:ContextVar 在 threading.Thread 不自动 propagate,所以所有用
+# ThreadPoolExecutor 派发的地方,submit 时必须用 `ctx.run(func, ...)` 显式
+# 传 context(见 _dispatch_tool_calls_parallel)。
+#
+# 默认 None:agent 路径外的调用(直接 import _make_submit_plan_impl 在脚本里
+# 跑等)拿到 None,impl 自然降级为不 emit 进度。
+ACTIVE_PROGRESS_CB: contextvars.ContextVar[Optional[ProgressCallback]] = (
+    contextvars.ContextVar("adapter_active_progress_cb", default=None)
+)
+
+
 def _emit(cb: Optional[ProgressCallback], stage: str, message: str, **meta: Any) -> None:
     if cb is None:
         return
@@ -1439,8 +1455,15 @@ def _dispatch_tool_calls_parallel(
         indexed[idx] = _make_tool_message(tc, result, cfg.max_tool_result_chars)
 
     if fresh:
+        # v0.3.0 D Phase 3:用 copy_context().run 把 ContextVar(尤其
+        # ACTIVE_PROGRESS_CB)透到 worker 线程 —— 不然 _make_submit_plan_impl
+        # 在 worker 里 .get() 会拿到 default None,emit 不出 plan_step_start/end。
+        ctx = contextvars.copy_context()
         with ThreadPoolExecutor(max_workers=max(cfg.parallel_dispatch_workers, 1)) as pool:
-            futures = [pool.submit(_run_one, idx, tc, name, args) for idx, tc, name, args in fresh]
+            futures = [
+                pool.submit(ctx.run, _run_one, idx, tc, name, args)
+                for idx, tc, name, args in fresh
+            ]
             for fut in as_completed(futures):
                 fut.result()
 
@@ -1838,6 +1861,11 @@ def run_agent(
 
     Returns (final_response_dict, trace).
     """
+    # v0.3.0 D Phase 3:把 progress_cb 透到 ContextVar,让深层 tool_impl
+    # (如 _make_submit_plan_impl 内部) 可 emit 细粒度进度事件。
+    # 每个 request 入口覆盖上次值,不做 reset —— server handler 用完 context
+    # 即弃,无副作用。
+    ACTIVE_PROGRESS_CB.set(progress_cb)
     trace = AgentTrace()
     tools = registry.schemas()
     augmented = _ensure_system_prompt(_sanitize_history(messages), cfg.system_prompt)
@@ -2306,6 +2334,12 @@ def run_agent_stream(
     def _drain_queue():
         while progress_queue:
             yield progress_queue.pop(0)
+
+    # v0.3.0 D Phase 3:把 stream 内部的 progress_cb 透到 ContextVar,
+    # 深层 tool_impl(如 _make_submit_plan_impl)能在 ThreadPoolExecutor
+    # worker 里 ACTIVE_PROGRESS_CB.get() 拿到它,emit per-step 进度。
+    # 每个 request 入口覆盖上次值,不 reset —— request 用完 context 即弃。
+    ACTIVE_PROGRESS_CB.set(progress_cb)
 
     def _run_attempt(msgs, current_tools, extra, tool_choice=None):
         """Forward chunks from one _speculative_iteration to client; capture state.

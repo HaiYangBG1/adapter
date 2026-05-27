@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 import urllib.parse
 import zipfile
+import contextvars  # v0.3.0 D Phase 3:跨 ThreadPoolExecutor 透 progress_cb
 from concurrent.futures import ThreadPoolExecutor, as_completed  # v0.3.0 D Phase 2 plan dispatcher
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,6 +45,7 @@ from agentic_web import (
     AgentConfig,
     EXCEL_AGENT_SYSTEM_PROMPT,
     EXCEL_AGENT_PLAN_PROMPT,  # v0.3.0 D Phase 1
+    ACTIVE_PROGRESS_CB,  # v0.3.0 D Phase 3:跨 worker 透 progress_cb
     EXCEL_QUERY_TOOL,
     SUBMIT_ANALYSIS_PLAN_TOOL,  # v0.3.0 D Phase 1
     ToolRegistry,
@@ -59,7 +61,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.3.0")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.3.1")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -1817,10 +1819,23 @@ def _make_submit_plan_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
     """
 
     def _impl(args: dict[str, Any]) -> Any:
+        # v0.3.0 D Phase 3:拿 ContextVar 里的 progress_cb(stream_agent 入口 set)。
+        # None 表示不在 agent stream 路径里(如 sync run_agent 或直接脚本测试),
+        # 此时所有 _emit_progress 调用降级 noop。
+        progress_cb = ACTIVE_PROGRESS_CB.get()
+
+        def _emit_progress(stage: str, message: str, meta: dict[str, Any]) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(stage, message, meta)
+                except Exception:  # noqa: BLE001 — emit 失败不能掀翻 dispatcher
+                    pass
+
         # 1. 校验
         steps_raw = args.get("steps")
         err = _validate_plan_steps(steps_raw)
         if err:
+            _emit_progress("plan_validation_failed", f"plan 校验失败:{err}", {})
             return {
                 "plan_executed": False,
                 "error": f"plan 校验失败:{err}",
@@ -1834,35 +1849,110 @@ def _make_submit_plan_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
         # 2. 拓扑排序
         batches = _topological_sort_plan_steps(steps)
         if batches is None:
+            _emit_progress(
+                "plan_validation_failed",
+                "plan 含循环依赖,无法拓扑排序",
+                {"step_ids": [s["id"] for s in steps]},
+            )
             return {
                 "plan_executed": False,
                 "error": "plan 含循环依赖,无法拓扑排序。请检查 depends_on 字段。",
                 "step_ids": [s["id"] for s in steps],
             }
 
-        # 3. 分批并行 dispatch
+        # ── v0.3.0 D Phase 3:plan_submitted 入口事件 ──────────────────
+        _emit_progress(
+            "plan_submitted",
+            f"已规划 {len(steps)} 步({len(batches)} 个并行批次)",
+            {
+                "step_count": len(steps),
+                "batch_count": len(batches),
+                "summary": args.get("summary") or "",
+                "steps": [
+                    {
+                        "id": s["id"],
+                        "question": s["question"][:200],  # 截断防超大
+                        "depends_on": s.get("depends_on") or [],
+                        "rationale": (s.get("rationale") or "")[:200],
+                    }
+                    for s in steps
+                ],
+            },
+        )
+
+        # 3. 分批并行 dispatch + per-step progress
         results: dict[str, dict[str, Any]] = {}
         elapsed_ms_per_step: dict[str, int] = {}
         plan_t0 = time.time()
+
+        def _run_step_with_progress(
+            step: dict[str, Any], batch_idx: int
+        ) -> tuple[str, Any, int]:
+            """worker 函数:emit start → 调 excel_backend → emit end → 返回。
+            异常被吞掉转成 error dict(单 step 失败不应拖死整 batch)。
+            """
+            sid = step["id"]
+            question = step["question"]
+            _emit_progress(
+                "plan_step_start",
+                f"执行 step {sid}",
+                {
+                    "step_id": sid,
+                    "question": question[:200],
+                    "batch_index": batch_idx,
+                },
+            )
+            t0 = time.time()
+            try:
+                result = _call_excel_backend(dataset_id, question)
+                elapsed_ms = int((time.time() - t0) * 1000)
+                ok = not (isinstance(result, dict) and result.get("error"))
+                _emit_progress(
+                    "plan_step_end",
+                    f"step {sid} 完成 ({elapsed_ms}ms)",
+                    {
+                        "step_id": sid,
+                        "elapsed_ms": elapsed_ms,
+                        "ok": ok,
+                        "error": (result.get("error") if isinstance(result, dict) and not ok else None),
+                    },
+                )
+                return sid, result, elapsed_ms
+            except Exception as exc:  # noqa: BLE001
+                elapsed_ms = int((time.time() - t0) * 1000)
+                err_msg = f"{type(exc).__name__}: {exc}"
+                _emit_progress(
+                    "plan_step_end",
+                    f"step {sid} 失败 ({elapsed_ms}ms)",
+                    {
+                        "step_id": sid,
+                        "elapsed_ms": elapsed_ms,
+                        "ok": False,
+                        "error": err_msg,
+                    },
+                )
+                return sid, {"error": f"step 执行失败:{err_msg}"}, elapsed_ms
+
+        # Phase 3:每个 batch 用 ctx-aware ThreadPoolExecutor,把 ContextVar
+        # 透到 worker thread —— _emit_progress 在 worker 里需要 ACTIVE_PROGRESS_CB 可见。
         for batch_idx, batch in enumerate(batches):
+            ctx = contextvars.copy_context()
             with ThreadPoolExecutor(
                 max_workers=min(AGENT_PLAN_PARALLELISM, len(batch))
             ) as pool:
-                # 把超时压到单个 future,避免一个 step 拖死整批
                 fut_to_step = {
-                    pool.submit(_call_excel_backend, dataset_id, s["question"]): s
+                    pool.submit(ctx.run, _run_step_with_progress, s, batch_idx): s
                     for s in batch
                 }
                 for fut in as_completed(fut_to_step, timeout=AGENT_PLAN_STEP_TIMEOUT + 5):
-                    s = fut_to_step[fut]
-                    step_t0 = time.time()
                     try:
-                        results[s["id"]] = fut.result(timeout=AGENT_PLAN_STEP_TIMEOUT)
-                    except Exception as exc:  # noqa: BLE001
-                        results[s["id"]] = {
-                            "error": f"step 执行失败:{type(exc).__name__}: {exc}"
-                        }
-                    elapsed_ms_per_step[s["id"]] = int((time.time() - step_t0) * 1000)
+                        sid, result, elapsed_ms = fut.result(timeout=AGENT_PLAN_STEP_TIMEOUT)
+                        results[sid] = result
+                        elapsed_ms_per_step[sid] = elapsed_ms
+                    except Exception as exc:  # noqa: BLE001 — defensive
+                        s = fut_to_step[fut]
+                        results[s["id"]] = {"error": f"future 异常:{type(exc).__name__}: {exc}"}
+                        elapsed_ms_per_step[s["id"]] = 0
 
         # 4. 汇总:保留原始 plan 顺序,LLM 看一致的视图
         summary_for_llm = {
@@ -1887,6 +1977,19 @@ def _make_submit_plan_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
         summary_for_llm["failed_step_count"] = len(failed)
         if failed:
             summary_for_llm["failed_step_ids"] = [r["step_id"] for r in failed]
+
+        # ── v0.3.0 D Phase 3:plan_complete 出口事件 ───────────────────
+        _emit_progress(
+            "plan_complete",
+            f"plan 完成 ({summary_for_llm['total_elapsed_ms']}ms,{len(steps)} 步,{len(failed)} 失败)",
+            {
+                "total_elapsed_ms": summary_for_llm["total_elapsed_ms"],
+                "step_count": len(steps),
+                "failed_count": len(failed),
+                "failed_step_ids": summary_for_llm.get("failed_step_ids") or [],
+            },
+        )
+
         return summary_for_llm
 
     return _impl
