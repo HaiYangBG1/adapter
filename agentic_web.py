@@ -501,6 +501,15 @@ class AgentConfig:
     # v0.2.24 默认 True,实验后若激活率提升不达预期可回切。
     force_answer_rewrite_history: bool = True
 
+    # v0.2.27 thinking 死循环防护:default sampling penalty。详见 adapter.py
+    # ADAPTER_DEFAULT_FREQUENCY_PENALTY / ADAPTER_DEFAULT_PRESENCE_PENALTY 注释。
+    # 0 表示不注入(让 SGLang 用 0 默认)。
+    default_frequency_penalty: float = 0.0
+    default_presence_penalty: float = 0.0
+    # reasoning_content 累积字符数硬上限。> 此值时主动 abort 防 thinking 死循环。
+    # 0 表示不限制。
+    max_reasoning_chars: int = 0
+
     # v0.2.25 L1:带数据集(Excel)的请求,**第一轮**强制 tool_choice 指向唯一
     # 的查询工具(force_first_tool_name),协议层保证模型不能直接给文本叙述。
     # 修的是 Qwen3.5 在 Excel 大表 + 多工具场景偶发的"describe but don't call"
@@ -585,6 +594,14 @@ def _build_upstream_request(
             if key in {"messages", "tools", "tool_choice", "stream", "stream_options", "model"}:
                 continue
             payload[key] = value
+
+    # v0.2.27 thinking 死循环防护 —— agent loop 路径同步注入 sampling penalty。
+    # cfg.default_frequency_penalty / default_presence_penalty 从 adapter.py 顶层 env
+    # 透传过来。client 显式覆盖时(通过 extra)按 client 走,这里只填默认。
+    if cfg.default_frequency_penalty > 0 and "frequency_penalty" not in payload:
+        payload["frequency_penalty"] = cfg.default_frequency_penalty
+    if cfg.default_presence_penalty > 0 and "presence_penalty" not in payload:
+        payload["presence_penalty"] = cfg.default_presence_penalty
     headers = {
         "Content-Type": "application/json",
         cfg.upstream_auth_header: cfg.upstream_auth_value,
@@ -1871,6 +1888,19 @@ def _speculative_iteration(
             # reasoning 累积(不影响路径承诺)
             if isinstance(reasoning_delta, str) and reasoning_delta:
                 reasoning_buf += reasoning_delta
+                # v0.2.27 thinking 死循环防护:reasoning_buf 累积超 max_reasoning_chars
+                # 主动 abort。Qwen3 thinking + Int8 量化在简单问题上易陷入 "Final →
+                # Wait → keep → Final" 自我质疑循环;normal 推理 < 4k token (16k char)
+                # 够用,> 此值大概率已死循环。abort 后通过 "empty" path 走 reasoning
+                # 兜底,前端看到"思考过程过长,请换个简单点的问法"。
+                if (
+                    cfg.max_reasoning_chars > 0
+                    and len(reasoning_buf) > cfg.max_reasoning_chars
+                    and not content_started
+                    and not tool_calls_started
+                ):
+                    finish_reason = "reasoning_too_long"
+                    break  # 跳出 stream loop,后续按 path=empty 路径走 synthesis 兜底
 
             # tool_calls delta:承诺 tool_calls 路径
             if tc_delta:

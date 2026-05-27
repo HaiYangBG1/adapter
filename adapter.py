@@ -56,7 +56,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.26")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.2.27")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -150,6 +150,31 @@ AGENT_MAX_PUSHBACKS = int(os.environ.get("ADAPTER_AGENT_MAX_PUSHBACKS", "2"))
 AGENT_MAX_CONTEXT_CHARS = int(os.environ.get("ADAPTER_AGENT_MAX_CONTEXT_CHARS", "500000"))
 # force_answer 轮单独的更紧预算。0 表示沿用 AGENT_MAX_CONTEXT_CHARS。
 AGENT_FORCE_ANSWER_MAX_CONTEXT_CHARS = int(os.environ.get("ADAPTER_AGENT_FORCE_ANSWER_MAX_CONTEXT_CHARS", "300000"))
+
+# v0.2.27 thinking 死循环防护 ────────────────────────────────────────────
+# 用户实测 (2026-05-27 12:53):简单问题"今天星期几" + chip ON → 模型 thinking
+# 模式陷入 "Final → Wait → Okay → keep → Final" 死循环,7.14k tokens 还在跑。
+# 根因三层:
+#   (1) Qwen3 thinking 对简单问题过度推理(known issue,Qwen-QwQ / DeepSeek-R1
+#       同款 pattern)
+#   (2) Int8-W8A8 量化让 attention 在长 thinking 累积噪声,容易 lock 在 repetition
+#   (3) 整条链路没注入 sampling penalty,SGLang 默认 frequency_penalty=0,
+#       presence_penalty=0,对 repetition 零惩罚
+#
+# 解法:adapter 在所有上行请求注入 default sampling penalty(只在 client 没显
+# 式覆盖时)。SGLang 接受 OpenAI 标准字段。
+ADAPTER_DEFAULT_FREQUENCY_PENALTY = float(
+    os.environ.get("ADAPTER_DEFAULT_FREQUENCY_PENALTY", "0.3")
+)
+ADAPTER_DEFAULT_PRESENCE_PENALTY = float(
+    os.environ.get("ADAPTER_DEFAULT_PRESENCE_PENALTY", "0.2")
+)
+# reasoning_content 累积字符数上限。超阈值后 adapter 主动 abort + 注入兜底文案。
+# Qwen3 thinking 模式正常深度推理 1k-3k token 够用,> 4000 token 大概率
+# 已经陷入 self-doubt 循环。每 4 char ≈ 1 token,16000 char ≈ 4000 token。
+ADAPTER_MAX_REASONING_CHARS = int(
+    os.environ.get("ADAPTER_MAX_REASONING_CHARS", "16000")
+)
 # Phase 3: vision tool (web_view) — controls browser screenshot fallback
 AGENT_WEB_VIEW_ENABLED = os.environ.get("ADAPTER_AGENT_WEB_VIEW_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 AGENT_WEB_VIEW_VIEWPORT = os.environ.get("ADAPTER_AGENT_WEB_VIEW_VIEWPORT", "1280x1600")
@@ -1716,6 +1741,11 @@ def _build_agent_config(model_from_payload: str) -> AgentConfig:
         # 方便后续不重 build 调阈值。
         max_context_chars=AGENT_MAX_CONTEXT_CHARS,
         force_answer_max_context_chars=AGENT_FORCE_ANSWER_MAX_CONTEXT_CHARS,
+        # v0.2.27 thinking 死循环防护:agent loop 路径 sampling penalty 默认值
+        # 跟 /v1/chat 直转路径(_transform_payload)对齐
+        default_frequency_penalty=ADAPTER_DEFAULT_FREQUENCY_PENALTY,
+        default_presence_penalty=ADAPTER_DEFAULT_PRESENCE_PENALTY,
+        max_reasoning_chars=ADAPTER_MAX_REASONING_CHARS,
     )
 
 
@@ -2504,6 +2534,23 @@ def _transform_payload(
     if web_context:
         _inject_web_context(payload, web_context)
     _cleanup_web_controls(payload)
+
+    # v0.2.27 thinking 死循环防护:default sampling penalty(只在 client 没设时)。
+    # Qwen3 thinking 模式 + Int8 量化容易陷入 "Final → Wait → keep → Final"
+    # 自我质疑循环。frequency_penalty=0.3 / presence_penalty=0.2 是业界常用的
+    # 防 repetition 配置,对正常推理质量影响极小,但能切断死循环。
+    if ADAPTER_DEFAULT_FREQUENCY_PENALTY > 0 and "frequency_penalty" not in payload:
+        payload["frequency_penalty"] = ADAPTER_DEFAULT_FREQUENCY_PENALTY
+    if ADAPTER_DEFAULT_PRESENCE_PENALTY > 0 and "presence_penalty" not in payload:
+        payload["presence_penalty"] = ADAPTER_DEFAULT_PRESENCE_PENALTY
+
+    # v0.2.27 兜底:client 没设 max_tokens 时注入 16K 上限。万一 Phase 1
+    # repetition penalty 失效仍死循环,最多吐 16K token 就停(EAS 上 ~ 30s)
+    # 不会再出现"2 分钟还在转圈"的体验。Agent loop 路径有自己的
+    # AGENT_DEFAULT_MAX_TOKENS=8000,这条 cover /v1/chat 直转路径。
+    if "max_tokens" not in payload and "max_completion_tokens" not in payload:
+        payload["max_tokens"] = 16000
+
     return payload
 
 
