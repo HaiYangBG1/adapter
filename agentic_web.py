@@ -2601,6 +2601,12 @@ def run_agent_stream(
                 and not is_last
                 and intent_leak_retries_used < cfg.max_intent_leak_retries
                 and iteration < cfg.max_iterations - 1  # 留至少 1 轮给真 answer
+                # v0.3.3 D Phase 4 修 false-positive:plan dispatch 完后,LLM 在
+                # tools=[] + PLAN_SYNTHESIS_HINT 路径下输出综合作答的开头
+                # ("我将分析以下数据...")会被 _looks_like_intent_not_answer
+                # 误判为 intent leak。但此时本来就该返回 content,无 tool 可调,
+                # 续轮没意义且浪费 LLM 调用。强制跳过 intent guard。
+                and not plan_dispatch_done
             )
             if can_intent_retry:
                 intent_leak_retries_used += 1
