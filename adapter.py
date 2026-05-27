@@ -61,7 +61,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.3.2")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.3.3")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -180,7 +180,18 @@ AGENT_PLAN_PARALLELISM = int(os.environ.get("ADAPTER_AGENT_PLAN_PARALLELISM", "4
 # v0.3.0 D Phase 2:单个 step excel_query 的超时(秒)。超时算这个 step 失败,
 # adapter 在 plan_results 里写 error,LLM 看到后能基于其他 step 综合作答 ——
 # 一个 step 挂不应该把整个 plan 拖死。
-AGENT_PLAN_STEP_TIMEOUT = int(os.environ.get("ADAPTER_AGENT_PLAN_STEP_TIMEOUT", "60"))
+# v0.3.3 改造:从 60s → 200s。实测复杂 SQL(GROUP BY 多列+排序+计算)
+# excel-poc /ask 需 90-160s(LLM 写 SQL 30-60s + DuckDB exec 30-60s + verify
+# 20-40s),60s 过短。配合 EXCEL_QUERY_TIMEOUT=240s socket 上限。
+AGENT_PLAN_STEP_TIMEOUT = int(os.environ.get("ADAPTER_AGENT_PLAN_STEP_TIMEOUT", "200"))
+
+# v0.3.3 D Phase 4 修复:plan 整体超时(秒)。as_completed timeout 行为
+# 在 SAE Python 实现下不稳定(本地 repro 工作但线上 v0.3.2 没触发),
+# 改用 plan-level deadline:plan_t0 + 此值 < now 时,后续 batch 整批跳过 +
+# 写 error。配合 step-level timeout 双兜底。
+# 取值上限:curl client max-time 240s,留 30s 给 final synthesis LLM 调用,
+# plan dispatcher 上限 ~210s。
+AGENT_PLAN_TOTAL_TIMEOUT = int(os.environ.get("ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT", "210"))
 # v0.2.26: agent loop 的 message context 字符预算。100K 是 EAS 262K context 时代
 # 的保守值;EAS 用 YaRN 扩到 1.01M token 后,500K char(~250K token)留 75% buffer
 # 给输出 + 系统模板,且远离 YaRN 高风险区(> 600K token)。
@@ -1884,6 +1895,8 @@ def _make_submit_plan_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
         results: dict[str, dict[str, Any]] = {}
         elapsed_ms_per_step: dict[str, int] = {}
         plan_t0 = time.time()
+        # v0.3.3 plan-level deadline:绝对时间点 plan_t0 + AGENT_PLAN_TOTAL_TIMEOUT
+        plan_deadline = plan_t0 + AGENT_PLAN_TOTAL_TIMEOUT
 
         def _run_step_with_progress(
             step: dict[str, Any], batch_idx: int
@@ -1933,15 +1946,37 @@ def _make_submit_plan_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
                 )
                 return sid, {"error": f"step 执行失败:{err_msg}"}, elapsed_ms
 
-        # Phase 3:每个 batch 用 ctx-aware ThreadPoolExecutor,把 ContextVar
-        # 透到 worker thread —— _emit_progress 在 worker 里需要 ACTIVE_PROGRESS_CB 可见。
+        # v0.3.3 D Phase 4 重写:as_completed timeout 在 SAE Python 实测不稳
+        # (v0.3.2 复杂 plan 158s step 没触发 65s timeout),改 plan-level
+        # deadline 自己判断。
+        #
+        # 策略:
+        #   for batch:
+        #     if past deadline → 后续 step 全标 error 不跑(_emit_progress 直接 end)
+        #     else 并行 submit(每个 worker 自己 copy_context)
+        #     用 fut.result(timeout=...) 单 future 等,每个 fut 留剩余时间预算
+        #     超 deadline 强制 break + 后续标 error
+        #
         # **关键**:每个 worker 必须自己 copy_context() —— Python 文档明确
         # "Context.run raises RuntimeError when called on the same context
-        # object from more than one OS thread"。共享同一个 ctx 会让除第一个
-        # worker 外全部 raise RuntimeError(被 _run_step_with_progress 的
-        # try/except 吃掉),表现为"只第一个 step emit 事件,其他全'失败'"。
-        # v0.3.1 → v0.3.2 修这个 bug。
+        # object from more than one OS thread"。
+        plan_aborted = False
+        plan_abort_reason = ""
         for batch_idx, batch in enumerate(batches):
+            now = time.time()
+            if now >= plan_deadline:
+                plan_aborted = True
+                plan_abort_reason = f"plan 总超时(>{AGENT_PLAN_TOTAL_TIMEOUT}s),batch {batch_idx} 及后续 step 跳过"
+                _emit_progress(
+                    "plan_batch_skipped",
+                    plan_abort_reason,
+                    {"batch_index": batch_idx, "skipped_step_count": sum(len(b) for b in batches[batch_idx:])},
+                )
+                for s in batch:
+                    results[s["id"]] = {"error": "plan 总超时,本 step 未执行"}
+                    elapsed_ms_per_step[s["id"]] = 0
+                continue
+            remaining_for_batch = plan_deadline - now
             with ThreadPoolExecutor(
                 max_workers=min(AGENT_PLAN_PARALLELISM, len(batch))
             ) as pool:
@@ -1952,13 +1987,43 @@ def _make_submit_plan_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
                     ): s
                     for s in batch
                 }
-                for fut in as_completed(fut_to_step, timeout=AGENT_PLAN_STEP_TIMEOUT + 5):
+                # 不用 as_completed timeout(不稳)。每个 fut 单独 wait with
+                # remaining-deadline。fut.result(timeout) 抛 TimeoutError 时,
+                # worker 还在跑 — 不能 cancel,但记 error,后续 batch 用 deadline 判断。
+                pending = dict(fut_to_step)
+                while pending:
+                    now = time.time()
+                    timeout_for_this = min(
+                        AGENT_PLAN_STEP_TIMEOUT,
+                        max(1.0, plan_deadline - now),
+                    )
+                    # 等任一 fut 完成,最多 timeout_for_this
                     try:
-                        sid, result, elapsed_ms = fut.result(timeout=AGENT_PLAN_STEP_TIMEOUT)
+                        done_iter = as_completed(list(pending.keys()), timeout=timeout_for_this)
+                        fut = next(iter(done_iter))
+                    except StopIteration:
+                        continue
+                    except Exception as exc:  # TimeoutError or other
+                        # 时间到了仍有 pending fut。把它们都标超时 error。
+                        for f, s in pending.items():
+                            results[s["id"]] = {
+                                "error": f"step 超时({type(exc).__name__}): plan 总耗时已达 {int(time.time()-plan_t0)}s",
+                            }
+                            elapsed_ms_per_step[s["id"]] = int((time.time() - plan_t0) * 1000)
+                            _emit_progress(
+                                "plan_step_end",
+                                f"step {s['id']} 超时",
+                                {"step_id": s["id"], "elapsed_ms": elapsed_ms_per_step[s["id"]], "ok": False, "error": "timeout"},
+                            )
+                        pending.clear()
+                        break
+                    # 拿到一个完成的 fut
+                    s = pending.pop(fut)
+                    try:
+                        sid, result, elapsed_ms = fut.result(timeout=0.1)  # 已 done,瞬时拿
                         results[sid] = result
                         elapsed_ms_per_step[sid] = elapsed_ms
-                    except Exception as exc:  # noqa: BLE001 — defensive
-                        s = fut_to_step[fut]
+                    except Exception as exc:  # noqa: BLE001
                         results[s["id"]] = {"error": f"future 异常:{type(exc).__name__}: {exc}"}
                         elapsed_ms_per_step[s["id"]] = 0
 
@@ -3124,6 +3189,7 @@ class Handler(BaseHTTPRequestHandler):
                         "agent_plan_and_execute_excel_enabled": ADAPTER_ENABLE_PLAN_EXEC_EXCEL,  # v0.3.0 D Phase 1
                         "agent_plan_parallelism": AGENT_PLAN_PARALLELISM,  # v0.3.0 D Phase 2
                         "agent_plan_step_timeout": AGENT_PLAN_STEP_TIMEOUT,  # v0.3.0 D Phase 2
+                        "agent_plan_total_timeout": AGENT_PLAN_TOTAL_TIMEOUT,  # v0.3.3 D Phase 4
                         "agent_web_view_enabled": AGENT_WEB_VIEW_ENABLED,
                         "agent_fetch_fallback_min_chars": AGENT_FETCH_FALLBACK_MIN_CHARS,
                         "agent_excel_query_enabled": bool(EXCEL_BACKEND_URL),

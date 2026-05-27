@@ -1482,6 +1482,27 @@ FORCE_ANSWER_SYSTEM_HINT = (
     "如果信息不足，请用自然语言告诉用户：哪部分信息你能确认，哪部分缺失或不确定。"
 )
 
+# v0.3.3 D Phase 4:plan-and-execute 模式下,plan tool 跑完后强制综合作答的
+# system hint(替代 FORCE_ANSWER_SYSTEM_HINT,语义不同 —— 这里不是因为预算
+# 用光,而是 plan 设计上 dispatcher 完一次后 LLM 必须综合作答)。
+# 配合 stream_agent 在 plan_dispatch_done 后置 tools=[]。
+PLAN_SYNTHESIS_HINT = (
+    "【plan 已执行完毕】你提交的 submit_analysis_plan 已经被 adapter 完整执行,"
+    "所有 step 的查询结果都在上一条 tool 消息(plan_executed=true)的 results 数组里。\n"
+    "\n"
+    "本轮你必须**立即用自然语言**综合作答,直接给用户最终的分析报告。\n"
+    "\n"
+    "严格禁止:\n"
+    "- 禁止再 emit 任何 tool_calls —— 本轮已禁用工具(架构上不可能再调一次 plan)\n"
+    "- 禁止写'我将查询...''让我再提交一个 plan...''接下来调用...'这类叙述\n"
+    "- 禁止凭记忆 / 推测补充数据 —— **所有数字必须逐字来自 plan results**\n"
+    "- 禁止输出 <tool_call>、{\"name\":...} 这类工具调用语法\n"
+    "\n"
+    "答案格式建议:用 Markdown 表格按 step 组织数据,附关键发现/对比/洞察。\n"
+    "若 plan 中某 step 失败(result.error 非空),如实告知用户该维度未拿到数据,"
+    "**基于剩余成功 step 综合作答**,不要因为部分失败而拒答。"
+)
+
 
 # Loop-level "dig deeper" pushback (v0.2.2). When the model finishes with an
 # answer that hedges on stale/incomplete data instead of digging, the loop
@@ -2341,6 +2362,13 @@ def run_agent_stream(
     # 每个 request 入口覆盖上次值,不 reset —— request 用完 context 即弃。
     ACTIVE_PROGRESS_CB.set(progress_cb)
 
+    # v0.3.3 D Phase 4:plan-and-execute 模式 per-session flag。
+    # 第一次 dispatch 完 submit_analysis_plan 后置 True;之后所有 iteration
+    # 都强制 tools=[] + PLAN_SYNTHESIS_HINT,LLM 看不到 submit_analysis_plan
+    # 这个 tool,架构上不可能再调一次 plan(修 v0.3.2 实测复现的 "iteration 2
+    # LLM 又 emit plan" silent loop)。
+    plan_dispatch_done = False
+
     def _run_attempt(msgs, current_tools, extra, tool_choice=None):
         """Forward chunks from one _speculative_iteration to client; capture state.
 
@@ -2361,24 +2389,38 @@ def run_agent_stream(
 
     for iteration in range(1, cfg.max_iterations + 1):
         is_last = iteration == cfg.max_iterations
-        if is_last:
+        # v0.3.3 D Phase 4:plan 模式下 dispatch 完成后,后续轮强制综合作答
+        # (tools=[] + PLAN_SYNTHESIS_HINT),架构上消除 "LLM 再调一次 plan"
+        # 的 silent loop。检测条件:enable_plan_and_execute + plan_dispatch_done
+        # + 不是 force_answer 轮(后者本来就 tools=[],PLAN hint 也适用)。
+        plan_synthesis_now = cfg.enable_plan_and_execute and plan_dispatch_done
+        if is_last or plan_synthesis_now:
             current_tools: list[dict[str, Any]] = []
             # v0.2.19: 合并 hint 进头部 system,不在末尾另开一条 ——
             # EAS upstream 严校验「System message must be at the beginning」。
-            current_messages = _inject_force_answer_hint(augmented, FORCE_ANSWER_SYSTEM_HINT)
+            hint_text = PLAN_SYNTHESIS_HINT if plan_synthesis_now else FORCE_ANSWER_SYSTEM_HINT
+            current_messages = _inject_force_answer_hint(augmented, hint_text)
             # v0.2.24 plan B(Anthropic 模式):rewrite history 消除 tool_call JSON 痕迹,
             # 让 Qwen3.5 在 force_answer 时更可能激活 thinking(尤其 chip ON 场景)。
-            # 默认关 — 通过 cfg 或 extra_body 临时开做 A/B 测试。
+            # plan synthesis 路径不走 rewrite —— plan 结果已经在 tool message 里
+            # 结构化清晰,改写反而丢信息。
             rewrote_history = False
-            if cfg.force_answer_rewrite_history:
+            if is_last and cfg.force_answer_rewrite_history and not plan_synthesis_now:
                 before_count = len(current_messages)
                 current_messages = _rewrite_history_for_force_answer(current_messages)
                 rewrote_history = len(current_messages) != before_count
-            progress_cb(
-                "agent_force_answer",
-                "最后一轮，强制模型作答",
-                {"iteration": iteration, "history_rewritten": rewrote_history},
-            )
+            if plan_synthesis_now:
+                progress_cb(
+                    "agent_plan_synthesis",
+                    f"plan 已 dispatch,本轮强制基于 plan results 综合作答(iter {iteration})",
+                    {"iteration": iteration},
+                )
+            else:
+                progress_cb(
+                    "agent_force_answer",
+                    "最后一轮，强制模型作答",
+                    {"iteration": iteration, "history_rewritten": rewrote_history},
+                )
         else:
             current_tools = tools
             current_messages = augmented
@@ -2697,6 +2739,17 @@ def run_agent_stream(
                 )
                 yield from _drain_queue()
                 augmented = augmented + [assistant_message] + tool_messages
+                # v0.3.3 D Phase 4:plan 模式下,dispatch 完 submit_analysis_plan
+                # 后置 flag。下一 iteration 进入 plan synthesis 路径(tools=[]),
+                # LLM 看不到 submit_analysis_plan,架构上无法再调一次 plan。
+                if (
+                    cfg.enable_plan_and_execute
+                    and any(
+                        (tc.get("function") or {}).get("name") == "submit_analysis_plan"
+                        for tc in assembled
+                    )
+                ):
+                    plan_dispatch_done = True
                 continue
 
         # ── 空响应兜底:重试已用完或仍空 → reasoning 当答案 ───────────────
