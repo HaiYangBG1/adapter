@@ -1,5 +1,13 @@
 FROM python:3.12-slim-bookworm
 
+# v0.2.27 加 GIT_SHA / VERSION build args —— /health 报 git_sha 之前一直
+# 停留在 v0.2.24 的 ba03af0(fast-path build 没刷),改成 build 时显式注入。
+# build_remote_image.sh / fast-path Dockerfile 都要传:
+#   --build-arg ADAPTER_GIT_SHA=$(git rev-parse --short HEAD)
+#   --build-arg ADAPTER_VERSION=v0.2.X
+ARG ADAPTER_GIT_SHA=unknown
+ARG ADAPTER_VERSION=unknown
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -7,7 +15,9 @@ ENV PYTHONUNBUFFERED=1 \
     ADAPTER_HOST=0.0.0.0 \
     ADAPTER_PORT=8000 \
     ADAPTER_ENABLE_OFFICE_RENDER=1 \
-    ADAPTER_LIBREOFFICE_BIN=/usr/bin/soffice
+    ADAPTER_LIBREOFFICE_BIN=/usr/bin/soffice \
+    ADAPTER_GIT_SHA=${ADAPTER_GIT_SHA} \
+    ADAPTER_VERSION=${ADAPTER_VERSION}
 
 RUN set -eux; \
     apt-get update; \
