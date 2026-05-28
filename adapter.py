@@ -61,7 +61,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.4.1")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.4.2")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -192,6 +192,15 @@ AGENT_PLAN_STEP_TIMEOUT = int(os.environ.get("ADAPTER_AGENT_PLAN_STEP_TIMEOUT", 
 # 取值上限:curl client max-time 240s,留 30s 给 final synthesis LLM 调用,
 # plan dispatcher 上限 ~210s。
 AGENT_PLAN_TOTAL_TIMEOUT = int(os.environ.get("ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT", "210"))
+
+# v0.4.2:单个 plan step 失败的最大 retry 次数。
+# 修 excel-poc 偶发返 HTTP 500 的影响(实测:同 prompt 一次失败一次全成,
+# 加 retry 1 次能把"偶发失败"兜住大半)。
+# 默认 1 = 失败后 retry 1 次(总尝试 2 次);0 = 不 retry(向后兼容)。
+# 重试 emit `plan_step_retrying` progress 事件给前端;
+# plan_step_end 加 `attempts` 字段记录实际尝试次数。
+# 不触发 retry:plan_total_timeout 路径(它是 plan-level 兜底,不是 step-level 失败)。
+AGENT_PLAN_STEP_MAX_RETRIES = int(os.environ.get("ADAPTER_AGENT_PLAN_STEP_MAX_RETRIES", "1"))
 # v0.2.26: agent loop 的 message context 字符预算。100K 是 EAS 262K context 时代
 # 的保守值;EAS 用 YaRN 扩到 1.01M token 后,500K char(~250K token)留 75% buffer
 # 给输出 + 系统模板,且远离 YaRN 高风险区(> 600K token)。
@@ -2906,6 +2915,7 @@ class Handler(BaseHTTPRequestHandler):
                         "agent_plan_parallelism": AGENT_PLAN_PARALLELISM,  # v0.3.0 D Phase 2
                         "agent_plan_step_timeout": AGENT_PLAN_STEP_TIMEOUT,  # v0.3.0 D Phase 2
                         "agent_plan_total_timeout": AGENT_PLAN_TOTAL_TIMEOUT,  # v0.3.3 D Phase 4
+                        "agent_plan_step_max_retries": AGENT_PLAN_STEP_MAX_RETRIES,  # v0.4.2
                         "agent_web_view_enabled": AGENT_WEB_VIEW_ENABLED,
                         "agent_fetch_fallback_min_chars": AGENT_FETCH_FALLBACK_MIN_CHARS,
                         "agent_excel_query_enabled": bool(EXCEL_BACKEND_URL),
@@ -3002,6 +3012,7 @@ class Handler(BaseHTTPRequestHandler):
                 cfg.agent_plan_parallelism = AGENT_PLAN_PARALLELISM
                 cfg.agent_plan_step_timeout = AGENT_PLAN_STEP_TIMEOUT
                 cfg.agent_plan_total_timeout = AGENT_PLAN_TOTAL_TIMEOUT
+                cfg.agent_plan_step_max_retries = AGENT_PLAN_STEP_MAX_RETRIES  # v0.4.2
             else:
                 cfg.system_prompt = EXCEL_AGENT_SYSTEM_PROMPT
                 # v0.2.25 L1:第一轮强制 tool_choice 指向 excel_query。修 Qwen3.5

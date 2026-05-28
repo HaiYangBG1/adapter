@@ -739,6 +739,18 @@ class AgentConfig:
     # 由 adapter.py 从 ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT env 注入。
     agent_plan_total_timeout: int = 480
 
+    # v0.4.2:单个 plan step 失败后的最大 retry 次数。
+    # 由 adapter.py 从 ADAPTER_AGENT_PLAN_STEP_MAX_RETRIES env 注入。
+    # 默认 0 = 不 retry,失败立即标 ok=false(向后兼容)。
+    # 触发条件:run_step 返回 dict 含 error 字段 / worker 抛异常。
+    # 不触发:plan_total_timeout 路径(它是 plan-level 兜底,不是 step-level 失败)。
+    # 重试时:重新起 worker 跑同 step,emit plan_step_retrying 事件给前端。
+    # plan_step_end.elapsed_ms 是从第一次 start 到最终完成的累计时间(含 retry)。
+    # plan_step_end.attempts 字段记录实际尝试次数(1 = 没 retry,2 = retry 1 次)。
+    # 修 excel-poc 偶发返 HTTP 500 的影响(实测:同 prompt 一次失败一次全成,
+    # 加 retry 1 次能把"偶发失败"兜住大半)。
+    agent_plan_step_max_retries: int = 0
+
     # v0.2.25 L1:带数据集(Excel)的请求,**第一轮**强制 tool_choice 指向唯一
     # 的查询工具(force_first_tool_name),协议层保证模型不能直接给文本叙述。
     # 修的是 Qwen3.5 在 Excel 大表 + 多工具场景偶发的"describe but don't call"
@@ -2412,11 +2424,18 @@ def _execute_plan_streaming(
             ))
 
         # 4.2 起 worker(并发上限 = parallelism;超出的进 pending 等前完成再起)
+        # v0.4.2:加 step_attempts 跟踪 retry 次数 + step_t0_map 记录第一次 start
+        # 时间(让 plan_step_end.elapsed_ms 包含 retry 累计时间)
         completed_q: "queue.Queue" = queue.Queue()
         in_flight = 0
         pending = list(batch)
+        step_attempts: dict[str, int] = {s["id"]: 0 for s in batch}
+        step_t0_map: dict[str, float] = {}
+        max_step_retries = max(0, cfg.agent_plan_step_max_retries)
+
         while pending and in_flight < parallelism:
             s = pending.pop(0)
+            step_t0_map[s["id"]] = time.time()  # v0.4.2:记 first-start 时间
             threading.Thread(
                 target=_worker, args=(s, completed_q), daemon=True,
             ).start()
@@ -2442,6 +2461,7 @@ def _execute_plan_streaming(
                         elapsed_ms=elapsed_per_step[sid],
                         ok=False,
                         error="plan_total_timeout",
+                        attempts=step_attempts.get(sid, 0) + 1,
                     ))
                 # 同样标 pending(后续 batch 不会跑)
                 aborted_by_deadline = True
@@ -2454,15 +2474,46 @@ def _execute_plan_streaming(
             except queue.Empty:
                 continue  # 还没完成,回到 while 顶检查 deadline
 
+            # ── v0.4.2 step retry:失败且还有配额 → resubmit 同 step ──
+            # 不触发:ok=True 或 retry 配额用完(走到下方正常完成路径)
+            if not ok and step_attempts[sid] < max_step_retries:
+                step_attempts[sid] += 1
+                yield ("chunk", _sse_progress_chunk(
+                    model, "plan_step_retrying",
+                    f"step {sid} 失败(第 {step_attempts[sid]} 次尝试),自动 retry",
+                    step_id=sid,
+                    attempt=step_attempts[sid] + 1,  # 即将开始的尝试编号(2-based)
+                    max_attempts=max_step_retries + 1,
+                    previous_error=str(err_msg)[:200] if err_msg else None,
+                    previous_elapsed_ms=elapsed_ms,
+                ))
+                # resubmit 同 step,in_flight 不变(worker 资源还在用)
+                # 不更新 step_t0_map[sid]:elapsed_ms 累计第一次 start 到最终完成
+                same_step = next(x for x in batch if x["id"] == sid)
+                threading.Thread(
+                    target=_worker, args=(same_step, completed_q), daemon=True,
+                ).start()
+                continue  # 不算 finished,继续 while
+
+            # 正常完成(ok=True)或 retry 配额用完(ok=False)
+            # v0.4.2:elapsed_ms 从 step_t0_map 算累计(含 retry 等待时间)
+            total_elapsed_ms = int(
+                (time.time() - step_t0_map[sid]) * 1000
+            ) if sid in step_t0_map else elapsed_ms
             results[sid] = r
-            elapsed_per_step[sid] = elapsed_ms
+            elapsed_per_step[sid] = total_elapsed_ms
+            attempt_count = step_attempts[sid] + 1  # 1-based 总尝试次数
             yield ("chunk", _sse_progress_chunk(
                 model, "plan_step_end",
-                f"step {sid} {'完成' if ok else '失败'} ({elapsed_ms}ms)",
+                f"step {sid} {'完成' if ok else '失败'} "
+                f"({total_elapsed_ms}ms"
+                + (f",尝试 {attempt_count} 次" if attempt_count > 1 else "")
+                + ")",
                 step_id=sid,
-                elapsed_ms=elapsed_ms,
+                elapsed_ms=total_elapsed_ms,
                 ok=ok,
                 error=err_msg,
+                attempts=attempt_count,
             ))
             finished += 1
             in_flight -= 1
@@ -2470,6 +2521,7 @@ def _execute_plan_streaming(
             # 释放并发,起下一个 pending(若有)
             if pending and in_flight < parallelism:
                 s = pending.pop(0)
+                step_t0_map[s["id"]] = time.time()  # v0.4.2:记 first-start
                 threading.Thread(
                     target=_worker, args=(s, completed_q), daemon=True,
                 ).start()
