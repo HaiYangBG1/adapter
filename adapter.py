@@ -34,8 +34,9 @@ import urllib.error
 import urllib.request
 import urllib.parse
 import zipfile
-import contextvars  # v0.3.0 D Phase 3:跨 ThreadPoolExecutor 透 progress_cb
-from concurrent.futures import ThreadPoolExecutor, as_completed  # v0.3.0 D Phase 2 plan dispatcher
+# v0.4.0 D 重构:不再需要 contextvars / ThreadPoolExecutor —— plan 执行已升级
+# 为 agentic_web.py 的 _execute_plan_streaming generator,内部用 threading + queue。
+# adapter.py 完全不参与 plan 执行调度,只通过 _make_excel_run_step 注入 step runner。
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
@@ -45,7 +46,6 @@ from agentic_web import (
     AgentConfig,
     EXCEL_AGENT_SYSTEM_PROMPT,
     EXCEL_AGENT_PLAN_PROMPT,  # v0.3.0 D Phase 1
-    ACTIVE_PROGRESS_CB,  # v0.3.0 D Phase 3:跨 worker 透 progress_cb
     EXCEL_QUERY_TOOL,
     SUBMIT_ANALYSIS_PLAN_TOOL,  # v0.3.0 D Phase 1
     ToolRegistry,
@@ -61,7 +61,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.3.4")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.4.0")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -1751,343 +1751,59 @@ def _make_excel_query_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
     return _impl
 
 
-def _validate_plan_steps(steps: Any) -> Optional[str]:
-    """v0.3.0 D Phase 2:校验 LLM 提交的 plan.steps。返回错误信息字符串,
-    None 表示通过。容错原则:能跑就跑(如 depends_on 引用不存在的 id 当作
-    无依赖处理),只对结构性问题报错。
-    """
-    if not isinstance(steps, list) or not steps:
-        return "steps 必须是非空数组"
-    if len(steps) > 12:
-        return f"steps 上限 12,收到 {len(steps)}(请合并相关 step)"
-    seen_ids: set[str] = set()
-    for i, s in enumerate(steps):
-        if not isinstance(s, dict):
-            return f"steps[{i}] 不是对象"
-        sid = s.get("id")
-        if not isinstance(sid, str) or not sid.strip():
-            return f"steps[{i}].id 缺失或不是字符串"
-        sid = sid.strip()
-        if sid in seen_ids:
-            return f"steps[{i}].id='{sid}' 重复"
-        seen_ids.add(sid)
-        q = s.get("question")
-        if not isinstance(q, str) or not q.strip():
-            return f"steps[{i}](id={sid}).question 缺失或为空"
-        deps = s.get("depends_on")
-        if deps is not None and not isinstance(deps, list):
-            return f"steps[{i}](id={sid}).depends_on 必须是数组(可省略表示无依赖)"
-    return None
+# v0.4.0 D 重构:_validate_plan_steps / _topological_sort_plan_steps / _make_submit_plan_impl
+# 整体删除 —— 已移到 agentic_web.py(plan 升级为一等公民)。
+# adapter.py 这边只保留依赖反转的 _make_excel_run_step 工厂函数。
 
 
-def _topological_sort_plan_steps(steps: list[dict[str, Any]]) -> Optional[list[list[dict[str, Any]]]]:
-    """v0.3.0 D Phase 2:把 plan.steps 按 depends_on 拓扑排序,返回 batches ——
-    同一 batch 内所有 step 互不依赖、可并行执行;batch 之间串行(前一 batch 全
-    完成才开下一 batch)。检测到循环依赖时返回 None。
+def _make_excel_run_step(dataset_id: str) -> Callable[[str, int], Any]:
+    """v0.4.0 D 重构:依赖反转的注入函数。返回 (question, timeout_s) → result
+    callable,绑定 dataset_id。由 do_POST handler 在 plan 模式下塞进
+    cfg.plan_step_runner,_execute_plan_streaming generator 调用它执行 step。
 
-    depends_on 引用不存在的 step id 当作无依赖(容错,避免 LLM 笔误整个 plan 挂)。
-    """
-    step_by_id = {s["id"].strip(): s for s in steps}
-    in_degree: dict[str, int] = {sid: 0 for sid in step_by_id}
-    dependents: dict[str, list[str]] = {sid: [] for sid in step_by_id}
-    for s in steps:
-        sid = s["id"].strip()
-        for dep in (s.get("depends_on") or []):
-            dep = dep.strip() if isinstance(dep, str) else ""
-            if dep and dep in step_by_id:
-                in_degree[sid] += 1
-                dependents[dep].append(sid)
-            # else: 引用不存在的 step id,容错跳过(不增 in_degree)
-    batches: list[list[dict[str, Any]]] = []
-    remaining = set(step_by_id.keys())
-    while remaining:
-        current_ids = [sid for sid in remaining if in_degree[sid] == 0]
-        if not current_ids:
-            return None  # 循环依赖
-        # 按原始顺序排,batch 内 dispatch 顺序稳定(便于观察)
-        current_batch = [step_by_id[sid] for sid in current_ids]
-        batches.append(current_batch)
-        for sid in current_ids:
-            remaining.remove(sid)
-            for dependent in dependents[sid]:
-                if dependent in remaining:
-                    in_degree[dependent] -= 1
-    return batches
+    内部包 _call_excel_backend:question 为空时直接返 error;timeout_s 参数当前
+    未透到 urllib(EXCEL_QUERY_TIMEOUT env 是 socket 上限),保留是为未来给
+    后端传 deadline 用 —— signature 跟 PlanStepRunner 协议一致(generic 边界)。
 
-
-def _make_submit_plan_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
-    """v0.3.0 D Phase 2:真 dispatcher 实现。LLM emit submit_analysis_plan 后,
-    adapter 在 tool_impl 里:
-      1. 校验 plan(_validate_plan_steps)—— 不合规直接返 error 给 LLM
-      2. 拓扑排序(_topological_sort_plan_steps)—— 循环依赖返 error
-      3. 按 batch 并行 dispatch excel_query(ThreadPoolExecutor,parallelism cap)
-      4. 收集 {step_id: result} 字典,作为单个 tool_result 返回给 LLM
-      5. LLM 下一轮看到所有 step 结果,基于真实数据综合作答
-
-    设计:整个 plan 跑完后才返回一个 tool_result(LLM 看一次完整图);如果某个
-    step 失败,在 results 里写 error 但其他 step 照常跑(单点失败不拖死全 plan)。
-    完全失败时返 plan_executed=False + 详细原因,LLM 会作答说"查询遇到问题"。
+    agentic_web.py 完全不知道 Excel 后端 / EXCEL_BACKEND_URL / urllib 调用 —— 守
+    AGENTS.md generic/open-source safe 边界。
     """
 
-    def _impl(args: dict[str, Any]) -> Any:
-        # v0.3.0 D Phase 3:拿 ContextVar 里的 progress_cb(stream_agent 入口 set)。
-        # None 表示不在 agent stream 路径里(如 sync run_agent 或直接脚本测试),
-        # 此时所有 _emit_progress 调用降级 noop。
-        progress_cb = ACTIVE_PROGRESS_CB.get()
+    def _run_step(question: str, timeout_s: int) -> Any:
+        question = (question or "").strip()
+        if not question:
+            return {"error": "step.question 为空,无法执行"}
+        # 当前 _call_excel_backend 内部用 EXCEL_QUERY_TIMEOUT(adapter-level
+        # urllib socket timeout)。timeout_s 是 agent 层的 step 软超时,
+        # _execute_plan_streaming 已经在 plan_deadline / completed_q.get 那层
+        # 兜底。未来可改 _call_excel_backend 接 timeout_s 透到 backend deadline。
+        _ = timeout_s  # acknowledge param
+        return _call_excel_backend(dataset_id, question)
 
-        def _emit_progress(stage: str, message: str, meta: dict[str, Any]) -> None:
-            if progress_cb is not None:
-                try:
-                    progress_cb(stage, message, meta)
-                except Exception:  # noqa: BLE001 — emit 失败不能掀翻 dispatcher
-                    pass
-
-        # 1. 校验
-        steps_raw = args.get("steps")
-        err = _validate_plan_steps(steps_raw)
-        if err:
-            _emit_progress("plan_validation_failed", f"plan 校验失败:{err}", {})
-            return {
-                "plan_executed": False,
-                "error": f"plan 校验失败:{err}",
-                "received_args_preview": str(args)[:200],
-            }
-        steps: list[dict[str, Any]] = [
-            {**s, "id": s["id"].strip(), "question": s["question"].strip()}
-            for s in steps_raw  # type: ignore[union-attr]
-        ]
-
-        # 2. 拓扑排序
-        batches = _topological_sort_plan_steps(steps)
-        if batches is None:
-            _emit_progress(
-                "plan_validation_failed",
-                "plan 含循环依赖,无法拓扑排序",
-                {"step_ids": [s["id"] for s in steps]},
-            )
-            return {
-                "plan_executed": False,
-                "error": "plan 含循环依赖,无法拓扑排序。请检查 depends_on 字段。",
-                "step_ids": [s["id"] for s in steps],
-            }
-
-        # ── v0.3.0 D Phase 3:plan_submitted 入口事件 ──────────────────
-        _emit_progress(
-            "plan_submitted",
-            f"已规划 {len(steps)} 步({len(batches)} 个并行批次)",
-            {
-                "step_count": len(steps),
-                "batch_count": len(batches),
-                "summary": args.get("summary") or "",
-                "steps": [
-                    {
-                        "id": s["id"],
-                        "question": s["question"][:200],  # 截断防超大
-                        "depends_on": s.get("depends_on") or [],
-                        "rationale": (s.get("rationale") or "")[:200],
-                    }
-                    for s in steps
-                ],
-            },
-        )
-
-        # 3. 分批并行 dispatch + per-step progress
-        results: dict[str, dict[str, Any]] = {}
-        elapsed_ms_per_step: dict[str, int] = {}
-        plan_t0 = time.time()
-        # v0.3.3 plan-level deadline:绝对时间点 plan_t0 + AGENT_PLAN_TOTAL_TIMEOUT
-        plan_deadline = plan_t0 + AGENT_PLAN_TOTAL_TIMEOUT
-
-        def _run_step_with_progress(
-            step: dict[str, Any], batch_idx: int
-        ) -> tuple[str, Any, int]:
-            """worker 函数:emit start → 调 excel_backend → emit end → 返回。
-            异常被吞掉转成 error dict(单 step 失败不应拖死整 batch)。
-            """
-            sid = step["id"]
-            question = step["question"]
-            _emit_progress(
-                "plan_step_start",
-                f"执行 step {sid}",
-                {
-                    "step_id": sid,
-                    "question": question[:200],
-                    "batch_index": batch_idx,
-                },
-            )
-            t0 = time.time()
-            try:
-                result = _call_excel_backend(dataset_id, question)
-                elapsed_ms = int((time.time() - t0) * 1000)
-                ok = not (isinstance(result, dict) and result.get("error"))
-                _emit_progress(
-                    "plan_step_end",
-                    f"step {sid} 完成 ({elapsed_ms}ms)",
-                    {
-                        "step_id": sid,
-                        "elapsed_ms": elapsed_ms,
-                        "ok": ok,
-                        "error": (result.get("error") if isinstance(result, dict) and not ok else None),
-                    },
-                )
-                return sid, result, elapsed_ms
-            except Exception as exc:  # noqa: BLE001
-                elapsed_ms = int((time.time() - t0) * 1000)
-                err_msg = f"{type(exc).__name__}: {exc}"
-                _emit_progress(
-                    "plan_step_end",
-                    f"step {sid} 失败 ({elapsed_ms}ms)",
-                    {
-                        "step_id": sid,
-                        "elapsed_ms": elapsed_ms,
-                        "ok": False,
-                        "error": err_msg,
-                    },
-                )
-                return sid, {"error": f"step 执行失败:{err_msg}"}, elapsed_ms
-
-        # v0.3.3 D Phase 4 重写:as_completed timeout 在 SAE Python 实测不稳
-        # (v0.3.2 复杂 plan 158s step 没触发 65s timeout),改 plan-level
-        # deadline 自己判断。
-        #
-        # 策略:
-        #   for batch:
-        #     if past deadline → 后续 step 全标 error 不跑(_emit_progress 直接 end)
-        #     else 并行 submit(每个 worker 自己 copy_context)
-        #     用 fut.result(timeout=...) 单 future 等,每个 fut 留剩余时间预算
-        #     超 deadline 强制 break + 后续标 error
-        #
-        # **关键**:每个 worker 必须自己 copy_context() —— Python 文档明确
-        # "Context.run raises RuntimeError when called on the same context
-        # object from more than one OS thread"。
-        plan_aborted = False
-        plan_abort_reason = ""
-        for batch_idx, batch in enumerate(batches):
-            now = time.time()
-            if now >= plan_deadline:
-                plan_aborted = True
-                plan_abort_reason = f"plan 总超时(>{AGENT_PLAN_TOTAL_TIMEOUT}s),batch {batch_idx} 及后续 step 跳过"
-                _emit_progress(
-                    "plan_batch_skipped",
-                    plan_abort_reason,
-                    {"batch_index": batch_idx, "skipped_step_count": sum(len(b) for b in batches[batch_idx:])},
-                )
-                for s in batch:
-                    results[s["id"]] = {"error": "plan 总超时,本 step 未执行"}
-                    elapsed_ms_per_step[s["id"]] = 0
-                continue
-            remaining_for_batch = plan_deadline - now
-            with ThreadPoolExecutor(
-                max_workers=min(AGENT_PLAN_PARALLELISM, len(batch))
-            ) as pool:
-                fut_to_step = {
-                    pool.submit(
-                        contextvars.copy_context().run,
-                        _run_step_with_progress, s, batch_idx,
-                    ): s
-                    for s in batch
-                }
-                # 不用 as_completed timeout(不稳)。每个 fut 单独 wait with
-                # remaining-deadline。fut.result(timeout) 抛 TimeoutError 时,
-                # worker 还在跑 — 不能 cancel,但记 error,后续 batch 用 deadline 判断。
-                pending = dict(fut_to_step)
-                while pending:
-                    now = time.time()
-                    timeout_for_this = min(
-                        AGENT_PLAN_STEP_TIMEOUT,
-                        max(1.0, plan_deadline - now),
-                    )
-                    # 等任一 fut 完成,最多 timeout_for_this
-                    try:
-                        done_iter = as_completed(list(pending.keys()), timeout=timeout_for_this)
-                        fut = next(iter(done_iter))
-                    except StopIteration:
-                        continue
-                    except Exception as exc:  # TimeoutError or other
-                        # 时间到了仍有 pending fut。把它们都标超时 error。
-                        for f, s in pending.items():
-                            results[s["id"]] = {
-                                "error": f"step 超时({type(exc).__name__}): plan 总耗时已达 {int(time.time()-plan_t0)}s",
-                            }
-                            elapsed_ms_per_step[s["id"]] = int((time.time() - plan_t0) * 1000)
-                            _emit_progress(
-                                "plan_step_end",
-                                f"step {s['id']} 超时",
-                                {"step_id": s["id"], "elapsed_ms": elapsed_ms_per_step[s["id"]], "ok": False, "error": "timeout"},
-                            )
-                        pending.clear()
-                        break
-                    # 拿到一个完成的 fut
-                    s = pending.pop(fut)
-                    try:
-                        sid, result, elapsed_ms = fut.result(timeout=0.1)  # 已 done,瞬时拿
-                        results[sid] = result
-                        elapsed_ms_per_step[sid] = elapsed_ms
-                    except Exception as exc:  # noqa: BLE001
-                        results[s["id"]] = {"error": f"future 异常:{type(exc).__name__}: {exc}"}
-                        elapsed_ms_per_step[s["id"]] = 0
-
-        # 4. 汇总:保留原始 plan 顺序,LLM 看一致的视图
-        summary_for_llm = {
-            "plan_executed": True,
-            "step_count": len(steps),
-            "batch_count": len(batches),
-            "total_elapsed_ms": int((time.time() - plan_t0) * 1000),
-            "results": [
-                {
-                    "step_id": s["id"],
-                    "question": s["question"],
-                    "rationale": s.get("rationale", ""),
-                    "depends_on": s.get("depends_on") or [],
-                    "elapsed_ms": elapsed_ms_per_step.get(s["id"], 0),
-                    "result": results.get(s["id"], {"error": "未执行"}),
-                }
-                for s in steps
-            ],
-        }
-        # 加 plan-level 失败统计便于 LLM 判断
-        failed = [r for r in summary_for_llm["results"] if "error" in (r.get("result") or {})]
-        summary_for_llm["failed_step_count"] = len(failed)
-        if failed:
-            summary_for_llm["failed_step_ids"] = [r["step_id"] for r in failed]
-
-        # ── v0.3.0 D Phase 3:plan_complete 出口事件 ───────────────────
-        _emit_progress(
-            "plan_complete",
-            f"plan 完成 ({summary_for_llm['total_elapsed_ms']}ms,{len(steps)} 步,{len(failed)} 失败)",
-            {
-                "total_elapsed_ms": summary_for_llm["total_elapsed_ms"],
-                "step_count": len(steps),
-                "failed_count": len(failed),
-                "failed_step_ids": summary_for_llm.get("failed_step_ids") or [],
-            },
-        )
-
-        return summary_for_llm
-
-    return _impl
+    return _run_step
 
 
 def _build_agent_registry(excel_dataset_id: str = "", enable_plan: bool = False) -> ToolRegistry:
     """无表格数据集时复用 web 工具单例;带数据集时新建一个 registry。
 
     带数据集 + enable_plan=False(旧路径,v0.2.x 默认):挂 web 工具 + EXCEL_QUERY_TOOL。
-    带数据集 + enable_plan=True(v0.3.0 D Plan-and-Execute):**只挂** SUBMIT_ANALYSIS_PLAN_TOOL ——
-    第一轮 LLM 看到的工具只有这一个,tool_choice 协议层强制 emit,从架构上消除
-    "说计划不 emit" silent failure 的可能性。Web 工具在 plan 模式下不暴露
-    (Excel 任务跟联网搜索语义不同;混合用例罕见,后续真有需求再说)。
-
-    每请求新建开销极小(几次 dict 赋值),换来 tool surface 只在确有数据集
-    时才对模型可见,且能按 plan/iterative 模式精确控制。
+    带数据集 + enable_plan=True(v0.4.0 D 重构):**用 register_schema_only**
+    只挂 SUBMIT_ANALYSIS_PLAN_TOOL schema,**不挂 impl**。第一轮 LLM 看到的
+    工具只有这一个,tool_choice 协议层强制 emit。LLM emit 后,run_agent_stream /
+    run_agent 在 plan 分支直接拦截 → _execute_plan_streaming generator,不走
+    ToolRegistry.dispatch。漏拦截时 _dispatch_tool_calls_parallel 检测到 plan
+    name 但无 impl,emit `agent_plan_intercept_missed` progress 让开发者立刻发现。
     """
     if not (excel_dataset_id and EXCEL_BACKEND_URL):
         return _get_agent_registry()
     reg = ToolRegistry()
     if enable_plan:
-        # v0.3.0 D Phase 1:只挂 submit_analysis_plan,不挂 excel_query 也不挂 web
-        # 工具 —— 第一轮 LLM 只能 emit plan,无 silent failure 可能。Phase 2
-        # dispatcher 接通后,plan 内部跑的实际是 excel_query(adapter 内部调用)。
-        reg.register(SUBMIT_ANALYSIS_PLAN_TOOL, _make_submit_plan_impl(excel_dataset_id))
+        # v0.4.0:用 register_schema_only —— 只挂 schema,impl 由 stream_agent
+        # 的 plan 分支直接处理(不走 dispatch)。这样设计的好处:
+        # 1. 删除 _make_submit_plan_impl 整段(160+ 行套娃)
+        # 2. 不需要 ACTIVE_PROGRESS_CB ContextVar 跨线程透传 progress_cb
+        # 3. plan 执行从 ToolRegistry 黑盒变成 agent loop 一等公民 generator
+        reg.register_schema_only(SUBMIT_ANALYSIS_PLAN_TOOL)
         return reg
     # 旧路径(v0.2.x):web 工具 + excel_query 全挂
     reg.register(WEB_SEARCH_TOOL, _tool_impl_web_search)
@@ -3272,13 +2988,20 @@ class Handler(BaseHTTPRequestHandler):
         # 误判「没材料」而拒答。
         if excel_dataset_id and EXCEL_BACKEND_URL:
             if enable_plan_for_request:
-                # v0.3.0 D Plan-and-Execute 模式:用 plan prompt,第一轮强制
-                # submit_analysis_plan(替代 excel_query)。Phase 1 stub impl
-                # 会回错让 LLM 知道服务未就绪;Phase 2 接通真 dispatcher 后
-                # 行为变成"plan emit → adapter 拓扑调度 → final synthesis"。
+                # v0.4.0 D 重构:Plan-and-Execute 一等公民模式
+                # 1. system prompt 用 PLAN(不是旧 SYSTEM)
+                # 2. force_first_tool_name=submit_analysis_plan
+                # 3. enable_plan_and_execute=True 让 run_agent_stream 走 plan 拦截分支
+                # 4. plan_step_runner 注入 — agentic_web.py 完全不知道 Excel 后端,
+                #    通过这个 callable 解耦,守 AGENTS.md generic 边界
+                # 5. plan-related env 同步到 cfg(_execute_plan_streaming 用)
                 cfg.system_prompt = EXCEL_AGENT_PLAN_PROMPT
                 cfg.enable_plan_and_execute = True
                 cfg.force_first_tool_name = "submit_analysis_plan"
+                cfg.plan_step_runner = _make_excel_run_step(excel_dataset_id)
+                cfg.agent_plan_parallelism = AGENT_PLAN_PARALLELISM
+                cfg.agent_plan_step_timeout = AGENT_PLAN_STEP_TIMEOUT
+                cfg.agent_plan_total_timeout = AGENT_PLAN_TOTAL_TIMEOUT
             else:
                 cfg.system_prompt = EXCEL_AGENT_SYSTEM_PROMPT
                 # v0.2.25 L1:第一轮强制 tool_choice 指向 excel_query。修 Qwen3.5

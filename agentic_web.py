@@ -26,7 +26,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import contextvars  # v0.3.0 D Phase 3:把 progress_cb 从 stream_agent 透到深层 tool_impl
+import queue  # v0.4.0 D 重构:plan 执行 generator 用 Queue 收集 worker 完成事件
+import threading  # v0.4.0 D 重构:plan 执行 worker 用 daemon thread,主 generator 退出后自然 GC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -593,6 +594,21 @@ class ToolRegistry:
         self._impls[name] = impl
         self._schemas[name] = schema
 
+    def register_schema_only(self, schema: dict[str, Any]) -> None:
+        """v0.4.0 D 重构:挂 schema 让 LLM 看到,但不挂 impl。
+        用于 inline-handled tool(如 submit_analysis_plan)—— 由 run_agent /
+        run_agent_stream 在 plan 分支直接拦截执行,不走 dispatch 路径。
+        漏拦截时 dispatch 会返回 "unknown tool" error,且
+        _dispatch_tool_calls_parallel 会 emit `agent_plan_intercept_missed`
+        progress(开发者明显告警,防 ToolRegistry 异常吞掉静默)。"""
+        name = schema["function"]["name"]
+        self._schemas[name] = schema
+        # 不写 self._impls[name] — dispatch 时 lookup 不到自然走 unknown-tool 路径
+
+    def has_impl(self, name: str) -> bool:
+        """是否注册了 impl(用于区分 inline-handled tool / 正常 tool)。"""
+        return name in self._impls
+
     def schemas(self) -> list[dict[str, Any]]:
         return list(self._schemas.values())
 
@@ -703,6 +719,26 @@ class AgentConfig:
     # 详见 lxj-adapter-deploy/design/2026-05-28-D-plan-and-execute-architecture.md
     enable_plan_and_execute: bool = False
 
+    # v0.4.0 D 重构:plan 执行注入的"step 执行器"。由 adapter.py 在 handler 路径
+    # 通过 _make_excel_run_step(dataset_id) 注入一个绑定 dataset_id 的 callable。
+    # 签名:(question: str, timeout_s: int) -> Any —— 返回 dict 含 answer / sql / error 等。
+    # agentic_web.py 不知道 Excel 后端存在,守 AGENTS.md generic/open-source safe 边界。
+    # 仅当 enable_plan_and_execute=True 且 plan_step_runner 非 None 时,plan 分支才触发。
+    plan_step_runner: Optional[Callable[[str, int], Any]] = None
+
+    # v0.4.0 D 重构:plan 执行的并发上限。同一 batch 内最多起 N 个 worker thread,
+    # 超出的进 pending 等前完成。由 adapter.py 从 ADAPTER_AGENT_PLAN_PARALLELISM env 注入。
+    agent_plan_parallelism: int = 4
+
+    # v0.4.0 D 重构:单个 step(run_step 调用)的超时(秒)。
+    # 由 adapter.py 从 ADAPTER_AGENT_PLAN_STEP_TIMEOUT env 注入。
+    agent_plan_step_timeout: int = 60
+
+    # v0.4.0 D 重构:plan 整体超时(秒) —— 兜底防 worker 跑飞(如 run_step hang)。
+    # 触发后标剩余 step error,正常 emit plan_step_end + plan_complete,正常 yield result。
+    # 由 adapter.py 从 ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT env 注入。
+    agent_plan_total_timeout: int = 480
+
     # v0.2.25 L1:带数据集(Excel)的请求,**第一轮**强制 tool_choice 指向唯一
     # 的查询工具(force_first_tool_name),协议层保证模型不能直接给文本叙述。
     # 修的是 Qwen3.5 在 Excel 大表 + 多工具场景偶发的"describe but don't call"
@@ -749,19 +785,11 @@ SourcesCallback = Callable[[str, list[dict[str, Any]]], None]
 # query, items —— 调用一次 = 一次 web_search 的结构化结果。前端累加去重。
 
 
-# v0.3.0 D Phase 3:ContextVar 把 stream_agent / run_agent 的 progress_cb
-# 透到深层 tool_impl —— 让 _make_submit_plan_impl 内部能 emit per-step
-# 细粒度进度事件(plan_step_start / plan_step_end),不用改 ToolRegistry 接口。
-#
-# **关键**:ContextVar 在 threading.Thread 不自动 propagate,所以所有用
-# ThreadPoolExecutor 派发的地方,submit 时必须用 `ctx.run(func, ...)` 显式
-# 传 context(见 _dispatch_tool_calls_parallel)。
-#
-# 默认 None:agent 路径外的调用(直接 import _make_submit_plan_impl 在脚本里
-# 跑等)拿到 None,impl 自然降级为不 emit 进度。
-ACTIVE_PROGRESS_CB: contextvars.ContextVar[Optional[ProgressCallback]] = (
-    contextvars.ContextVar("adapter_active_progress_cb", default=None)
-)
+# v0.4.0 D 重构:删除 ACTIVE_PROGRESS_CB ContextVar(原 v0.3.0 Phase 3 引入)。
+# 重构后 plan 执行升级为 agent loop 一等公民(`_execute_plan_streaming`),通过
+# generator 直接 yield SSE chunk,**不再依赖 ContextVar 把 progress_cb 跨线程透传**。
+# ToolRegistry 接口零改动,web 工具继续走 _dispatch_tool_calls_parallel(纯 sync,
+# 无 ContextVar 需求)。
 
 
 def _emit(cb: Optional[ProgressCallback], stage: str, message: str, **meta: Any) -> None:
@@ -950,6 +978,22 @@ def _tool_args_preview(tc: dict[str, Any]) -> str:
         return str(args.get("url") or "")[:160]
     if name == "excel_query":
         return str(args.get("question") or "")[:160]
+    if name == "submit_analysis_plan":
+        # v0.4.0:plan 特化 —— 让 args_preview 显示有意义的摘要,而不是被截断的
+        # raw JSON。正常路径下 plan 走 _execute_plan_streaming 不经过 dispatch,
+        # 这个 preview 用在 stream_agent plan 拦截分支 emit 的兼容性 tools_dispatch
+        # 事件里(必做兼容事件 #1)。
+        steps = args.get("steps") if isinstance(args.get("steps"), list) else []
+        summary = str(args.get("summary") or "").strip()
+        if summary:
+            return f"{summary}(共 {len(steps)} 步)"[:200]
+        ids = [
+            str(s.get("id", "?"))
+            for s in steps[:5]
+            if isinstance(s, dict)
+        ]
+        suffix = "" if len(steps) <= 5 else f" 等 {len(steps)} 步"
+        return f"plan: {', '.join(ids)}{suffix}"[:200]
     # 通用兜底
     return json.dumps(args, ensure_ascii=False)[:80]
 
@@ -1369,6 +1413,25 @@ def _dispatch_tool_calls_parallel(
         except json.JSONDecodeError:
             args = {}
 
+        # v0.4.0:漏拦截兜底告警 —— plan tool 正常路径应该被 stream_agent /
+        # run_agent 的 plan 分支直接 yield generator 拦截,不应该进 dispatch。
+        # 走到这里说明:(1) cfg.enable_plan_and_execute=False(env 关闭场景);
+        # (2) plan_step_runner 未注入(adapter.py handler 漏配);(3) LLM 在
+        # 多 tool 场景下混合 emit 了 plan(理论上 register_schema_only 已防,
+        # 但 LLM 可能直接构造 tool_call 而无视 schema)。三种都是 bug,
+        # 给开发者明显信号(progress event 走 Langfuse + 前端 + 日志)。
+        if name == "submit_analysis_plan" and not registry.has_impl(name):
+            _emit(
+                progress_cb, "agent_plan_intercept_missed",
+                "submit_analysis_plan 落到 dispatch(预期应被 plan 分支拦截)—— "
+                "请检查 cfg.enable_plan_and_execute / cfg.plan_step_runner 是否正确注入",
+                name=name,
+                args_preview=str(args)[:200],
+                iteration_hint="plan 分支应在 _execute_plan_streaming 处理,不应到这里",
+            )
+            # 继续走 unknown-tool 路径(registry.dispatch 会返 "unknown tool" error)
+            # —— LLM 看到 error 后会知道 plan 不可用,fallback 到旧 iterative loop 行为
+
         sig = _call_signature(tc)
         if sig in seen_signatures:
             trace.duplicate_calls_skipped += 1
@@ -1455,13 +1518,12 @@ def _dispatch_tool_calls_parallel(
         indexed[idx] = _make_tool_message(tc, result, cfg.max_tool_result_chars)
 
     if fresh:
-        # v0.3.0 D Phase 3:用 copy_context().run 把 ContextVar(尤其
-        # ACTIVE_PROGRESS_CB)透到 worker 线程 —— 不然 _make_submit_plan_impl
-        # 在 worker 里 .get() 会拿到 default None,emit 不出 plan_step_start/end。
-        ctx = contextvars.copy_context()
+        # v0.4.0:还原为最初的 pool.submit(_run_one, ...) 直接派发。
+        # 不再用 copy_context().run —— plan 执行已升级为一等公民 generator,
+        # 不依赖 ContextVar 跨线程透传 progress_cb。
         with ThreadPoolExecutor(max_workers=max(cfg.parallel_dispatch_workers, 1)) as pool:
             futures = [
-                pool.submit(ctx.run, _run_one, idx, tc, name, args)
+                pool.submit(_run_one, idx, tc, name, args)
                 for idx, tc, name, args in fresh
             ]
             for fut in as_completed(futures):
@@ -1882,11 +1944,8 @@ def run_agent(
 
     Returns (final_response_dict, trace).
     """
-    # v0.3.0 D Phase 3:把 progress_cb 透到 ContextVar,让深层 tool_impl
-    # (如 _make_submit_plan_impl 内部) 可 emit 细粒度进度事件。
-    # 每个 request 入口覆盖上次值,不做 reset —— server handler 用完 context
-    # 即弃,无副作用。
-    ACTIVE_PROGRESS_CB.set(progress_cb)
+    # v0.4.0:删除 ACTIVE_PROGRESS_CB.set —— plan 执行已升级为 generator,直接
+    # 通过 yield 传 chunk 给上层,不需要 ContextVar 跨线程透传。
     trace = AgentTrace()
     tools = registry.schemas()
     augmented = _ensure_system_prompt(_sanitize_history(messages), cfg.system_prompt)
@@ -1961,6 +2020,69 @@ def run_agent(
         # Tool calls present — dispatch and continue
         message = choice.get("message", {}) or {}
         tool_calls = message.get("tool_calls") or []
+
+        # ── v0.4.0 D 重构:非流式路径对称加 plan 拦截分支 ──
+        is_plan_call = (
+            cfg.enable_plan_and_execute
+            and cfg.plan_step_runner is not None
+            and len(tool_calls) == 1
+            and (tool_calls[0].get("function") or {}).get("name")
+                == "submit_analysis_plan"
+        )
+        if is_plan_call:
+            plan_tc = tool_calls[0]
+            plan_tc_id = plan_tc.get("id", "") or "tc_plan"
+            plan_args_raw = (plan_tc.get("function") or {}).get("arguments") or "{}"
+            try:
+                plan_args = (
+                    json.loads(plan_args_raw)
+                    if isinstance(plan_args_raw, str)
+                    else (plan_args_raw or {})
+                )
+                plan_parse_err: Optional[str] = None
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                plan_args = {}
+                plan_parse_err = f"plan args 非合法 JSON:{type(exc).__name__}: {exc}"
+
+            _emit(
+                progress_cb, "tools_dispatch", "模型请求 1 个工具调用",
+                count=1, iteration=iteration,
+            )
+
+            plan_result: Optional[dict[str, Any]] = None
+            plan_t0 = time.time()
+            if plan_parse_err:
+                plan_result = {
+                    "plan_executed": False, "error": plan_parse_err,
+                }
+                trace.tool_calls.append({
+                    "name": "submit_analysis_plan", "ok": False,
+                    "modality": "text",
+                    "elapsed_ms": int((time.time() - plan_t0) * 1000),
+                    "error": plan_parse_err, "step_count": 0,
+                })
+            else:
+                for kind, payload in _execute_plan_streaming(
+                    plan_args, cfg.plan_step_runner, cfg, cfg.model, trace,
+                ):
+                    # 非流式路径丢弃 chunk(没 SSE client),只取 result
+                    if kind == "result":
+                        plan_result = payload
+                if plan_result is None:
+                    plan_result = {
+                        "plan_executed": False,
+                        "error": "_execute_plan_streaming 未 yield result",
+                    }
+
+            tool_message = {
+                "role": "tool",
+                "tool_call_id": plan_tc_id,
+                "content": json.dumps(plan_result, ensure_ascii=False),
+            }
+            augmented = augmented + [message, tool_message]
+            continue
+
+        # ── 非 plan tool_call:走原 _dispatch_tool_calls_parallel ──
         _emit(
             progress_cb,
             "tools_dispatch",
@@ -2073,6 +2195,334 @@ def _stream_final_answer(model: str, content: str, resp: dict[str, Any]):
     if resp.get("usage"):
         stop["usage"] = resp["usage"]
     yield stop
+
+
+# =============================================================================
+# v0.4.0 D 重构:Plan 升级为 agent loop 一等公民(first-class phase)
+# 不再套 ToolRegistry 接口,plan 执行是 generator,直接 yield SSE chunk。
+# 详见 lxj-adapter-deploy/design/2026-05-28-D-refactor-plan-as-first-class-phase.md
+# =============================================================================
+
+
+def _validate_plan_steps(steps: Any) -> Optional[str]:
+    """校验 LLM 提交的 plan.steps 结构。返回错误信息字符串,None 表示通过。
+    容错原则:能跑就跑(如 depends_on 引用不存在的 id 当作无依赖处理 —— 在
+    _topological_sort_plan_steps 里处理),只对结构性问题报错。
+    v0.4.0:从 adapter.py 移过来,作为 agent loop 内部 helper。
+    """
+    if not isinstance(steps, list) or not steps:
+        return "steps 必须是非空数组"
+    if len(steps) > 12:
+        return f"steps 上限 12,收到 {len(steps)}(请合并相关 step)"
+    seen_ids: set[str] = set()
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict):
+            return f"steps[{i}] 不是对象"
+        sid = s.get("id")
+        if not isinstance(sid, str) or not sid.strip():
+            return f"steps[{i}].id 缺失或不是字符串"
+        sid = sid.strip()
+        if sid in seen_ids:
+            return f"steps[{i}].id='{sid}' 重复"
+        seen_ids.add(sid)
+        q = s.get("question")
+        if not isinstance(q, str) or not q.strip():
+            return f"steps[{i}](id={sid}).question 缺失或为空"
+        deps = s.get("depends_on")
+        if deps is not None and not isinstance(deps, list):
+            return f"steps[{i}](id={sid}).depends_on 必须是数组(可省略表示无依赖)"
+    return None
+
+
+def _topological_sort_plan_steps(
+    steps: list[dict[str, Any]],
+) -> Optional[list[list[dict[str, Any]]]]:
+    """拓扑排序 plan.steps,返回 batches —— 同一 batch 内 step 互不依赖、可并行执行;
+    batch 之间串行(前一 batch 全完成才开下一 batch)。检测到循环依赖时返回 None。
+    depends_on 引用不存在的 id 当无依赖容错跳过。
+    v0.4.0:从 adapter.py 移过来。
+    """
+    step_by_id = {s["id"].strip(): s for s in steps}
+    in_degree: dict[str, int] = {sid: 0 for sid in step_by_id}
+    dependents: dict[str, list[str]] = {sid: [] for sid in step_by_id}
+    for s in steps:
+        sid = s["id"].strip()
+        for dep in (s.get("depends_on") or []):
+            dep = dep.strip() if isinstance(dep, str) else ""
+            if dep and dep in step_by_id:
+                in_degree[sid] += 1
+                dependents[dep].append(sid)
+            # else: 引用不存在的 step id,容错跳过(不增 in_degree)
+    batches: list[list[dict[str, Any]]] = []
+    remaining = set(step_by_id.keys())
+    while remaining:
+        current_ids = [sid for sid in remaining if in_degree[sid] == 0]
+        if not current_ids:
+            return None  # 循环依赖
+        current_batch = [step_by_id[sid] for sid in current_ids]
+        batches.append(current_batch)
+        for sid in current_ids:
+            remaining.remove(sid)
+            for dependent in dependents[sid]:
+                if dependent in remaining:
+                    in_degree[dependent] -= 1
+    return batches
+
+
+# v0.4.0:run_step 是 agentic_web.py 不知道 Excel 等具体后端时的"step 执行器"抽象。
+# adapter.py 在 handler 路径通过 cfg.plan_step_runner 注入一个绑定 dataset_id 的
+# callable,签名:(question: str, timeout_s: int) -> Any。
+# agentic_web.py 完全 Excel-agnostic,守 AGENTS.md generic/open-source safe 边界。
+PlanStepRunner = Callable[[str, int], Any]
+
+
+def _execute_plan_streaming(
+    plan_args: dict[str, Any],
+    run_step: PlanStepRunner,
+    cfg: "AgentConfig",
+    model: str,
+    trace: "AgentTrace",
+):
+    """v0.4.0 D 重构核心:plan 执行的 generator-based 一等公民实现。
+
+    yield ("chunk", sse_dict)  ── 实时进度,直接给上层 generator forward 到 SSE client
+    yield ("result", dict)     ── 最后一次,给上层组 tool_message
+
+    设计要点(均见 design doc §4.2):
+    - 不依赖 ContextVar / 不嵌套 ThreadPoolExecutor —— 纯 generator 单向数据流
+    - plan_deadline 兜底:cfg.agent_plan_total_timeout 触发后,标剩余 step 为 error,
+      正常 emit plan_step_end + plan_complete,正常 yield result(不抛异常)
+    - 单 step 超时由 run_step 内部 deadline 保证(cfg.agent_plan_step_timeout)
+    - worker daemon thread:主 generator 退出后自然 GC,不阻塞
+    - 并发上限:cfg.agent_plan_parallelism 限制每批 inflight worker 数
+    - trace.tool_calls 必写入:替代原 _dispatch_tool_calls_parallel 的 _run_one 写入,
+      保证 Langfuse 上报完整(reviewer 反馈,见 design doc §7.5)
+    """
+    plan_t0 = time.time()
+    plan_deadline = plan_t0 + cfg.agent_plan_total_timeout
+
+    def _trace_write(ok: bool, *, error: Optional[str] = None, **extra: Any) -> None:
+        """统一 trace.tool_calls append 入口 —— 三个 return 路径都调一次。"""
+        rec: dict[str, Any] = {
+            "name": "submit_analysis_plan",
+            "ok": ok,
+            "modality": "text",
+            "elapsed_ms": int((time.time() - plan_t0) * 1000),
+            "args": {
+                "summary": (plan_args.get("summary") or "")[:200],
+            },
+        }
+        if error is not None:
+            rec["error"] = error
+        rec.update(extra)
+        trace.tool_calls.append(rec)
+
+    # ── 1. 校验 plan 结构 ───────────────────────────────────────────
+    steps_raw = plan_args.get("steps")
+    err = _validate_plan_steps(steps_raw)
+    if err:
+        yield ("chunk", _sse_progress_chunk(
+            model, "plan_validation_failed",
+            f"plan 校验失败:{err}",
+        ))
+        _trace_write(False, error=err, step_count=0)
+        yield ("result", {
+            "plan_executed": False,
+            "error": f"plan 校验失败:{err}",
+        })
+        return
+
+    steps: list[dict[str, Any]] = [
+        {**s, "id": s["id"].strip(), "question": s["question"].strip()}
+        for s in steps_raw  # type: ignore[union-attr]
+    ]
+
+    # ── 2. 拓扑排序 ─────────────────────────────────────────────────
+    batches = _topological_sort_plan_steps(steps)
+    if batches is None:
+        err_msg = "plan 含循环依赖,无法拓扑排序"
+        yield ("chunk", _sse_progress_chunk(
+            model, "plan_validation_failed", err_msg,
+            step_ids=[s["id"] for s in steps],
+        ))
+        _trace_write(False, error=err_msg, step_count=len(steps))
+        yield ("result", {
+            "plan_executed": False,
+            "error": err_msg + "。请检查 depends_on 字段。",
+            "step_ids": [s["id"] for s in steps],
+        })
+        return
+
+    # ── 3. emit plan_submitted ──────────────────────────────────────
+    yield ("chunk", _sse_progress_chunk(
+        model, "plan_submitted",
+        f"已规划 {len(steps)} 步({len(batches)} 个并行批次)",
+        step_count=len(steps),
+        batch_count=len(batches),
+        summary=plan_args.get("summary") or "",
+        steps=[
+            {
+                "id": s["id"],
+                "question": s["question"][:200],
+                "depends_on": s.get("depends_on") or [],
+                "rationale": (s.get("rationale") or "")[:200],
+            }
+            for s in steps
+        ],
+    ))
+
+    # ── 4. 分批执行 ─────────────────────────────────────────────────
+    results: dict[str, Any] = {}
+    elapsed_per_step: dict[str, int] = {}
+    aborted_by_deadline = False
+    parallelism = max(1, cfg.agent_plan_parallelism)
+    step_timeout = cfg.agent_plan_step_timeout
+
+    def _worker(step: dict[str, Any], q: "queue.Queue") -> None:
+        """worker:跑 run_step,完成或异常后 put 完整 result 到 queue。"""
+        t0 = time.time()
+        sid = step["id"]
+        question = step["question"]
+        try:
+            r = run_step(question, step_timeout)
+            ok = not (isinstance(r, dict) and r.get("error"))
+            err = (r.get("error") if isinstance(r, dict) and not ok else None)
+            q.put((sid, r, int((time.time() - t0) * 1000), ok, err))
+        except Exception as exc:  # noqa: BLE001
+            q.put((
+                sid,
+                {"error": f"{type(exc).__name__}: {exc}"},
+                int((time.time() - t0) * 1000),
+                False,
+                f"{type(exc).__name__}: {exc}",
+            ))
+
+    for batch_idx, batch in enumerate(batches):
+        if aborted_by_deadline:
+            break
+
+        # 4.1 emit plan_step_start —— 批量同时发 N 个,前端可立即展示 N 个 ⏳
+        for s in batch:
+            yield ("chunk", _sse_progress_chunk(
+                model, "plan_step_start",
+                f"执行 step {s['id']}",
+                step_id=s["id"],
+                question=s["question"][:200],
+                batch_index=batch_idx,
+            ))
+
+        # 4.2 起 worker(并发上限 = parallelism;超出的进 pending 等前完成再起)
+        completed_q: "queue.Queue" = queue.Queue()
+        in_flight = 0
+        pending = list(batch)
+        while pending and in_flight < parallelism:
+            s = pending.pop(0)
+            threading.Thread(
+                target=_worker, args=(s, completed_q), daemon=True,
+            ).start()
+            in_flight += 1
+
+        # 4.3 主 generator 边等边 yield —— plan_deadline 兜底
+        finished = 0
+        target = len(batch)
+        while finished < target:
+            remaining = plan_deadline - time.time()
+            if remaining <= 0:
+                # plan-level 总超时:标剩余 step 为 error,emit plan_step_end
+                missing_in_batch = [s for s in batch if s["id"] not in results]
+                for s in missing_in_batch:
+                    sid = s["id"]
+                    err_msg = f"plan 总超时 ({cfg.agent_plan_total_timeout}s)"
+                    results[sid] = {"error": err_msg}
+                    elapsed_per_step[sid] = int((time.time() - plan_t0) * 1000)
+                    yield ("chunk", _sse_progress_chunk(
+                        model, "plan_step_end",
+                        f"step {sid} 因 plan 总超时未执行",
+                        step_id=sid,
+                        elapsed_ms=elapsed_per_step[sid],
+                        ok=False,
+                        error="plan_total_timeout",
+                    ))
+                # 同样标 pending(后续 batch 不会跑)
+                aborted_by_deadline = True
+                break
+
+            try:
+                sid, r, elapsed_ms, ok, err_msg = completed_q.get(
+                    timeout=min(remaining, 1.0)
+                )
+            except queue.Empty:
+                continue  # 还没完成,回到 while 顶检查 deadline
+
+            results[sid] = r
+            elapsed_per_step[sid] = elapsed_ms
+            yield ("chunk", _sse_progress_chunk(
+                model, "plan_step_end",
+                f"step {sid} {'完成' if ok else '失败'} ({elapsed_ms}ms)",
+                step_id=sid,
+                elapsed_ms=elapsed_ms,
+                ok=ok,
+                error=err_msg,
+            ))
+            finished += 1
+            in_flight -= 1
+
+            # 释放并发,起下一个 pending(若有)
+            if pending and in_flight < parallelism:
+                s = pending.pop(0)
+                threading.Thread(
+                    target=_worker, args=(s, completed_q), daemon=True,
+                ).start()
+                in_flight += 1
+
+    # ── 5. plan_complete + trace 写入 + 返回 result ─────────────────
+    total_ms = int((time.time() - plan_t0) * 1000)
+    failed_step_ids = [
+        sid for sid, r in results.items()
+        if isinstance(r, dict) and r.get("error")
+    ]
+    plan_ok = (len(failed_step_ids) == 0) and (not aborted_by_deadline)
+
+    yield ("chunk", _sse_progress_chunk(
+        model, "plan_complete",
+        f"plan 完成 ({total_ms}ms,{len(steps)} 步,{len(failed_step_ids)} 失败"
+        + (",总超时中止" if aborted_by_deadline else "") + ")",
+        total_elapsed_ms=total_ms,
+        step_count=len(steps),
+        failed_count=len(failed_step_ids),
+        failed_step_ids=failed_step_ids,
+        aborted=aborted_by_deadline,
+    ))
+
+    _trace_write(
+        plan_ok,
+        step_count=len(steps),
+        batch_count=len(batches),
+        failed_step_count=len(failed_step_ids),
+        failed_step_ids=failed_step_ids,
+        aborted_by_total_timeout=aborted_by_deadline,
+    )
+
+    yield ("result", {
+        "plan_executed": not aborted_by_deadline,
+        "step_count": len(steps),
+        "batch_count": len(batches),
+        "total_elapsed_ms": total_ms,
+        "results": [
+            {
+                "step_id": s["id"],
+                "question": s["question"],
+                "rationale": s.get("rationale", ""),
+                "depends_on": s.get("depends_on") or [],
+                "elapsed_ms": elapsed_per_step.get(s["id"], 0),
+                "result": results.get(s["id"], {"error": "未执行"}),
+            }
+            for s in steps
+        ],
+        "failed_step_count": len(failed_step_ids),
+        "failed_step_ids": failed_step_ids,
+        "aborted_by_total_timeout": aborted_by_deadline,
+    })
 
 
 def _speculative_iteration(
@@ -2356,11 +2806,7 @@ def run_agent_stream(
         while progress_queue:
             yield progress_queue.pop(0)
 
-    # v0.3.0 D Phase 3:把 stream 内部的 progress_cb 透到 ContextVar,
-    # 深层 tool_impl(如 _make_submit_plan_impl)能在 ThreadPoolExecutor
-    # worker 里 ACTIVE_PROGRESS_CB.get() 拿到它,emit per-step 进度。
-    # 每个 request 入口覆盖上次值,不 reset —— request 用完 context 即弃。
-    ACTIVE_PROGRESS_CB.set(progress_cb)
+    # v0.4.0:删除 ACTIVE_PROGRESS_CB.set —— plan 执行 generator 直接 yield 传 chunk。
 
     # v0.3.3 D Phase 4:plan-and-execute 模式 per-session flag。
     # 第一次 dispatch 完 submit_analysis_plan 后置 True;之后所有 iteration
@@ -2712,8 +3158,144 @@ def run_agent_stream(
                 return
 
             else:
-                # 正常 dispatch
-                assistant_message: dict[str, Any] = {
+                # ── v0.4.0 D 重构:plan tool_call 走 _execute_plan_streaming
+                #    一等公民 generator,不再套 _dispatch_tool_calls_parallel ──
+                is_plan_call = (
+                    cfg.enable_plan_and_execute
+                    and cfg.plan_step_runner is not None
+                    and len(assembled) == 1
+                    and (assembled[0].get("function") or {}).get("name")
+                        == "submit_analysis_plan"
+                )
+                if is_plan_call:
+                    plan_tc = assembled[0]
+                    plan_tc_id = plan_tc.get("id", "") or "tc_plan"
+                    plan_fn = plan_tc.get("function") or {}
+                    plan_args_raw = plan_fn.get("arguments") or "{}"
+                    try:
+                        plan_args = (
+                            json.loads(plan_args_raw)
+                            if isinstance(plan_args_raw, str)
+                            else (plan_args_raw or {})
+                        )
+                        plan_parse_err: Optional[str] = None
+                    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                        plan_args = {}
+                        plan_parse_err = (
+                            f"plan args 非合法 JSON:{type(exc).__name__}: {exc}"
+                        )
+
+                    # ── 必做兼容事件 #1:tools_dispatch + tool_start ──
+                    # 前端"执行步骤"UI 依赖工具行视觉锚点(reviewer 反馈,设计 §7.3)
+                    plan_steps_count = (
+                        len(plan_args.get("steps") or [])
+                        if isinstance(plan_args, dict) else 0
+                    )
+                    plan_summary = (
+                        plan_args.get("summary") or ""
+                        if isinstance(plan_args, dict) else ""
+                    )
+                    args_preview = (
+                        plan_summary
+                        if plan_summary
+                        else f"已规划 {plan_steps_count} 步"
+                    )[:200]
+                    progress_cb(
+                        "tools_dispatch",
+                        f"模型请求 1 个工具调用",
+                        {
+                            "count": 1,
+                            "iteration": iteration,
+                            "tool_calls": [{
+                                "tool_call_id": plan_tc_id,
+                                "name": "submit_analysis_plan",
+                                "args_preview": args_preview,
+                            }],
+                        },
+                    )
+                    progress_cb(
+                        "tool_start",
+                        "调用 submit_analysis_plan",
+                        {
+                            "tool_call_id": plan_tc_id,
+                            "name": "submit_analysis_plan",
+                            "args": {
+                                "summary": plan_summary[:200],
+                                "step_count": plan_steps_count,
+                            },
+                        },
+                    )
+                    yield from _drain_queue()
+
+                    # ── 直接消费 generator,chunk 实时 yield 给 client ──
+                    plan_t0 = time.time()
+                    plan_result: Optional[dict[str, Any]] = None
+                    if plan_parse_err:
+                        # JSON 解析失败:不调 _execute_plan_streaming(它的校验是
+                        # 结构层,JSON 解析是更外层),直接 emit validation failed
+                        # 并组 error result
+                        progress_cb(
+                            "plan_validation_failed", plan_parse_err,
+                            {"phase": "json_parse"},
+                        )
+                        yield from _drain_queue()
+                        plan_result = {
+                            "plan_executed": False,
+                            "error": plan_parse_err,
+                        }
+                        trace.tool_calls.append({
+                            "name": "submit_analysis_plan", "ok": False,
+                            "modality": "text",
+                            "elapsed_ms": int((time.time() - plan_t0) * 1000),
+                            "error": plan_parse_err, "step_count": 0,
+                        })
+                    else:
+                        for kind, payload in _execute_plan_streaming(
+                            plan_args, cfg.plan_step_runner, cfg, model, trace,
+                        ):
+                            if kind == "chunk":
+                                yield payload  # ← 实时流给 SSE client
+                            elif kind == "result":
+                                plan_result = payload
+                        if plan_result is None:
+                            plan_result = {
+                                "plan_executed": False,
+                                "error": "_execute_plan_streaming 未 yield result",
+                            }
+
+                    # ── 必做兼容事件 #2:tool_end ─────────────────────
+                    plan_elapsed = int((time.time() - plan_t0) * 1000)
+                    plan_ok = bool(plan_result and plan_result.get("plan_executed"))
+                    progress_cb(
+                        "tool_end",
+                        f"submit_analysis_plan 完成 ({plan_elapsed}ms)",
+                        {
+                            "tool_call_id": plan_tc_id,
+                            "name": "submit_analysis_plan",
+                            "elapsed_ms": plan_elapsed,
+                            "ok": plan_ok,
+                            "modality": "text",
+                        },
+                    )
+                    yield from _drain_queue()
+
+                    # plan tool_call + tool_message 进 history,进下一轮 synthesis
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [plan_tc],
+                    }
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": plan_tc_id,
+                        "content": json.dumps(plan_result, ensure_ascii=False),
+                    }
+                    augmented = augmented + [assistant_message, tool_message]
+                    plan_dispatch_done = True
+                    continue
+
+                # ── 非 plan tool_call:走原 _dispatch_tool_calls_parallel ──
+                assistant_message = {
                     "role": "assistant",
                     "content": "",
                     "tool_calls": assembled,
@@ -2745,9 +3327,9 @@ def run_agent_stream(
                 )
                 yield from _drain_queue()
                 augmented = augmented + [assistant_message] + tool_messages
-                # v0.3.3 D Phase 4:plan 模式下,dispatch 完 submit_analysis_plan
-                # 后置 flag。下一 iteration 进入 plan synthesis 路径(tools=[]),
-                # LLM 看不到 submit_analysis_plan,架构上无法再调一次 plan。
+                # v0.3.3 → v0.4.0:plan 模式下,若 LLM 通过非 plan 路径
+                # 误调 submit_analysis_plan(理论上 register_schema_only 已防,
+                # 但兜底),仍标 plan_dispatch_done 防止 silent loop。
                 if (
                     cfg.enable_plan_and_execute
                     and any(
