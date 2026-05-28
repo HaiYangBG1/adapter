@@ -3103,6 +3103,75 @@ def run_agent_stream(
                 )
                 continue
 
+            # ── v0.4.1 修问题 3:intent-leak retry 配额用完仍 leak → 合成兜底 ─
+            # 前情:v0.2.30 intent-leak guard 续轮 1 次后,如果模型再次输出
+            # intent narrative(没真 emit tool_calls),原代码直接 fall through
+            # 到 line 3158 把"第二次 leak content"当 final answer 返回,
+            # 用户看到的就是"分隔符之后还是计划描述,没有真答案" —— 协议描述
+            # 「真答案以 content delta 接续流出」承诺不兑现。
+            #
+            # 修法:复用现有 _synthesize_answer 走合成兜底(参考 line 3146
+            # 的 force_answer_fallback 模式)。把已有工具结果交给 LLM 在
+            # tool-free 环境下硬作答,产出真正的结论 prose。
+            #
+            # 已经流出去的两次 leak content 撤不回,但在它们后面接一个分隔符
+            # 告知用户"模型仍未直接作答,已强制合成"+ synthesis 真答案。
+            # 用户看到:[leak 1] [续轮分隔符] [leak 2] [合成提示分隔符] [真答案]
+            #
+            # 协议事件用现有 `agent_force_answer_fallback`(前端已 handle),
+            # 区分用 message 文本,不引入新 stage。
+            elif (
+                looks_intent
+                and not is_last
+                and intent_leak_retries_used >= cfg.max_intent_leak_retries
+                # 跟 can_intent_retry 同样排除 plan_dispatch_done 的 false-positive:
+                # plan synthesis 路径下 LLM 输出综合作答开头会被误判为 intent,
+                # 不该走兜底(直接 return 即可,内容本身就是答案)
+                and not plan_dispatch_done
+            ):
+                progress_cb(
+                    "agent_force_answer_fallback",
+                    "intent-leak retry 配额已用完,模型仍未给出真答案,走合成兜底",
+                    {
+                        "iteration": iteration,
+                        "retries_used": intent_leak_retries_used,
+                        "content_chars": len(content_buf),
+                        "reason": "intent_leak_exhausted",  # 给 Langfuse / 前端区分
+                    },
+                )
+                yield from _drain_queue()
+                # 流一个分隔符:把"上面是 leak / 下面是合成真答案"视觉区分
+                synth_notice = (
+                    "\n\n---\n\n_（模型多轮仍未直接作答,adapter 已基于已有工具"
+                    "结果强制合成最终结论:）_\n\n"
+                )
+                yield {
+                    "id": "agent-intent-leak-synth-notice",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": synth_notice},
+                        "finish_reason": None,
+                    }],
+                }
+                # 调合成(非流式,LLM 在 tool-free 环境下基于工具结果硬作答)
+                synthesized = _synthesize_answer(cfg, augmented, extra_payload, trace)
+                if not synthesized:
+                    synthesized = (
+                        "（抱歉,模型在续轮后仍未给出有效答案,合成兜底也失败。"
+                        "请重试或换一种问法。）"
+                    )
+                    trace.stopped_reason = "answered_empty_fallback"
+                else:
+                    trace.stopped_reason = "answered_synthesized"
+                trace.final_finish_reason = "stop"
+                fake_resp = {"id": "agent-intent-leak-synth", "created": int(time.time())}
+                yield from _stream_final_answer(model, synthesized, fake_resp)
+                yield _sse_trace_chunk(model, trace)
+                return
+
             trace.final_finish_reason = finish_reason or "stop"
             trace.answer_truncated = finish_reason == "length"
             trace.stopped_reason = trace.stopped_reason or (
