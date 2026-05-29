@@ -23,6 +23,7 @@
 | 表格理解 | 保留工作表名、预览行、单元格坐标、公式、缓存值、合并单元格和表格范围 |
 | 联网增强 | `/web/v1` 可读取 URL、执行搜索、注入来源上下文，并要求模型引用来源链接 |
 | Agentic 联网 | `/v1/agent` 由模型驱动多轮工具调用循环：搜索、抓取、浏览器截图，自带预算控制和引用合规校验 |
+| Plan-and-execute | `/v1/agent` 的可选结构化模式：模型一次性提交完整计划，adapter 按依赖关系调度执行各步骤，再让模型基于结果作答 |
 | 流式响应 | 保留 SSE streaming，可在模型生成前输出简短进度信息 |
 | 安全防护 | 联网读取时阻断 localhost、私有网段、link-local、metadata endpoint 等目标 |
 | 可排障性 | 行为显式，便于对比 adapter 转发链路和上游直连链路 |
@@ -139,6 +140,28 @@ POST /v1/agent/chat/completions
 
 `web_view` 需要镜像内安装 Chromium。agentic 相关环境变量、SearXNG 部署、上线 checklist 见 `DEPLOYMENT.md`。
 
+#### Plan-and-execute 模式（可选）
+
+默认的 agentic 循环每一轮都让模型决定下一步。对**结构化的多步任务（针对单一数据工具）**，这种自由循环很脆弱：每轮成功率会累乘（如 80% × 5 轮 ≈ 33%），而且模型可能用自然语言"叙述"出一个计划却始终不真正发出 tool call。
+
+Plan-and-execute 把"每轮决策"换成 **决策一次、确定性执行、综合一次**：
+
+1. **规划** —— 首轮协议层强制模型 emit 单个 `submit_analysis_plan` 工具调用，里面是它需要的所有步骤（每步含 `id`、自然语言 `question`、可选 `depends_on`）。工具 schema 注册但由 agent 循环 inline 接管，模型无法用叙述绕过。
+2. **执行** —— adapter 校验计划、按 `depends_on` 拓扑排序、分批并发调度（通过注入的 step runner）。执行期间不调模型。
+3. **综合** —— 所有步骤结果收齐后，关闭工具，模型基于聚合结果作答。
+
+特性：
+
+- **依赖调度** —— Kahn 拓扑排序；循环依赖被拒；引用不存在的依赖被容错跳过
+- **并发执行** —— 同批步骤并发，上限 `ADAPTER_AGENT_PLAN_PARALLELISM`
+- **双层超时** —— 单步 `ADAPTER_AGENT_PLAN_STEP_TIMEOUT` + 计划级 deadline `ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT`（超时把剩余步骤标失败，而不是挂起）
+- **单步重试** —— `ADAPTER_AGENT_PLAN_STEP_MAX_RETRIES` 失败步骤放弃前自动重试
+- **实时进度事件** —— `plan_submitted` / `plan_step_start` / `plan_step_end` / `plan_step_retrying` / `plan_complete` 实时流式
+- **部分失败容错** —— 单步失败不中断整个计划，模型基于已成功的步骤综合作答
+- **通用边界** —— step runner 由宿主应用注入，agent 循环本身与具体工具/后端解耦
+
+step runner 由宿主应用提供（例如绑定到某个查询后端），保证 `agentic_web.py` 不耦合任何后端细节。模式关闭时，请求回退到标准 agentic 循环。
+
 ### 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -163,6 +186,17 @@ POST /v1/agent/chat/completions
 | `ADAPTER_WEB_AI_NEWS_SOURCE_URLS` | empty | 可选的逗号分隔精选新闻源 URL |
 | `TAVILY_API_KEY` | empty | 使用 `tavily` provider 时需要 |
 | `BING_SEARCH_API_KEY` | empty | 使用 `bing` provider 时需要 |
+
+Plan-and-execute(仅在 `/v1/agent` 且宿主开启该模式并注入 step runner 时生效):
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `ADAPTER_AGENT_PLAN_PARALLELISM` | `4` | 同一依赖批次内并发执行的步骤数上限 |
+| `ADAPTER_AGENT_PLAN_STEP_TIMEOUT` | `60` | 单步超时（秒） |
+| `ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT` | `480` | 计划级 deadline（秒）；超时把剩余步骤标失败而非挂起 |
+| `ADAPTER_AGENT_PLAN_STEP_MAX_RETRIES` | `0` | 失败步骤放弃前的重试次数 |
+
+> 表中为代码内默认值。部署可用环境变量覆盖任意项；`/health` 在 `capabilities` 下回显生效值。
 
 ### 本地运行
 
@@ -256,6 +290,7 @@ The project is deployment-neutral by default. It does not include company-specif
 | Spreadsheet understanding | Preserves sheet names, preview rows, cell coordinates, formulas, cached values, merged ranges, and table ranges |
 | Web augmentation | `/web/v1` can fetch URLs, search the web, inject source context, and ask the model to cite source URLs |
 | Agentic web | `/v1/agent` runs a model-driven tool-calling loop: search, fetch, browser screenshot — with budget control and a citation guard |
+| Plan-and-execute | Optional structured mode on `/v1/agent`: the model submits a full plan once, the adapter runs the steps with dependency-aware scheduling, then the model answers from the results |
 | Streaming | Preserves SSE streaming and can emit short progress messages before model generation |
 | Safety | Blocks localhost, private networks, link-local, metadata endpoints, and other internal targets during web fetches |
 | Debuggability | Keeps adapter behavior explicit so deployments can compare adapter-routed requests with direct upstream calls |
@@ -377,6 +412,40 @@ Features:
 `web_view` requires Chromium in the image. See `DEPLOYMENT.md` for agentic
 environment variables, SearXNG setup, and the deploy checklist.
 
+#### Plan-and-execute mode (optional)
+
+The default agentic loop lets the model decide the next step on every turn. For
+**structured, multi-step tasks against a single data tool**, that free loop is
+brittle — per-turn success compounds (e.g. 80% × 5 turns ≈ 33%), and the model
+can narrate a plan in prose without ever emitting a tool call.
+
+Plan-and-execute replaces "decide every turn" with **decide once, execute
+deterministically, synthesize once**:
+
+1. **Plan** — the first turn is protocol-locked to a single `submit_analysis_plan`
+   tool call listing every step (each with `id`, a natural-language `question`,
+   and optional `depends_on`). The schema is registered but inline-handled, so the
+   model cannot bypass it with prose.
+2. **Execute** — the adapter validates the plan, topologically sorts steps by
+   `depends_on`, and dispatches each batch concurrently through an injected step
+   runner. No model call happens during execution.
+3. **Synthesize** — once all results are collected, tools are disabled and the
+   model answers from the aggregated results.
+
+Features:
+
+- **Dependency scheduling** — Kahn topological sort; cycles rejected; unknown deps tolerated
+- **Concurrent batches** — capped by `ADAPTER_AGENT_PLAN_PARALLELISM`
+- **Two-layer timeout** — per-step `ADAPTER_AGENT_PLAN_STEP_TIMEOUT` + plan-level deadline `ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT` (remaining steps are marked failed, not hung)
+- **Per-step retry** — `ADAPTER_AGENT_PLAN_STEP_MAX_RETRIES` retries a failed step before giving up
+- **Real-time progress** — `plan_submitted` / `plan_step_start` / `plan_step_end` / `plan_step_retrying` / `plan_complete` SSE events
+- **Partial-failure tolerance** — a failed step does not abort the plan; the model synthesizes from whatever succeeded
+- **Generic boundary** — the step runner is dependency-injected; the agent loop stays tool-agnostic
+
+The step runner is supplied by the host application (e.g. bound to a query
+backend), keeping `agentic_web.py` free of backend-specific coupling. When the
+mode is disabled, requests fall back to the standard iterative loop.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -401,6 +470,17 @@ environment variables, SearXNG setup, and the deploy checklist.
 | `ADAPTER_WEB_AI_NEWS_SOURCE_URLS` | empty | Optional comma-separated curated news URLs |
 | `TAVILY_API_KEY` | empty | Tavily API key when using `tavily` provider |
 | `BING_SEARCH_API_KEY` | empty | Bing Search API key when using `bing` provider |
+
+Plan-and-execute (only effective on `/v1/agent` when the host enables the mode and injects a step runner):
+
+| Variable | Default | Description |
+|---|---:|---|
+| `ADAPTER_AGENT_PLAN_PARALLELISM` | `4` | Max steps run concurrently per dependency batch |
+| `ADAPTER_AGENT_PLAN_STEP_TIMEOUT` | `60` | Per-step timeout (seconds) |
+| `ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT` | `480` | Plan-level deadline (seconds); remaining steps are marked failed, not hung |
+| `ADAPTER_AGENT_PLAN_STEP_MAX_RETRIES` | `0` | Retries for a failed step before giving up |
+
+> Defaults shown are the in-code values. A deployment may override any of them via environment; `/health` echoes the effective values under `capabilities`.
 
 ### Local Run
 

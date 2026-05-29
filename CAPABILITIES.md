@@ -10,6 +10,7 @@ This document describes the public, deployment-neutral capabilities of `adapter`
 | File adaptation | Yes | Converts file parts into text/image parts before forwarding |
 | Web augmentation | Yes | Optional `/web/v1` path for URL fetch and search |
 | Agentic web | Yes | `/v1/agent` tool-calling loop (search / fetch / screenshot) |
+| Plan-and-execute | Yes | Optional structured mode: model submits a full plan once, the adapter runs the steps with dependency-aware scheduling, then the model answers from the results |
 | SSE streaming | Yes | Streams upstream chunks, progress chunks, and agent token deltas |
 | SSRF protection | Yes | Blocks internal/private targets and validates redirects |
 | Upstream auth | Yes | Optional bearer token through environment variable |
@@ -32,8 +33,46 @@ fetch, or screenshot, iterating until it can answer.
 | Current-date injection | Supported | Tells the model "today" so stale memory is not trusted |
 | Concurrency gate | Supported | Caps in-flight agent requests; excess returns HTTP 429 |
 | Observability | Supported | One `AGENT_METRICS` JSON log line per request |
+| Plan-and-execute mode | Optional | Structured alternative to the free iterative loop — see below |
 
 See `DEPLOYMENT.md` for configuration and the environment-variable reference.
+
+## Plan-and-Execute Mode (optional)
+
+The default agentic loop lets the model decide the next step on every turn. For
+**structured, multi-step tasks against a single data tool**, that free loop is
+brittle — per-turn success compounds (e.g. 80% × 5 turns ≈ 33%), and the model
+can narrate a plan in prose without ever emitting a tool call.
+
+Plan-and-execute mode replaces "decide every turn" with **decide once, execute
+deterministically, synthesize once**:
+
+1. **Plan** — the first turn forces the model to emit a single
+   `submit_analysis_plan` tool call containing every step it needs
+   (each step has an `id`, a natural-language `question`, and optional
+   `depends_on`). The tool schema is registered but inline-handled, so the
+   model cannot bypass it with prose.
+2. **Execute** — the adapter validates the plan, topologically sorts steps by
+   `depends_on`, and dispatches each batch concurrently through an injected
+   step runner. No model call happens during execution.
+3. **Synthesize** — once all step results are collected, the model answers from
+   the aggregated results with tools disabled.
+
+| Feature | Status | Description |
+|---|---|---|
+| Forced plan submission | Supported | First turn is protocol-locked to `submit_analysis_plan` |
+| Dependency scheduling | Supported | Kahn topological sort; cycles are rejected; unknown deps are tolerated |
+| Concurrent batch execution | Supported | Capped by `ADAPTER_AGENT_PLAN_PARALLELISM` |
+| Per-step timeout | Supported | `ADAPTER_AGENT_PLAN_STEP_TIMEOUT` |
+| Plan-level deadline | Supported | `ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT`; remaining steps are marked failed, not hung |
+| Per-step retry | Supported | `ADAPTER_AGENT_PLAN_STEP_MAX_RETRIES` retries a failed step before giving up |
+| Live progress events | Supported | `plan_submitted`, `plan_step_start`, `plan_step_end`, `plan_step_retrying`, `plan_complete` SSE events stream in real time |
+| Partial-failure tolerance | Supported | A failed step does not abort the plan; the model synthesizes from whatever succeeded |
+| Generic boundary | Supported | The step runner is dependency-injected; the agent loop itself stays tool-agnostic |
+
+The step runner is supplied by the host application (e.g. bound to a query
+backend), keeping `agentic_web.py` free of any backend-specific coupling. When
+the mode is disabled, requests fall back to the standard iterative loop.
 
 ## File Inputs
 
@@ -92,6 +131,10 @@ See `DEPLOYMENT.md` for configuration and the environment-variable reference.
 | Web context chars | `100000` | `ADAPTER_WEB_MAX_CONTEXT_CHARS` |
 | Web timeout | `10s` | `ADAPTER_WEB_TIMEOUT` |
 | Web cache TTL | `600s` | `ADAPTER_WEB_CACHE_TTL` |
+| Plan step concurrency | `4` | `ADAPTER_AGENT_PLAN_PARALLELISM` |
+| Plan per-step timeout | `60s` | `ADAPTER_AGENT_PLAN_STEP_TIMEOUT` |
+| Plan total deadline | `480s` | `ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT` |
+| Plan per-step retries | `0` | `ADAPTER_AGENT_PLAN_STEP_MAX_RETRIES` |
 
 ## Security Boundaries
 
@@ -116,3 +159,5 @@ See `DEPLOYMENT.md` for configuration and the environment-variable reference.
 | Explicit URL through `/web/v1/chat/completions` | Answer uses fetched source |
 | Private URL attempt | Fetch is rejected |
 | Streaming request | Response remains chunked |
+| Agentic loop through `/v1/agent/chat/completions` | Tool-calling loop reaches a final answer |
+| Plan-and-execute (when enabled) | `plan_submitted` → `plan_step_*` → `plan_complete` stream, then a synthesized answer |
