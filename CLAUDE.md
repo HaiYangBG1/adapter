@@ -1,8 +1,9 @@
-# CLAUDE.md — 后端域 · adapter / agentic_web
+# CLAUDE.md — 全栈域(后端侧) · adapter / agentic_web
 
+> **v3(2026-06-07):前端 + 后端已合并为「全栈」单域**(详见 `../../pm/协作总线-v3-角色扩展（设计+测试）.md`)。同一会话同持前端 `llm-playground-pro/` + 本后端域,**提交按 repo 分别 stage**。🔴 动 `../../contracts/PROTOCOL.md` 契约必派 `reviewer` subagent + 测试域黑盒 E2E 独立核两端。
 > 本仓是 chickAI 工作区的一个**独立 git 子仓**;独立仓的会话**不一定**会自动向上读到工作区根的协作规则。
 > 开工前**必读**(在上两级目录):
-> - `../../CLAUDE.md` — 工作区会话路由 + 协作总线(你属于「**后端**」域)
+> - `../../CLAUDE.md` — 工作区会话路由 + 协作总线(你属于「**全栈**」域)
 > - `../../Agent.md` — 全栈总图(架构 / 服务器矩阵 / 凭据位置 / 红线)
 > - `../../contracts/PROTOCOL.md` — 前后端唯一契约入口(改接口契约**先改这里**)
 >
