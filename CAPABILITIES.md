@@ -136,6 +136,26 @@ the mode is disabled, requests fall back to the standard iterative loop.
 | Plan total deadline | `480s` | `ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT` |
 | Plan per-step retries | `0` | `ADAPTER_AGENT_PLAN_STEP_MAX_RETRIES` |
 
+## Sampling Parameters
+
+adapter injects default repetition penalties to suppress the thinking
+self-doubt loop seen on the K2.6 / Int8 base — **but only for non-tool requests**.
+
+| Parameter | Default | Environment variable |
+|---|---:|---|
+| `frequency_penalty` | `0.3` | `ADAPTER_DEFAULT_FREQUENCY_PENALTY` |
+| `presence_penalty` | `0.2` | `ADAPTER_DEFAULT_PRESENCE_PENALTY` |
+
+**v0.4.3 — tool-call requests skip penalty injection.** Code / JSON / structured
+output legitimately repeats high-frequency tokens (newlines, indentation,
+keywords); a repetition penalty pushes their probability down and degrades long
+`tool_call` arguments into word-chain loops with unclosed JSON. A request that
+carries a non-empty `tools` array or `tool_choice != "none"` therefore receives
+**no** penalty injection — on both the `/v1` proxy path (`_transform_payload`)
+and the agent loop (`agentic_web`). An explicit client-supplied
+`frequency_penalty` / `presence_penalty` is always respected; only absent values
+are filled.
+
 ## Security Boundaries
 
 | Boundary | Behavior |
