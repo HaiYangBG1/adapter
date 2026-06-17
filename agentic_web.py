@@ -846,10 +846,15 @@ def _build_upstream_request(
     # v0.2.27 thinking 死循环防护 —— agent loop 路径同步注入 sampling penalty。
     # cfg.default_frequency_penalty / default_presence_penalty 从 adapter.py 顶层 env
     # 透传过来。client 显式覆盖时(通过 extra)按 client 走,这里只填默认。
-    if cfg.default_frequency_penalty > 0 and "frequency_penalty" not in payload:
-        payload["frequency_penalty"] = cfg.default_frequency_penalty
-    if cfg.default_presence_penalty > 0 and "presence_penalty" not in payload:
-        payload["presence_penalty"] = cfg.default_presence_penalty
+    # 🔴 v0.4.3:带 tools / tool_choice≠none 时跳过 penalty(同 adapter.py _transform_payload)
+    #    —— agent loop 本质是工具调用,长 SQL / 结构化 tool_call arguments 会被 penalty
+    #    压成词链死循环。工具轮跳过、最终总结轮(不带 tools)仍注入防死循环。
+    _is_tool_call = bool(payload.get("tools")) or (payload.get("tool_choice") not in (None, "none"))
+    if not _is_tool_call:
+        if cfg.default_frequency_penalty > 0 and "frequency_penalty" not in payload:
+            payload["frequency_penalty"] = cfg.default_frequency_penalty
+        if cfg.default_presence_penalty > 0 and "presence_penalty" not in payload:
+            payload["presence_penalty"] = cfg.default_presence_penalty
     headers = {
         "Content-Type": "application/json",
         cfg.upstream_auth_header: cfg.upstream_auth_value,

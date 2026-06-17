@@ -61,7 +61,7 @@ HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ADAPTER_PORT", "8000"))
 # 编译期注入版本(由 Dockerfile 或 build script 写),fallback 到代码内
 # 默认值。/health 暴露,排障时能立刻知道实例跑的是哪个 hotfix 级别。
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.4.2")
+ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v0.4.3")
 ADAPTER_GIT_SHA = os.environ.get("ADAPTER_GIT_SHA", "")
 UPSTREAM = os.environ.get("ADAPTER_UPSTREAM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 UPSTREAM_API_KEY = os.environ.get("ADAPTER_UPSTREAM_API_KEY", "")
@@ -2650,10 +2650,16 @@ def _transform_payload(
     # Qwen3 thinking 模式 + Int8 量化容易陷入 "Final → Wait → keep → Final"
     # 自我质疑循环。frequency_penalty=0.3 / presence_penalty=0.2 是业界常用的
     # 防 repetition 配置,对正常推理质量影响极小,但能切断死循环。
-    if ADAPTER_DEFAULT_FREQUENCY_PENALTY > 0 and "frequency_penalty" not in payload:
-        payload["frequency_penalty"] = ADAPTER_DEFAULT_FREQUENCY_PENALTY
-    if ADAPTER_DEFAULT_PRESENCE_PENALTY > 0 and "presence_penalty" not in payload:
-        payload["presence_penalty"] = ADAPTER_DEFAULT_PRESENCE_PENALTY
+    # 🔴 v0.4.3:带 tools / tool_choice≠none 时**跳过 penalty** —— 代码/JSON 等结构化
+    #    输出里换行、缩进、关键字是合法高频 token,penalty 按"已出现次数"线性压低它们 →
+    #    模型被逼吐新词、tool_call arguments 退化成词链死循环、JSON 不闭合(见
+    #    `问题报告-lxj工具调用乱码`)。普通对话不带 tools,死循环防护照旧生效。
+    _is_tool_call = bool(payload.get("tools")) or (payload.get("tool_choice") not in (None, "none"))
+    if not _is_tool_call:
+        if ADAPTER_DEFAULT_FREQUENCY_PENALTY > 0 and "frequency_penalty" not in payload:
+            payload["frequency_penalty"] = ADAPTER_DEFAULT_FREQUENCY_PENALTY
+        if ADAPTER_DEFAULT_PRESENCE_PENALTY > 0 and "presence_penalty" not in payload:
+            payload["presence_penalty"] = ADAPTER_DEFAULT_PRESENCE_PENALTY
 
     # v0.2.27 兜底:client 没设 max_tokens 时注入 16K 上限。万一 Phase 1
     # repetition penalty 失效仍死循环,最多吐 16K token 就停(EAS 上 ~ 30s)
