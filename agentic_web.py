@@ -2733,8 +2733,10 @@ def _build_no_thinking_extra(
     out = dict(extra or {})
     ct = dict(out.get("chat_template_kwargs") or {})
     ct["enable_thinking"] = False
+    ct["thinking"] = False  # 🔴 K2.6/vLLM0.18 用 thinking;enable_thinking 是 Qwen 旧名,对 K2.6 静默失效(已实测)——只塞 enable_thinking 时 adapter「关 thinking」一直没生效
     out["chat_template_kwargs"] = ct
     out["enable_thinking"] = False
+    out["thinking"] = False
     return out
 
 
@@ -2747,10 +2749,12 @@ def _client_wants_thinking(extra: Optional[dict[str, Any]]) -> bool:
     """
     if not extra:
         return False
+    # 🔴 前端 v0.9.0/0.16.x 起发的是 K2.6 字段 `thinking`(不再是 `enable_thinking`);
+    #    两个 key 都认,否则用户开了深度思考 chip 这里检测不到、被静默关掉。
     ct = extra.get("chat_template_kwargs")
-    if isinstance(ct, dict) and ct.get("enable_thinking") is True:
+    if isinstance(ct, dict) and (ct.get("enable_thinking") is True or ct.get("thinking") is True):
         return True
-    return extra.get("enable_thinking") is True
+    return extra.get("enable_thinking") is True or extra.get("thinking") is True
 
 
 def _build_iteration_extra(
@@ -2782,8 +2786,10 @@ def _build_iteration_extra(
         out = dict(base_extra or {})
         ct = dict(out.get("chat_template_kwargs") or {})
         ct["enable_thinking"] = True
+        ct["thinking"] = True  # K2.6/vLLM0.18 字段(enable_thinking 对 K2.6 失效)
         out["chat_template_kwargs"] = ct
         out["enable_thinking"] = True
+        out["thinking"] = True
         return out
     # 关 thinking:用现有的 _build_no_thinking_extra(确保双 key=False)
     return _build_no_thinking_extra(base_extra)
