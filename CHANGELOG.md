@@ -7,6 +7,15 @@
 
 ---
 
+## [v0.4.4] - 2026-06-18
+### Fixed
+- 补 K2.6 `thinking` 字段(原来只塞 Qwen 旧名 `enable_thinking`,对 K2.6/vLLM0.18
+  **静默失效**)—— adapter 的「关 thinking」(中间轮/force_answer/空响应重试,走
+  `_build_no_thinking_extra`)与「检测 client 是否要 thinking」(`_client_wants_thinking`;
+  前端 v0.9.0 起发 `thinking` 而非 `enable_thinking`)一直对 K2.6 失效。两处双写两字段修复。
+  配合 excel-poc v0.2.21(写 SQL 默认关 thinking)治大表分析超时(reviewer 抓到 P0:
+  检测字段不一致会静默忽略用户深度思考意图,已修)。详见 runbook deploy-2026-06-18-thinking-speedup。
+
 ## [v0.4.3] - 2026-06-17
 ### Fixed
 - **带 tools 的请求跳过采样 penalty 注入** —— 治 `lxj` 工具调用乱码:代码/JSON 等
