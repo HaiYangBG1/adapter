@@ -7,6 +7,19 @@
 
 ---
 
+## [v0.4.5] - 2026-06-18
+### Fixed
+- 大表分析「多表盲查」超时根治(数据集十几张利润表的 case 全超时):
+  - **plan prompt(agentic_web.py:449-463)**:原 prompt 鼓励全并行(`depends_on` 空)、连
+    「先看表结构」都说"并行不耽误时间" → 查询 step 不等结构就在十几张表里盲猜表名列名、
+    反复试错撞 240s。改成:数据集表多/结构不确定时,让查询 step `depends_on`「看表结构」step;
+    表结构清楚时仍并行。
+  - **step retry 跳过 timeout(agentic_web.py:2484)**:timeout 类失败不 retry(retry 同样
+    撞 EXCEL_QUERY_TIMEOUT,只把 240s 白翻成 480s);只对瞬时错误(HTTP 5xx)retry。
+    判据收窄为 `"timed out"`(不用宽 `"timeout"`,避免误杀 504 body,reviewer P1)。
+- 配合部署:`ADAPTER_EXCEL_QUERY_TIMEOUT` 240→360 给复杂多表查询更多时间。
+- 后续(未做):step_schema 直接读 profile json 零 LLM(需 excel-poc schema 端点)。
+
 ## [v0.4.4] - 2026-06-18
 ### Fixed
 - 补 K2.6 `thinking` 字段(原来只塞 Qwen 旧名 `enable_thinking`,对 K2.6/vLLM0.18

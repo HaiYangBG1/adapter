@@ -447,9 +447,9 @@ EXCEL_AGENT_PLAN_PROMPT = """你是一个数据分析助手。本次对话用户
 - **不同维度 / 不同实体粒度 / 不同数据子集** 才需要拆成不同 step。例:「按区域分组」和「按教练分组」是两个独立 step;「全年合计」和「分月合计」也是两个 step。
 
 【关于 depends_on】
-- **绝大多数 step 的 `depends_on` 应该是空数组 `[]`**(并行执行最快)。
-- 只有当"B 的 question 需要 A 的结果才能写出来"时才填 —— 这种情况罕见。**绝大多数业务查询互相独立**,不需要互相等。
-- 错误示例:「① 算全国总营业额,② 算各区域占比」—— 这两个其实可以并行,② 不需要等 ①,因为 ② 本身就能算"区域营业额 / SUM(全国)"。
+- **绝大多数业务查询互相独立**,`depends_on` 填空数组 `[]` 并行最快。
+- 错误示例:「① 算全国总营业额,② 算各区域占比」—— 可并行,② 不需要等 ①(② 本身就能算"区域营业额 / SUM(全国)")。
+- 🔴 **唯一必须用 depends_on 的情况:数据集表很多 / 结构不确定,你不知道指标在哪张表、列名叫什么时**。这时**先列一个「查看表结构」step 放在 plan 第一个,再给所有"需要这些表名/列名才能写出来"的查询 step 填上 `depends_on: ["该结构 step 的 id"]`**——否则查询 step 在不知道结构时盲猜表名列名,在多表数据集里会反复试错、撞超时失败(实测教训:十几张利润表的数据集,查询 step 不依赖结构 step → 全部超时)。表结构清楚时(单表 / 列名明确)则不必,直接并行。
 
 【关于 step 数量】
 - 简单问题:1 步(如"全年总营业额是多少")
@@ -460,7 +460,7 @@ EXCEL_AGENT_PLAN_PROMPT = """你是一个数据分析助手。本次对话用户
 【关于 plan 完整性】
 - plan 提交后,你**没有机会再追加 step**(本轮预算用完了)。**一次性把要查的都列出**。
 - 拿不准的边缘指标也可以列上,系统按 plan 跑完后,你看实际结果再决定哪些进答案。
-- 用户问题没明说但你判断需要的"上下文性 step"(如先看表结构、口径定义),也直接列进去 —— 反正并行执行不耽误时间。
+- 用户问题没明说但你判断需要的"上下文性 step"(如先看表结构、口径定义),也直接列进去;**若后续查询 step 要用到它的结果(表名/列名/口径),务必给那些 step 填 `depends_on`**,别让它们在不知道结构时盲查。
 
 【严格禁止】
 - 禁止在 content 里写"我将调用 excel_query 查询..." 这类计划叙述 —— 你的 plan **必须**通过 `submit_analysis_plan` tool 提交,不是写在 content 里。
@@ -2481,7 +2481,14 @@ def _execute_plan_streaming(
 
             # ── v0.4.2 step retry:失败且还有配额 → resubmit 同 step ──
             # 不触发:ok=True 或 retry 配额用完(走到下方正常完成路径)
-            if not ok and step_attempts[sid] < max_step_retries:
+            # v0.4.5:timeout 类失败**不 retry** —— retry 同样会撞 EXCEL_QUERY_TIMEOUT,
+            # 只把 240s 白翻成 480s(截图实测:利润查询 step 超时后 retry 又超时)。
+            # 只对 excel-poc 瞬时错误(HTTP 5xx 等非 timeout)retry。
+            # 只认 Python socket 超时的固定串 "timed out"(TimeoutError/socket.timeout);
+            # 不用宽泛 "timeout" 子串——否则 excel-poc 返回的 504 body(如 "Gateway Timeout")
+            # 会被误判为超时跳过 retry,而那本是该 retry 的瞬时错误(reviewer P1)。
+            _is_timeout = bool(err_msg) and "timed out" in str(err_msg).lower()
+            if not ok and not _is_timeout and step_attempts[sid] < max_step_retries:
                 step_attempts[sid] += 1
                 yield ("chunk", _sse_progress_chunk(
                     model, "plan_step_retrying",

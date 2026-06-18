@@ -65,7 +65,7 @@ deterministically, synthesize once**:
 | Concurrent batch execution | Supported | Capped by `ADAPTER_AGENT_PLAN_PARALLELISM` |
 | Per-step timeout | Supported | `ADAPTER_AGENT_PLAN_STEP_TIMEOUT` |
 | Plan-level deadline | Supported | `ADAPTER_AGENT_PLAN_TOTAL_TIMEOUT`; remaining steps are marked failed, not hung |
-| Per-step retry | Supported | `ADAPTER_AGENT_PLAN_STEP_MAX_RETRIES` retries a failed step before giving up |
+| Per-step retry | Supported | `ADAPTER_AGENT_PLAN_STEP_MAX_RETRIES` retries a failed step before giving up (v0.4.5: timeout failures are **not** retried — a retry would just time out again) |
 | Live progress events | Supported | `plan_submitted`, `plan_step_start`, `plan_step_end`, `plan_step_retrying`, `plan_complete` SSE events stream in real time |
 | Partial-failure tolerance | Supported | A failed step does not abort the plan; the model synthesizes from whatever succeeded |
 | Generic boundary | Supported | The step runner is dependency-injected; the agent loop itself stays tool-agnostic |
