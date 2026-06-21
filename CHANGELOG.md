@@ -7,11 +7,20 @@
 
 ---
 
-## [Unreleased] — v0.5.0 文件生成 MVP(PPTX)· 代码就绪,待 OSS 配置 + 部署
-> 五期 B(文件生成 MVP)。⚠️ **尚未部署**:依赖运维注入 OSS 凭据/桶配置(见
-> `DEPLOYMENT.md` 新增 env 段 + `../../pm/status/运维.md` provisioning ask)。本地
-> py_compile + 渲染/重签逻辑自测过;线上闭环(生成→下载)gated on OSS 就绪。
-### Added
+## [v0.5.1] - 2026-06-21 — 文件生成 MVP(PPTX)· ✅ 已暗部署 + 线上闭环 PASS
+> 五期 B(文件生成 MVP)。**暗部署**:整条通路被 per-request `gen_pptx` 标志门控,
+> 前端无入口发该标志 → 真实用户够不着,部署对现有 chat/excel/web **零影响**(已实测回归)。
+> **部署证据**:镜像 `v0.5.1-20260621`(digest `sha256:3a71d09…`,git `76578de`);
+> 智能增量构建(FROM v0.4.5 + pip install python-pptx/oss2〈aliyun mirror〉+ COPY 4 模块);
+> SAE 滚动 Batch=1(2 副本始终 ≥1 服务,PreStop 保留)。OSS = 桶 `lxj-ai-center` 前缀
+> `ai-center/artifacts/`(lifecycle TTL 14d)+ RAM 子账号最小权限(仅该前缀 Put/Get)。
+> **线上烟测全 PASS**:K2.6→大纲→python-pptx 渲染→OSS→presigned 下载真 9 页 pptx;
+> 普通 agent 回归正常无误触发。详见 `../lxj-adapter-deploy/runbooks/deploy-2026-06-21-pptx-filegen-darklaunch.md`。
+### Fixed (v0.5.1)
+- **presign 去 `response-content-type` 覆盖**(线上实测 OSS 400 `InvalidRequest: Can not
+  override response header on content-type`)。该覆盖冗余 —— 对象上传时已带正确 Content-Type;
+  保留 `response-content-disposition`(下载文件名)。实测 disposition-only → 200 真 pptx。
+### Added (v0.5.0 → 并入 v0.5.1)
 - **PPTX 确定性生成**(A 铁律:模型只出大纲数据,渲染是写死代码):
   - `pptx_generator.py`(新):outline JSON → python-pptx 套模板渲染 → `.pptx` bytes。
     防御式 normalize(容忍模型松散输出),16:9 模板,封面 + 正文页(标题/要点/备注),
@@ -33,11 +42,11 @@
   - `requirements.txt`:`python-pptx>=1.0.0` + `oss2>=2.18.0`(缺失时该能力降级,adapter 仍启动)。
   - `Dockerfile`:COPY `pptx_generator.py` / `oss_store.py`。
 ### Notes
-- 新增 env(运维注入,见 DEPLOYMENT.md):`OSS_ENDPOINT` / `OSS_INTERNAL_ENDPOINT` /
+- 生产已注入 env(SAE,🔴 OSS AK/SK 只在运行时 env):`OSS_INTERNAL_ENDPOINT` /
   `OSS_PUBLIC_ENDPOINT` / `OSS_BUCKET` / `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` /
-  `OSS_ARTIFACT_PREFIX` / `OSS_PRESIGN_EXPIRE_SECONDS` / `ADAPTER_ENABLE_PPTX_GEN`。
-- 前端触发(`gen_pptx:true` 路由到 `/api/agent`)= 待定 thin slice(产品 UX 待 PM 拍)。
-- 契约:`../../contracts/PROTOCOL.md` §SSE + `../../llm-playground-pro/docs/BACKEND_REQUESTS_artifact_5期.md`。reviewer 核查门过(P0 复核非阻塞 + P1 已修)。
+  `OSS_ARTIFACT_PREFIX` / `OSS_PRESIGN_EXPIRE_SECONDS` / `ADAPTER_ENABLE_PPTX_GEN`(全表见 DEPLOYMENT.md)。
+- **剩余(非本次)= 前端 `gen_pptx` 触发入口**(产品 UX 待 PM 拍;后端契约已就绪,带 `gen_pptx:true` 走 `/api/agent` 即触发)。在它 ship 之前,功能对用户不可见(暗部署)。
+- 契约:`../../contracts/PROTOCOL.md` §SSE + `../../llm-playground-pro/docs/BACKEND_REQUESTS_artifact_5期.md`。reviewer 核查门过(P1 已修)。
 
 ## [v0.4.5] - 2026-06-18
 ### Fixed
