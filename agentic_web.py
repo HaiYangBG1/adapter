@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid  # v0.5.0 B:artifact id 生成(generating→ready 同 id 三态)
 import queue  # v0.4.0 D 重构:plan 执行 generator 用 Queue 收集 worker 完成事件
 import threading  # v0.4.0 D 重构:plan 执行 worker 用 daemon thread,主 generator 退出后自然 GC
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -341,6 +342,70 @@ SUBMIT_ANALYSIS_PLAN_TOOL: dict[str, Any] = {
     },
 }
 
+# v0.5.0 B(文件生成 MVP):PPTX 确定性生成工具。enable_pptx_gen=True 时由
+# _build_agent_registry 用 register_schema_only 挂上(inline 拦截,不走 dispatch),
+# 第一轮 force_first_tool_name 强制模型 emit 完整大纲。模型**只产出结构化大纲数据**
+# (A 铁律:不写渲染代码),adapter 注入的 pptx_renderer 用写死的 python-pptx 模板
+# 把大纲 → 真 .pptx → 落对象存储 → emit x_adapter_artifact。
+GENERATE_PPTX_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "generate_pptx",
+        "description": (
+            "把一份**完整的演示文稿大纲**提交给确定性渲染器,生成可下载的 .pptx 文件。\n"
+            "\n"
+            "**关键约束**:\n"
+            "- 本轮**只有这一个工具可用**,你必须 emit 这个 tool_call,不能用自然语言描述大纲。\n"
+            "- 一次性把**所有**幻灯片列全(标题页之后的每一页);提交后没有追加机会。\n"
+            "- 每页 `bullets` 写**要点短句**(不是整段文字),3-6 条为宜;一页一个主题。\n"
+            "- 你只负责**内容大纲**;版式 / 配色 / 字体由渲染器统一控制,不要在文本里写样式。\n"
+            "- 建议 6-15 页(含封面);超过 30 页会被截断。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "演示文稿主标题(出现在封面页),如「2024 Q4 营收分析」。",
+                },
+                "subtitle": {
+                    "type": "string",
+                    "description": "(可选)副标题 / 作者 / 日期,出现在封面标题下方。",
+                },
+                "slides": {
+                    "type": "array",
+                    "description": "正文幻灯片列表(封面之后;建议 5-14 页)。",
+                    "minItems": 1,
+                    "maxItems": 30,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "description": "本页标题(一行短语)。",
+                            },
+                            "bullets": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "本页要点列表(3-6 条短句)。每条是一个独立要点,"
+                                    "不要写成整段;不含编号 / 项目符号(渲染器自动加)。"
+                                ),
+                            },
+                            "notes": {
+                                "type": "string",
+                                "description": "(可选)演讲者备注,放进 pptx 备注栏,不显示在幻灯片上。",
+                            },
+                        },
+                        "required": ["title"],
+                    },
+                },
+            },
+            "required": ["title", "slides"],
+        },
+    },
+}
+
 
 EXCEL_QUERY_TOOL: dict[str, Any] = {
     "type": "function",
@@ -470,6 +535,35 @@ EXCEL_AGENT_PLAN_PROMPT = """你是一个数据分析助手。本次对话用户
 
 【数据集结构】
 {schema}
+"""
+
+
+# v0.5.0 B(文件生成 MVP):PPTX 生成模式系统提示词。enable_pptx_gen=True 时整体
+# 替换 cfg.system_prompt;第一轮 force_first_tool_name 强制模型 emit generate_pptx。
+# 模型只产出**结构化大纲**(A 铁律),渲染由 adapter 写死的 python-pptx 模板完成。
+PPTX_GEN_PROMPT = """你是一个演示文稿(PPT)内容策划助手。用户希望你把某个主题整理成一份结构清晰的演示文稿。
+
+你**必须**做一件事:把演示文稿的**完整大纲**一次性提交到 `generate_pptx` 工具。系统会用统一模板把它渲染成真正的 .pptx 文件,供用户下载。
+
+【工作模式】
+1. 读懂用户想要的主题、受众、篇幅;在 reasoning 里规划好幻灯片结构(封面 → 若干正文页 → 收尾)。
+2. 把规划好的内容填进 `generate_pptx`:`title`(主标题)、可选 `subtitle`、`slides`(正文每页一个对象,含 `title` 和 `bullets`)。
+3. emit 这**一个** tool_call。系统渲染完成后会给你回执,你再用一两句话告知用户文件已生成。
+
+【内容质量要求】
+- **一页一个主题**:每页 `title` 是该页的核心论点,`bullets` 是支撑它的 3-6 条要点短句。
+- **要点写短句不写长段**:每条 bullet 一行能说完;要展开的细节放进该页 `notes`(演讲者备注)。
+- **有逻辑流**:正文页之间有递进/并列关系(如 现状 → 问题 → 方案 → 计划),不要堆砌零散事实。
+- **篇幅**:除非用户指定,正文 5-12 页比较合适(加封面);宁可精炼,不要注水。
+- 若用户给了具体素材/数据,**忠实使用**,不要编造数字;信息不足时给出合理的框架性大纲并在收尾页注明"待补充数据"。
+
+【关于样式】
+- 你**只负责文字内容**。版式、配色、字体、项目符号、页码全部由渲染器统一控制 —— **不要**在文本里写 markdown 符号、"•"、"第 X 页"、颜色或排版指令。
+
+【严格禁止】
+- 禁止用自然语言把大纲写在 content 里 —— 大纲**必须**通过 `generate_pptx` 工具提交。
+- 禁止本轮直接给最终答复(本轮只有 `generate_pptx` 一个工具,且被强制调用);渲染完成后下一轮再收尾。
+- 禁止输出 <tool_call>、{"name":...} 这类原始工具调用语法 —— 直接 emit 标准 tool_calls 结构。
 """
 
 
@@ -767,6 +861,24 @@ class AgentConfig:
     # None 表示关闭(默认,web 模式)。adapter.py 在 excel_dataset_id 不空时
     # 设为 "excel_query"。
     force_first_tool_name: Optional[str] = None
+
+    # v0.5.0 B(文件生成 MVP):PPTX 确定性生成模式。True 时:
+    #   - _build_agent_registry 只挂 GENERATE_PPTX_TOOL(register_schema_only,
+    #     inline 拦截,不走 dispatch —— 同 submit_analysis_plan 架构)
+    #   - cfg.system_prompt = PPTX_GEN_PROMPT
+    #   - cfg.force_first_tool_name = "generate_pptx"(协议层强制首轮 emit 大纲)
+    #   - run_agent_stream 走 generate_pptx 拦截分支:渲染→上传→emit x_adapter_artifact
+    # 模型只产出**结构化大纲数据**(A 铁律),渲染是 adapter 注入的写死代码。
+    enable_pptx_gen: bool = False
+
+    # v0.5.0 B:注入的 PPTX 渲染器,签名 (outline_args: dict, artifact_id: str) -> dict。
+    #   成功:{"ok": True, "name": str, "mime": str, "size": int,
+    #          "download_url": str, "object_key": str}
+    #   失败:{"ok": False, "error": str, "name": str}
+    # adapter.py 在 handler 路径通过 _make_pptx_renderer() 注入;agentic_web.py 不
+    # 知道 python-pptx / OSS 细节(同 plan_step_runner 依赖反转,守 AGENTS.md
+    # generic / open-source safe 边界)。仅 enable_pptx_gen=True 且非 None 时触发。
+    pptx_renderer: Optional[Callable[[dict, str], dict]] = None
 
 
 @dataclass
@@ -1582,6 +1694,23 @@ PLAN_SYNTHESIS_HINT = (
     "**基于剩余成功 step 综合作答**,不要因为部分失败而拒答。"
 )
 
+# v0.5.0 B:PPTX 生成完毕后强制收尾的 system hint(配合 stream_agent 在
+# pptx_dispatch_done 后置 tools=[])。文件已 emit 给前端(下方文件卡),本轮只需
+# 一句话告知用户,不要重复大纲全文。
+PPTX_SYNTHESIS_HINT = (
+    "【PPT 已生成完毕】你提交的 generate_pptx 大纲已被渲染成 .pptx 文件,"
+    "文件卡已显示在对话下方(用户可直接下载)。\n"
+    "\n"
+    "本轮你必须**用一两句自然语言**收尾即可,例如:已为你生成《<标题>》演示文稿,"
+    "共 N 页,可点击下方卡片下载;如需调整可告诉我。\n"
+    "\n"
+    "严格禁止:\n"
+    "- 禁止再 emit 任何 tool_calls —— 本轮已禁用工具\n"
+    "- 禁止把大纲全文 / 每页要点重新抄一遍(文件里已有,啰嗦)\n"
+    "- 禁止输出 <tool_call>、{\"name\":...} 这类工具调用语法\n"
+    "若上一条 tool 消息显示生成失败(ok=false),如实把失败原因告诉用户,并建议重试或换个表述。"
+)
+
 
 # Loop-level "dig deeper" pushback (v0.2.2). When the model finishes with an
 # answer that hedges on stale/incomplete data instead of digging, the loop
@@ -2183,6 +2312,25 @@ def _sse_trace_chunk(model: str, trace: AgentTrace) -> dict[str, Any]:
             "answer_truncated": trace.answer_truncated,
             "elapsed_total_ms": int((time.time() - trace.started_at) * 1000),
         },
+    }
+
+
+def _sse_artifact_chunk(model: str, artifact: dict[str, Any]) -> dict[str, Any]:
+    """OpenAI-shaped event carrying our ``x_adapter_artifact`` extension (五期 B).
+
+    ``artifact`` 是单个文件产物信封(契约见 docs/BACKEND_REQUESTS_artifact_5期.md):
+    ``{id, type:"file", kind, name, mime, size?, status, downloadUrl?, previewKind, error?}``。
+    前端 chat-client 按顶层键 ``x_adapter_artifact`` 解析,按 ``id`` 累积到
+    ``message.artifacts[]``(同 id 三态覆盖:generating → ready → error)。
+    """
+    _aid = str(artifact.get("id") or "")
+    return {
+        "id": f"agent-artifact-{_aid}" if _aid else "agent-artifact",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model or "adapter",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+        "x_adapter_artifact": artifact,
     }
 
 
@@ -2884,6 +3032,10 @@ def run_agent_stream(
     # 这个 tool,架构上不可能再调一次 plan(修 v0.3.2 实测复现的 "iteration 2
     # LLM 又 emit plan" silent loop)。
     plan_dispatch_done = False
+    # v0.5.0 B:PPTX 生成同款 per-session flag。第一次拦截执行完 generate_pptx 后
+    # 置 True;之后所有 iteration 强制 tools=[] + PPTX_SYNTHESIS_HINT,模型看不到
+    # generate_pptx,架构上不可能再生成一次,只能用一句话收尾。
+    pptx_dispatch_done = False
 
     def _run_attempt(msgs, current_tools, extra, tool_choice=None):
         """Forward chunks from one _speculative_iteration to client; capture state.
@@ -2910,22 +3062,40 @@ def run_agent_stream(
         # 的 silent loop。检测条件:enable_plan_and_execute + plan_dispatch_done
         # + 不是 force_answer 轮(后者本来就 tools=[],PLAN hint 也适用)。
         plan_synthesis_now = cfg.enable_plan_and_execute and plan_dispatch_done
-        if is_last or plan_synthesis_now:
+        # v0.5.0 B:PPTX 生成完成后同样强制收尾(tools=[] + PPTX hint)。
+        pptx_synthesis_now = cfg.enable_pptx_gen and pptx_dispatch_done
+        if is_last or plan_synthesis_now or pptx_synthesis_now:
             current_tools: list[dict[str, Any]] = []
             # v0.2.19: 合并 hint 进头部 system,不在末尾另开一条 ——
             # EAS upstream 严校验「System message must be at the beginning」。
-            hint_text = PLAN_SYNTHESIS_HINT if plan_synthesis_now else FORCE_ANSWER_SYSTEM_HINT
+            if pptx_synthesis_now:
+                hint_text = PPTX_SYNTHESIS_HINT
+            elif plan_synthesis_now:
+                hint_text = PLAN_SYNTHESIS_HINT
+            else:
+                hint_text = FORCE_ANSWER_SYSTEM_HINT
             current_messages = _inject_force_answer_hint(augmented, hint_text)
             # v0.2.24 plan B(Anthropic 模式):rewrite history 消除 tool_call JSON 痕迹,
             # 让 Qwen3.5 在 force_answer 时更可能激活 thinking(尤其 chip ON 场景)。
-            # plan synthesis 路径不走 rewrite —— plan 结果已经在 tool message 里
+            # plan / pptx synthesis 路径不走 rewrite —— 结果已经在 tool message 里
             # 结构化清晰,改写反而丢信息。
             rewrote_history = False
-            if is_last and cfg.force_answer_rewrite_history and not plan_synthesis_now:
+            if (
+                is_last
+                and cfg.force_answer_rewrite_history
+                and not plan_synthesis_now
+                and not pptx_synthesis_now
+            ):
                 before_count = len(current_messages)
                 current_messages = _rewrite_history_for_force_answer(current_messages)
                 rewrote_history = len(current_messages) != before_count
-            if plan_synthesis_now:
+            if pptx_synthesis_now:
+                progress_cb(
+                    "agent_pptx_synthesis",
+                    f"PPT 已生成,本轮强制一句话收尾(iter {iteration})",
+                    {"iteration": iteration},
+                )
+            elif plan_synthesis_now:
                 progress_cb(
                     "agent_plan_synthesis",
                     f"plan 已 dispatch,本轮强制基于 plan results 综合作答(iter {iteration})",
@@ -3431,6 +3601,180 @@ def run_agent_stream(
                     }
                     augmented = augmented + [assistant_message, tool_message]
                     plan_dispatch_done = True
+                    continue
+
+                # ── v0.5.0 B:generate_pptx 拦截 → 渲染→上传→emit x_adapter_artifact ──
+                # 同 plan 架构:inline 拦截(register_schema_only,不走 dispatch)。
+                # 模型只产出大纲(A 铁律),cfg.pptx_renderer 注入写死的渲染/存储。
+                # 取 assembled 里**第一个** generate_pptx(模型偶发并发 emit 多个时,
+                # 不退化成 dispatch 的 "unknown tool",而是渲染第一个、忽略其余 —— 一次
+                # 请求出一份 PPT 足够;register_schema_only 下其余也无 impl 可跑)。
+                _pptx_tc_found = (
+                    next(
+                        (tc for tc in assembled
+                         if (tc.get("function") or {}).get("name") == "generate_pptx"),
+                        None,
+                    )
+                    if (cfg.enable_pptx_gen and cfg.pptx_renderer is not None)
+                    else None
+                )
+                is_pptx_call = _pptx_tc_found is not None
+                if is_pptx_call:
+                    pptx_tc = _pptx_tc_found
+                    pptx_tc_id = pptx_tc.get("id", "") or "tc_pptx"
+                    pptx_fn = pptx_tc.get("function") or {}
+                    pptx_args_raw = pptx_fn.get("arguments") or "{}"
+                    try:
+                        outline_args = (
+                            json.loads(pptx_args_raw)
+                            if isinstance(pptx_args_raw, str)
+                            else (pptx_args_raw or {})
+                        )
+                        if not isinstance(outline_args, dict):
+                            outline_args = {}
+                        pptx_parse_err: Optional[str] = None
+                    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                        outline_args = {}
+                        pptx_parse_err = f"大纲 args 非合法 JSON:{type(exc).__name__}: {exc}"
+
+                    artifact_id = uuid.uuid4().hex
+                    prov_title = (
+                        outline_args["title"].strip()
+                        if isinstance(outline_args.get("title"), str) else ""
+                    )
+                    prov_name = ((prov_title or "演示文稿")[:60]) + ".pptx"
+                    pptx_mime = (
+                        "application/vnd.openxmlformats-officedocument"
+                        ".presentationml.presentation"
+                    )
+                    slide_count_hint = (
+                        len(outline_args.get("slides") or [])
+                        if isinstance(outline_args.get("slides"), list) else 0
+                    )
+
+                    # 兼容事件:tools_dispatch + tool_start(前端"执行步骤"UI 锚点)
+                    progress_cb(
+                        "tools_dispatch",
+                        "模型请求 1 个工具调用",
+                        {
+                            "count": 1,
+                            "iteration": iteration,
+                            "tool_calls": [{
+                                "tool_call_id": pptx_tc_id,
+                                "name": "generate_pptx",
+                                "args_preview": (prov_title or "PPT")[:200],
+                            }],
+                        },
+                    )
+                    progress_cb(
+                        "tool_start",
+                        "调用 generate_pptx",
+                        {
+                            "tool_call_id": pptx_tc_id,
+                            "name": "generate_pptx",
+                            "args": {"title": prov_title[:120], "slides": slide_count_hint},
+                        },
+                    )
+                    yield from _drain_queue()
+
+                    # 1) 先 emit generating 占位卡(渲染/上传可能耗时数秒)
+                    yield _sse_artifact_chunk(model, {
+                        "id": artifact_id,
+                        "type": "file",
+                        "kind": "pptx",
+                        "name": prov_name,
+                        "mime": pptx_mime,
+                        "status": "generating",
+                        "previewKind": "office",
+                    })
+
+                    # 2) 渲染 + 上传(注入的 pptx_renderer;agentic_web 不知 pptx/OSS 细节)
+                    pptx_t0 = time.time()
+                    if pptx_parse_err:
+                        render_result = {"ok": False, "error": pptx_parse_err, "name": prov_name}
+                    else:
+                        try:
+                            render_result = cfg.pptx_renderer(outline_args, artifact_id)
+                            if not isinstance(render_result, dict):
+                                render_result = {"ok": False, "error": "renderer 返回非 dict", "name": prov_name}
+                        except Exception as exc:  # noqa: BLE001 — 渲染失败不能崩 loop
+                            render_result = {
+                                "ok": False,
+                                "error": f"{type(exc).__name__}: {exc}",
+                                "name": prov_name,
+                            }
+                    pptx_elapsed = int((time.time() - pptx_t0) * 1000)
+                    ok = bool(render_result.get("ok"))
+
+                    # 3) emit ready / error(同 id 覆盖)
+                    if ok:
+                        final_name = render_result.get("name") or prov_name
+                        artifact_ready: dict[str, Any] = {
+                            "id": artifact_id,
+                            "type": "file",
+                            "kind": "pptx",
+                            "name": final_name,
+                            "mime": render_result.get("mime") or pptx_mime,
+                            "status": "ready",
+                            "downloadUrl": render_result.get("download_url"),
+                            "previewKind": "office",
+                        }
+                        if render_result.get("size") is not None:
+                            artifact_ready["size"] = render_result["size"]
+                        yield _sse_artifact_chunk(model, artifact_ready)
+                        tool_result: dict[str, Any] = {
+                            "ok": True,
+                            "name": final_name,
+                            "slides": slide_count_hint,
+                            "note": "PPT 已生成并展示在对话下方文件卡,用户可直接下载。",
+                        }
+                    else:
+                        err_msg = str(render_result.get("error") or "生成失败")
+                        yield _sse_artifact_chunk(model, {
+                            "id": artifact_id,
+                            "type": "file",
+                            "kind": "pptx",
+                            "name": render_result.get("name") or prov_name,
+                            "mime": pptx_mime,
+                            "status": "error",
+                            "previewKind": "office",
+                            "error": err_msg,
+                        })
+                        tool_result = {"ok": False, "error": err_msg}
+
+                    trace.tool_calls.append({
+                        "name": "generate_pptx",
+                        "ok": ok,
+                        "modality": "file",
+                        "elapsed_ms": pptx_elapsed,
+                    })
+                    progress_cb(
+                        "tool_end",
+                        f"generate_pptx 完成 ({pptx_elapsed}ms)",
+                        {
+                            "tool_call_id": pptx_tc_id,
+                            "name": "generate_pptx",
+                            "elapsed_ms": pptx_elapsed,
+                            "ok": ok,
+                            "modality": "file",
+                        },
+                    )
+                    yield from _drain_queue()
+
+                    # tool_call + tool_message 进 history;下一轮 pptx_synthesis_now
+                    # 强制 tools=[] + PPTX_SYNTHESIS_HINT,模型一句话收尾。
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [pptx_tc],
+                    }
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": pptx_tc_id,
+                        "content": json.dumps(tool_result, ensure_ascii=False),
+                    }
+                    augmented = augmented + [assistant_message, tool_message]
+                    pptx_dispatch_done = True
                     continue
 
                 # ── 非 plan tool_call:走原 _dispatch_tool_calls_parallel ──

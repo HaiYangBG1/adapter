@@ -78,6 +78,43 @@ dispatches tools, and loops until the model produces a final answer.
 `MAX_CONCURRENT × 300 MB` is the screenshot memory ceiling — size it to the
 host (e.g. 3 on a 2 GB box, 10+ on an 8 GB box).
 
+### File artifact generation (PPTX) + object storage
+
+Deterministic `.pptx` generation. The model emits a structured outline via the
+`generate_pptx` tool; the adapter renders it with a fixed template (`python-pptx`)
+and uploads the file to S3/OSS-compatible object storage, then streams a
+short-lived presigned download URL to the client (`x_adapter_artifact` SSE block).
+Per-request opt-in: the caller sends `gen_pptx: true` (top-level or in `extra_body`)
+on `/v1/agent/.../chat/completions`.
+
+If `python-pptx` / `oss2` are missing, or the object-storage env below is
+incomplete, the feature degrades off and the rest of the adapter still runs.
+🔴 The two credentials are read **only** from the runtime environment — never
+commit them or write them to any file/log/response.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ADAPTER_ENABLE_PPTX_GEN` | `1` | Master kill-switch for the whole PPTX path |
+| `OSS_ENDPOINT` | _(empty)_ | Generic endpoint fallback, e.g. `https://oss-<region>.example.com` |
+| `OSS_INTERNAL_ENDPOINT` | _(= OSS_ENDPOINT)_ | **Upload** endpoint (use the in-network/internal one when the service runs inside the provider's network — faster, no egress cost) |
+| `OSS_PUBLIC_ENDPOINT` | _(= OSS_ENDPOINT)_ | **Presign** endpoint — must be **browser-reachable** (public), or the presigned URL won't resolve for end users |
+| `OSS_BUCKET` | _(empty)_ | Bucket name |
+| `OSS_ACCESS_KEY_ID` | _(empty)_ | 🔴 credential — env only |
+| `OSS_ACCESS_KEY_SECRET` | _(empty)_ | 🔴 credential — env only |
+| `OSS_ARTIFACT_PREFIX` | `ai-center/artifacts/` | Object key prefix; set a bucket lifecycle TTL on this prefix |
+| `OSS_PRESIGN_EXPIRE_SECONDS` | `900` | Presigned URL TTL (clamped 60–3600) |
+| `PPTX_ACCENT_COLOR` | `008042` | Hex accent color for the slide template (no `#`) |
+| `PPTX_FOOTER_TEXT` | _(empty)_ | Optional footer label rendered on each slide |
+
+> **Two-endpoint rule:** uploads use the internal endpoint, presigns use the
+> public one — same bucket, two URLs. Signing a presigned URL against an
+> internal-only endpoint produces links that fail outside the network.
+
+> **Re-sign endpoint:** `GET /v1/artifact/{id}/url?ext=pptx&name=<filename>` →
+> `{ "downloadUrl": ... }`. Rebuilds the deterministic object key from id+ext and
+> re-mints a presigned URL (for when the original expires). The frontend BFF
+> proxies to it so OSS credentials stay in the adapter only.
+
 ## SearXNG Setup (recommended search provider)
 
 SearXNG is a free, self-hosted metasearch engine — no API key, queries stay

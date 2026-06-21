@@ -5,3 +5,8 @@ openpyxl>=3.1.0
 # Agentic web — web_view screenshot tool (optional; web_view is skipped if absent)
 playwright>=1.40.0
 Pillow>=10.0.0
+# File-artifact generation (PPTX) + object storage upload/presign. If a dep is
+# absent at runtime the feature degrades off and the rest of the adapter still
+# boots (see adapter.py _PPTX_GEN_AVAILABLE guard / oss_store graceful import).
+python-pptx>=1.0.0
+oss2>=2.18.0

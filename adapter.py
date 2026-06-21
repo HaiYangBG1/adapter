@@ -47,6 +47,8 @@ from agentic_web import (
     EXCEL_AGENT_SYSTEM_PROMPT,
     EXCEL_AGENT_PLAN_PROMPT,  # v0.3.0 D Phase 1
     EXCEL_QUERY_TOOL,
+    GENERATE_PPTX_TOOL,  # v0.5.0 B 文件生成 MVP
+    PPTX_GEN_PROMPT,     # v0.5.0 B 文件生成 MVP
     SUBMIT_ANALYSIS_PLAN_TOOL,  # v0.3.0 D Phase 1
     ToolRegistry,
     WEB_FETCH_TOOL,
@@ -55,6 +57,18 @@ from agentic_web import (
     run_agent as _run_agent_loop,
     run_agent_stream as _run_agent_stream,
 )
+
+# v0.5.0 B(文件生成 MVP):PPTX 确定性渲染 + 对象存储。两者依赖 python-pptx / oss2,
+# 用 try 包住 —— 缺依赖时该能力降级关闭,**不影响** adapter 其余功能(chat 代理 /
+# excel / web)正常启动。pptx_generator / oss_store 都是本仓 generic 模块(无内部标识)。
+try:
+    import pptx_generator  # type: ignore
+    import oss_store  # type: ignore
+    _PPTX_GEN_AVAILABLE = True
+except Exception as _pptx_import_exc:  # noqa: BLE001 — 缺依赖优雅降级
+    pptx_generator = None  # type: ignore
+    oss_store = None  # type: ignore
+    _PPTX_GEN_AVAILABLE = False
 
 
 HOST = os.environ.get("ADAPTER_HOST", "0.0.0.0")
@@ -170,6 +184,12 @@ AGENT_MAX_INTENT_LEAK_RETRIES = int(os.environ.get("ADAPTER_AGENT_MAX_INTENT_LEA
 # (Plan 模式架构上消除了 "说计划不 emit" 这类 silent failure)。
 # 详见 lxj-adapter-deploy/design/2026-05-28-D-plan-and-execute-architecture.md
 ADAPTER_ENABLE_PLAN_EXEC_EXCEL = os.environ.get("ADAPTER_ENABLE_PLAN_EXEC_EXCEL", "0").lower() not in {"0", "false", "no", "off"}
+
+# v0.5.0 B(文件生成 MVP):PPTX 生成总开关(master kill-switch)。默认开 ——
+# 实际触发仍需 per-request flag(gen_pptx / extra_body.gen_pptx)且对象存储已配置;
+# 这个 env 用于运维一键关停整条 PPTX 生成通路。需 _PPTX_GEN_AVAILABLE(依赖在位)
+# + oss_store.is_configured()(OSS env 齐)才真正可用。
+ADAPTER_ENABLE_PPTX_GEN = os.environ.get("ADAPTER_ENABLE_PPTX_GEN", "1").lower() not in {"0", "false", "no", "off"}
 
 # v0.3.0 D Phase 2:plan dispatcher 并发上限。同一 batch 内所有 step 并行
 # excel_query,这是上限。excel-poc /ask 实测单 query 几秒-几十秒,4 并发
@@ -1792,9 +1812,62 @@ def _make_excel_run_step(dataset_id: str) -> Callable[[str, int], Any]:
     return _run_step
 
 
-def _build_agent_registry(excel_dataset_id: str = "", enable_plan: bool = False) -> ToolRegistry:
+def _make_pptx_renderer() -> Callable[[dict, str], dict]:
+    """v0.5.0 B(文件生成 MVP):依赖注入的 PPTX 渲染器。
+
+    返回 (outline_args, artifact_id) -> result dict,绑定本仓 pptx_generator(写死
+    模板的确定性 python-pptx 渲染)+ oss_store(对象存储上传 + presigned 下载)。
+    agentic_web.py 通过 cfg.pptx_renderer 调它,自己**不知道** pptx / OSS 细节
+    (同 plan_step_runner 依赖反转,守 AGENTS.md generic / open-source safe 边界)。
+
+    成功:{"ok": True, "name", "mime", "size", "download_url", "object_key"}
+    失败:{"ok": False, "error": <人话原因>}(渲染/上传任何异常都兜成 error,
+          由 stream_agent emit 成 x_adapter_artifact status=error,前端显示红卡)。
+    🔴 OSS 凭据只在运行时 env(oss_store 读),绝不落盘 / 进响应。
+    """
+    _PPTX_MIME = (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    )
+
+    def _render(outline_args: dict, artifact_id: str) -> dict:
+        if not _PPTX_GEN_AVAILABLE:
+            return {"ok": False, "error": "PPTX 渲染依赖未安装(python-pptx)"}
+        if not oss_store.is_configured():
+            return {
+                "ok": False,
+                "error": "文件存储未配置,暂时无法生成可下载文件(请联系管理员配置对象存储)",
+            }
+        try:
+            outline = pptx_generator.normalize_outline(outline_args)
+            data = pptx_generator.build_pptx(outline)
+            name = pptx_generator.safe_filename(outline["title"], "pptx")
+            download_url, object_key, _ttl = oss_store.upload_and_presign(
+                artifact_id, "pptx", data, _PPTX_MIME, name,
+            )
+            return {
+                "ok": True,
+                "name": name,
+                "mime": _PPTX_MIME,
+                "size": len(data),
+                "download_url": download_url,
+                "object_key": object_key,
+            }
+        except oss_store.OssNotConfigured as exc:
+            return {"ok": False, "error": f"文件存储未就绪:{exc}"}
+        except Exception as exc:  # noqa: BLE001 — 渲染/上传失败兜成 error,不抛给 loop
+            return {"ok": False, "error": f"PPT 生成失败:{type(exc).__name__}: {exc}"}
+
+    return _render
+
+
+def _build_agent_registry(
+    excel_dataset_id: str = "", enable_plan: bool = False, enable_pptx: bool = False
+) -> ToolRegistry:
     """无表格数据集时复用 web 工具单例;带数据集时新建一个 registry。
 
+    enable_pptx=True(v0.5.0 B):**只挂 GENERATE_PPTX_TOOL schema**(register_schema_only,
+    inline 拦截,不走 dispatch),首轮 force_first_tool_name 强制模型 emit 大纲。优先级
+    最高且互斥(PPTX 模式不挂 web/excel 工具)。
     带数据集 + enable_plan=False(旧路径,v0.2.x 默认):挂 web 工具 + EXCEL_QUERY_TOOL。
     带数据集 + enable_plan=True(v0.4.0 D 重构):**用 register_schema_only**
     只挂 SUBMIT_ANALYSIS_PLAN_TOOL schema,**不挂 impl**。第一轮 LLM 看到的
@@ -1803,6 +1876,12 @@ def _build_agent_registry(excel_dataset_id: str = "", enable_plan: bool = False)
     ToolRegistry.dispatch。漏拦截时 _dispatch_tool_calls_parallel 检测到 plan
     name 但无 impl,emit `agent_plan_intercept_missed` progress 让开发者立刻发现。
     """
+    if enable_pptx:
+        # v0.5.0 B:只挂 generate_pptx schema —— impl 由 run_agent_stream 的
+        # pptx 拦截分支直接处理(渲染→上传→emit artifact),不走 dispatch。
+        reg = ToolRegistry()
+        reg.register_schema_only(GENERATE_PPTX_TOOL)
+        return reg
     if not (excel_dataset_id and EXCEL_BACKEND_URL):
         return _get_agent_registry()
     reg = ToolRegistry()
@@ -2925,11 +3004,60 @@ class Handler(BaseHTTPRequestHandler):
                         "agent_web_view_enabled": AGENT_WEB_VIEW_ENABLED,
                         "agent_fetch_fallback_min_chars": AGENT_FETCH_FALLBACK_MIN_CHARS,
                         "agent_excel_query_enabled": bool(EXCEL_BACKEND_URL),
+                        # v0.5.0 B(文件生成 MVP):PPTX 生成 + 对象存储就绪状态(非敏感)
+                        "pptx_gen_enabled": bool(ADAPTER_ENABLE_PPTX_GEN and _PPTX_GEN_AVAILABLE),
+                        "object_storage": (
+                            oss_store.status() if (_PPTX_GEN_AVAILABLE and oss_store) else {"configured": False}
+                        ),
                     },
                 },
             )
             return
+        # v0.5.0 B(文件生成 MVP):presigned 下载链接重签端点。
+        # GET /v1/artifact/{id}/url?ext=pptx&name=<filename> → {"downloadUrl": ...}
+        # 前端 BFF(/api/artifact/[id]/url)代理到这里;OSS 凭据只在 adapter env。
+        # objectKey 确定性(prefix+id.ext),无需 id→key 映射表(MVP PPT-only)。
+        if path.startswith("/v1/artifact/") or path.startswith("/artifact/"):
+            self._handle_artifact_url(path)
+            return
         self._proxy()
+
+    def _handle_artifact_url(self, path: str) -> None:
+        """重签 presigned 下载 URL。路径形如 /v1/artifact/<id>/url。"""
+        parts = [p for p in path.strip("/").split("/") if p]
+        # 接受 ["v1","artifact",<id>,"url"] 或 ["artifact",<id>,"url"]
+        if parts and parts[0] == "v1":
+            parts = parts[1:]
+        if len(parts) != 3 or parts[0] != "artifact" or parts[2] != "url":
+            self._send_json(404, {"error": {"message": "not found", "type": "not_found"}})
+            return
+        artifact_id = parts[1]
+        # 校验 id 形态(uuid4.hex 恒为 32 hex;放宽到带连字符的 8-64 位安全字符),
+        # 杜绝路径遍历 / 注入(配合 oss_store.object_key_for 的去点兜底)。
+        if not re.fullmatch(r"[A-Za-z0-9-]{8,64}", artifact_id):
+            self._send_json(400, {"error": {"message": "bad artifact id", "type": "bad_request"}})
+            return
+        if not (_PPTX_GEN_AVAILABLE and oss_store and oss_store.is_configured()):
+            self._send_json(503, {"error": {"message": "object storage not configured", "type": "unavailable"}})
+            return
+        qs = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+        ext = (qs.get("ext", ["pptx"])[0] or "pptx").strip().lower()
+        # ext 白名单 —— 防 MIME 欺骗(签出 .exe 等钓鱼下载)。MVP 仅 pptx,预留其余 office。
+        if ext not in {"pptx", "xlsx", "docx", "pdf"}:
+            self._send_json(400, {"error": {"message": "unsupported ext", "type": "bad_request"}})
+            return
+        name = (qs.get("name", [""])[0] or "").strip() or None
+        try:
+            object_key = oss_store.object_key_for(artifact_id, ext)
+            # MIME 由扩展名推断(MVP 仅 pptx;其它走通用)
+            mime = (
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                if ext == "pptx" else "application/octet-stream"
+            )
+            url = oss_store.presign_get(object_key, filename=name, mime=mime)
+            self._send_json(200, {"downloadUrl": url})
+        except Exception as exc:  # noqa: BLE001 — 重签失败回 502,不崩
+            self._send_json(502, {"error": {"message": f"presign failed: {type(exc).__name__}", "type": "upstream_error"}})
 
     def _log_agent_run(self, trace_dict: dict[str, Any], model: str, stream: bool) -> None:
         """Emit one structured JSON line summarizing an agent run (observability).
@@ -2989,20 +3117,34 @@ class Handler(BaseHTTPRequestHandler):
         # 本次请求挂一个绑定该数据集的 excel_query 工具。它是 adapter 私有控制
         # 字段,不能透传给上游模型 API,故从 extra 里排除。
         excel_dataset_id = str(payload.get("excel_dataset_id") or "").strip()
-        # v0.3.0 D Phase 1:Plan-and-Execute 模式 per-request 开关 ──────────
-        # env ADAPTER_ENABLE_PLAN_EXEC_EXCEL 控制(per-request flag 可由 client
-        # extra_body.enable_plan_and_execute 覆盖,便于灰度 A/B)。仅作用于
-        # 带 excel_dataset_id 的请求 —— 没有数据集不需要 plan。
-        enable_plan_for_request = ADAPTER_ENABLE_PLAN_EXEC_EXCEL and bool(excel_dataset_id)
         _client_extra_body_check = payload.get("extra_body") if isinstance(payload.get("extra_body"), dict) else {}
+        # v0.5.0 B(文件生成 MVP):PPTX 生成模式 —— 优先级最高、与 excel/web 互斥。
+        # 触发 = client 传 gen_pptx(顶层或 extra_body)+ 总开关 ADAPTER_ENABLE_PPTX_GEN
+        # + 渲染依赖在位(_PPTX_GEN_AVAILABLE)。对象存储是否就绪在 renderer 内判:
+        # 未配置则返回 error → emit error artifact(用户看清晰红卡,不静默退化成纯文本)。
+        gen_pptx_req = bool(payload.get("gen_pptx")) or bool(_client_extra_body_check.get("gen_pptx"))
+        pptx_mode = gen_pptx_req and ADAPTER_ENABLE_PPTX_GEN and _PPTX_GEN_AVAILABLE
+        # v0.3.0 D Phase 1:Plan-and-Execute 模式 per-request 开关(env 控制,client
+        # extra_body.enable_plan_and_execute 可覆盖,便于灰度)。仅作用于带数据集的请求。
+        enable_plan_for_request = ADAPTER_ENABLE_PLAN_EXEC_EXCEL and bool(excel_dataset_id)
         if isinstance(_client_extra_body_check.get("enable_plan_and_execute"), bool):
             enable_plan_for_request = _client_extra_body_check["enable_plan_and_execute"] and bool(excel_dataset_id)
-        registry = _build_agent_registry(excel_dataset_id, enable_plan=enable_plan_for_request)
+
+        if pptx_mode:
+            # v0.5.0 B:只挂 generate_pptx,首轮强制 emit 大纲,注入确定性渲染器。
+            registry = _build_agent_registry(enable_pptx=True)
+            cfg.system_prompt = PPTX_GEN_PROMPT
+            cfg.enable_pptx_gen = True
+            cfg.force_first_tool_name = "generate_pptx"
+            cfg.pptx_renderer = _make_pptx_renderer()
+            cfg.citation_guard = False  # 文件生成无 URL 概念,关引用合规审计
+        else:
+            registry = _build_agent_registry(excel_dataset_id, enable_plan=enable_plan_for_request)
         # 带数据集时,**整体替换**为 Excel 专用系统提示词(而非在联网提示词上追加)
         # —— 联网那套的「必搜 / 没调工具就加未联网免责声明」会把模型带偏,且需
         # 明确告诉模型「数据集在 excel_query 工具后面、不在上下文里」,否则它会
         # 误判「没材料」而拒答。
-        if excel_dataset_id and EXCEL_BACKEND_URL:
+        if not pptx_mode and excel_dataset_id and EXCEL_BACKEND_URL:
             if enable_plan_for_request:
                 # v0.4.0 D 重构:Plan-and-Execute 一等公民模式
                 # 1. system prompt 用 PLAN(不是旧 SYSTEM)
@@ -3042,11 +3184,15 @@ class Handler(BaseHTTPRequestHandler):
             if k not in {
                 "messages", "model", "stream", "tools", "tool_choice",
                 "parallel_tool_calls", "excel_dataset_id", "extra_body",
+                "gen_pptx",  # v0.5.0 B:adapter 私有控制字段,不透传上游
             }
         }
         # extra_body 字段不能覆盖顶层已有同名键(顶层优先 —— 保留显式控制权)
         for _k, _v in client_extra_body.items():
             extra.setdefault(_k, _v)
+        # v0.5.0 B:gen_pptx 可能从 extra_body 解包进来 —— 在 setdefault 之后剔除,
+        # 确保不透传上游(adapter 私有控制字段)。
+        extra.pop("gen_pptx", None)
         # Inject a sane max_tokens default when the client didn't set one —
         # agentic answers need headroom or they truncate mid-thought.
         if not extra.get("max_tokens") and not extra.get("max_completion_tokens"):

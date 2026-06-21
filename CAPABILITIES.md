@@ -12,6 +12,7 @@ This document describes the public, deployment-neutral capabilities of `adapter`
 | Agentic web | Yes | `/v1/agent` tool-calling loop (search / fetch / screenshot) |
 | Plan-and-execute | Yes | Optional structured mode: model submits a full plan once, the adapter runs the steps with dependency-aware scheduling, then the model answers from the results |
 | SSE streaming | Yes | Streams upstream chunks, progress chunks, and agent token deltas |
+| File artifact generation | Optional | Deterministic `.pptx` from a model outline → object storage → presigned download (`x_adapter_artifact` SSE block); needs `python-pptx` + `oss2` + object-storage env |
 | SSRF protection | Yes | Blocks internal/private targets and validates redirects |
 | Upstream auth | Yes | Optional bearer token through environment variable |
 

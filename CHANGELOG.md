@@ -7,6 +7,38 @@
 
 ---
 
+## [Unreleased] — v0.5.0 文件生成 MVP(PPTX)· 代码就绪,待 OSS 配置 + 部署
+> 五期 B(文件生成 MVP)。⚠️ **尚未部署**:依赖运维注入 OSS 凭据/桶配置(见
+> `DEPLOYMENT.md` 新增 env 段 + `../../pm/status/运维.md` provisioning ask)。本地
+> py_compile + 渲染/重签逻辑自测过;线上闭环(生成→下载)gated on OSS 就绪。
+### Added
+- **PPTX 确定性生成**(A 铁律:模型只出大纲数据,渲染是写死代码):
+  - `pptx_generator.py`(新):outline JSON → python-pptx 套模板渲染 → `.pptx` bytes。
+    防御式 normalize(容忍模型松散输出),16:9 模板,封面 + 正文页(标题/要点/备注),
+    页码/单主色(`PPTX_ACCENT_COLOR` env,默认绿)。generic/open-source safe,全 env 驱动。
+  - `oss_store.py`(新):oss2 上传 + presigned GET(短时效,默认 15min)。**双端点**:
+    上传走内网 `OSS_INTERNAL_ENDPOINT`、presign 走公网 `OSS_PUBLIC_ENDPOINT`(浏览器可达)。
+    objectKey 确定性 `{prefix}{id}.{ext}`(无需 id→key 映射表);Content-Disposition 支持 CJK
+    文件名(RFC5987)。缺 oss2/未配 env 时优雅降级。🔴 凭据只读 env,绝不落盘。
+  - `agentic_web.py`:`generate_pptx` 工具(register_schema_only,inline 拦截,仿
+    submit_analysis_plan)+ `_sse_artifact_chunk`(顶层 `x_adapter_artifact` 信封,三态
+    generating→ready→error,同 id 覆盖)+ `AgentConfig.enable_pptx_gen/pptx_renderer`
+    (依赖注入,agentic_web 不知 pptx/OSS 细节)+ run_agent_stream 拦截分支 +
+    `PPTX_GEN_PROMPT` / `PPTX_SYNTHESIS_HINT`。
+  - `adapter.py`:`gen_pptx` per-request flag(顶层或 extra_body)→ pptx_mode(优先级最高、
+    与 excel/web 互斥),`force_first_tool_name=generate_pptx` 首轮强制 emit 大纲,
+    `_make_pptx_renderer()` 注入渲染/存储。`GET /v1/artifact/{id}/url` presigned 重签端点
+    (id 形态校验 + ext 白名单,防遍历/MIME 欺骗)。`/health` 加 `pptx_gen_enabled` +
+    `object_storage` 就绪快照(非敏感)。
+  - `requirements.txt`:`python-pptx>=1.0.0` + `oss2>=2.18.0`(缺失时该能力降级,adapter 仍启动)。
+  - `Dockerfile`:COPY `pptx_generator.py` / `oss_store.py`。
+### Notes
+- 新增 env(运维注入,见 DEPLOYMENT.md):`OSS_ENDPOINT` / `OSS_INTERNAL_ENDPOINT` /
+  `OSS_PUBLIC_ENDPOINT` / `OSS_BUCKET` / `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` /
+  `OSS_ARTIFACT_PREFIX` / `OSS_PRESIGN_EXPIRE_SECONDS` / `ADAPTER_ENABLE_PPTX_GEN`。
+- 前端触发(`gen_pptx:true` 路由到 `/api/agent`)= 待定 thin slice(产品 UX 待 PM 拍)。
+- 契约:`../../contracts/PROTOCOL.md` §SSE + `../../llm-playground-pro/docs/BACKEND_REQUESTS_artifact_5期.md`。reviewer 核查门过(P0 复核非阻塞 + P1 已修)。
+
 ## [v0.4.5] - 2026-06-18
 ### Fixed
 - 大表分析「多表盲查」超时根治(数据集十几张利润表的 case 全超时):
