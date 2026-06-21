@@ -148,16 +148,21 @@ def upload_bytes(artifact_id: str, ext: str, data: bytes, mime: str) -> str:
 def presign_get(object_key: str, filename: Optional[str] = None, mime: Optional[str] = None) -> str:
     """Return a short-lived presigned GET URL (browser-facing public endpoint).
 
-    Adds a Content-Disposition so the browser downloads with the friendly name,
-    and overrides Content-Type so the object opens/saves with the right kind.
+    Adds a Content-Disposition so the browser downloads with the friendly name.
+
+    NOTE: we deliberately do NOT set ``response-content-type`` — OSS rejects
+    overriding content-type on a GET ("Can not override response header on
+    content-type", 400 InvalidRequest), and it is redundant anyway: the object is
+    uploaded (``upload_bytes``) with the correct ``Content-Type`` header, so OSS
+    already serves it with the right kind. The ``mime`` arg is kept for call-site
+    compatibility but intentionally unused here.
     """
     if not is_configured():
         raise OssNotConfigured("object storage not configured")
+    _ = mime  # intentionally unused — see note above
     params: dict[str, str] = {}
     if filename:
         params["response-content-disposition"] = _content_disposition(filename)
-    if mime:
-        params["response-content-type"] = mime
     return _presign_bucket().sign_url(
         "GET", object_key, _expire_seconds(), params=params or None, slash_safe=True
     )
