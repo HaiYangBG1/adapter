@@ -7,11 +7,19 @@
 
 ---
 
-## [Unreleased] — v0.6.0 B+ 多类型文件生成 + 自动识别 · 🧪 code-complete 待部署
+## [v0.6.0-20260622] — B+ 多类型文件生成 + 自动识别 · ✅ 已上线生产
 > 五期 B+(decisions 2026-06-22)。把 PPTX 生成泛化为**多类型**(+ Excel/CSV/Word/HTML)+
 > **模型自动识别**触发。纯加法,**显式 PPTX(`gen_pptx`)路径行为不变**(无回归)。
 > 本地全验:py_compile 全绿 + 5 类型渲染→reopen 校验 + 集成 dispatch 自测 + HTML 消毒单测 +
-> reviewer 核查门(无 P0;P1 已修)。⚠️ **未部署**,线上闭环 gated on 整包部署 + 测试域带图实测。
+> reviewer 核查门(无 P0;P1 已修)。
+> **部署证据(2026-06-22)**:镜像 `172.29.0.223:5000/lxj/adapter:v0.6.0-20260622`,digest
+> `sha256:184c9315fca02bbea5372b6fc4b8a1a4f37a2157d60c4fb42690aa19bd3d3440`,git `b47c5c9`。
+> **智能增量构建**(FROM v0.5.1-20260621 + COPY *.py〈9 模块,无新 pip 依赖〉)+ 镜像内自检
+> `SELFCHECK_OK file_gen exts: csv/docx/html/pdf/pptx/xlsx`。SAE image-only 滚动部署(ChangeOrder
+> `7d16f624-…` Status→2 ~90s;**env 不动**——`ADAPTER_ENABLE_PPTX_GEN` 回退逻辑使 file_gen 自动
+> 启用、OSS env 沿用 B2;PreStop sleep25 保留)。**线上烟测全 PASS**(经生产前端 BFF):PPTX 回归
+> 真 8 页 pptx + 多类型 gen_file 模型自选 xlsx/docx/csv/html 各合法可下载 + HTML 消毒在线生效
+> + 普通 agent 无误触发 artifact。
 ### Added (v0.6.0)
 - **4 个确定性生成器**(模型只出结构化数据,A 铁律):`xlsx_generator.py`(openpyxl,多 sheet +
   表头样式 + 冻结窗格 + 列宽)/ `docx_generator.py`(python-docx,标题/小节/段落/项目符号)/

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Fast-path remote build —— FROM 上一镜像 + COPY *.py + 注入 ENV。
-# 适合改动只在 adapter.py / agentic_web.py(不动 requirements / Dockerfile)
-# 的小迭代,build < 5s vs 完整构建 5-10min。
+# Fast-path remote build —— FROM 上一镜像 + COPY 全部运行时 *.py + 注入 ENV。
+# 适合改动只在 Python 源码(**不新增 pip 依赖**、不动 requirements)的迭代,
+# build < 30s vs 完整构建 5-10min。
+# 🔴 COPY 全部 *.py(不止 adapter.py/agentic_web.py)—— v0.6.0 B+ 教训:只 COPY 两文件
+#    会在「加了新模块」时把它们漏在镜像外 → import 失败 → 功能静默退化(见 runbook
+#    deploy-2026-06-21 「关键陷阱」)。根目录只有运行时模块,*.py 安全。
+# ⚠️ 仍**不跑 pip install**:若本次新增了 pip 依赖,必须走 build_remote_image.sh 完整构建。
 #
 # 流程:
 #   1. 本地 tar 源码 → OSS 上传(签名 URL)
@@ -35,8 +39,8 @@ echo "  NEW_TAG          = $NEW_TAG"
 echo
 
 # ── 1. 打包源码上传 OSS ─────────────────────────────────────────────
-tar -czf "$SRC_TGZ" adapter.py agentic_web.py
-echo "src tarball: $(du -h $SRC_TGZ | cut -f1)"
+tar -czf "$SRC_TGZ" *.py
+echo "src tarball: $(du -h $SRC_TGZ | cut -f1) ($(ls -1 *.py | wc -l | tr -d ' ') modules)"
 aliyun oss cp "$SRC_TGZ" "$OSS_PATH" --region cn-hangzhou --force >/dev/null
 SIGNED_URL=$(aliyun oss sign "$OSS_PATH" --timeout 3600 --region cn-hangzhou 2>&1 | head -1)
 
@@ -51,11 +55,14 @@ curl -sS -o src.tgz '$SIGNED_URL'
 tar -xzf src.tgz
 cat > Dockerfile <<'DOCKERFILE'
 FROM $BASE_IMAGE
-COPY adapter.py agentic_web.py /app/
+COPY *.py /app/
 ENV ADAPTER_VERSION=$ADAPTER_VERSION
 ENV ADAPTER_GIT_SHA=$GIT_SHA
 DOCKERFILE
 docker build -t $NEW_TAG .
+# 镜像内自检:确认全部运行时模块在镜像里且可导入 + 文件生成通路可用(命中"漏 COPY
+# 模块"陷阱时 _FILE_GEN_AVAILABLE=False,在此 fail-fast,不推坏镜像)。
+docker run --rm $NEW_TAG python -c "import adapter; assert adapter._FILE_GEN_AVAILABLE, 'FILE_GEN_UNAVAILABLE'; print('SELFCHECK_OK file_gen exts:', sorted(adapter._ARTIFACT_EXT_MIME))"
 docker push $NEW_TAG
 docker inspect $NEW_TAG --format '{{index .RepoDigests 0}}'
 BUILD
