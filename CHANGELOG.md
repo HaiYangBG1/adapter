@@ -7,6 +7,32 @@
 
 ---
 
+## [Unreleased] — v0.6.0 B+ 多类型文件生成 + 自动识别 · 🧪 code-complete 待部署
+> 五期 B+(decisions 2026-06-22)。把 PPTX 生成泛化为**多类型**(+ Excel/CSV/Word/HTML)+
+> **模型自动识别**触发。纯加法,**显式 PPTX(`gen_pptx`)路径行为不变**(无回归)。
+> 本地全验:py_compile 全绿 + 5 类型渲染→reopen 校验 + 集成 dispatch 自测 + HTML 消毒单测 +
+> reviewer 核查门(无 P0;P1 已修)。⚠️ **未部署**,线上闭环 gated on 整包部署 + 测试域带图实测。
+### Added (v0.6.0)
+- **4 个确定性生成器**(模型只出结构化数据,A 铁律):`xlsx_generator.py`(openpyxl,多 sheet +
+  表头样式 + 冻结窗格 + 列宽)/ `docx_generator.py`(python-docx,标题/小节/段落/项目符号)/
+  `csv_generator.py`(stdlib,UTF-8 BOM 便于 Excel)/ `html_generator.py`(stdlib;模型写正文
+  HTML → **消毒** 去 script/style/外链/事件处理器/`javascript:` 后套干净文档外壳)。
+  共享助手 `file_gen_common.py`(clean_text/clamp/as_cell/safe_filename/accent)。
+- **`agentic_web.py` 泛化**:新增 `GENERATE_{XLSX,DOCX,CSV,HTML}_TOOL` schema + `FILE_GEN_PROMPT`
+  (自动识别系统提示,不强制调工具)+ `ALL_FILE_GEN_TOOLS` + `FILE_GEN_TOOL_META`(tool→kind/
+  mime/ext/preview);`generate_pptx` inline 拦截分支泛化为按 tool name 路由任一 `generate_*`。
+- **`gen_file` 自动多类型触发**:挂全部 `generate_*`、`tool_choice=auto`,模型自决类型/是否生成。
+  与 `gen_pptx`(显式 PPTX)互斥并存,`gen_pptx` 优先。两字段均不透传上游。
+- **`/health`** 加 `file_gen_enabled` + `file_gen_types`(保留 `pptx_gen_enabled` 兼容键);
+  重签端点 ext 白名单加 `csv`/`html`。
+### Changed (v0.6.0)
+- `AgentConfig.enable_pptx_gen`→`enable_file_gen`;`pptx_renderer`→`file_renderer`(签名加
+  `tool_name` 首参);per-session `pptx_dispatch_done`/`PPTX_SYNTHESIS_HINT`→`file_gen_*`/
+  `FILE_GEN_SYNTHESIS_HINT`(措辞泛化)。`adapter._make_pptx_renderer`→`_make_file_renderer`
+  (按 tool name 分发到 5 个 generator)。master switch `ADAPTER_ENABLE_FILE_GEN`(回退旧名
+  `ADAPTER_ENABLE_PPTX_GEN`,运维平滑)。`Dockerfile` COPY 5 个新模块。openpyxl/python-docx
+  早已在 requirements(输入侧),生成侧复用,**无新增依赖**(csv/html 为 stdlib)。
+
 ## [v0.5.1] - 2026-06-21 — 文件生成 MVP(PPTX)· ✅ 已暗部署 + 线上闭环 PASS
 > 五期 B(文件生成 MVP)。**暗部署**:整条通路被 per-request `gen_pptx` 标志门控,
 > 前端无入口发该标志 → 真实用户够不着,部署对现有 chat/excel/web **零影响**(已实测回归)。

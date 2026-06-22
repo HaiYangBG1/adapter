@@ -78,23 +78,31 @@ dispatches tools, and loops until the model produces a final answer.
 `MAX_CONCURRENT × 300 MB` is the screenshot memory ceiling — size it to the
 host (e.g. 3 on a 2 GB box, 10+ on an 8 GB box).
 
-### File artifact generation (PPTX) + object storage
+### File artifact generation (pptx/xlsx/docx/csv/html) + object storage
 
-Deterministic `.pptx` generation. The model emits a structured outline via the
-`generate_pptx` tool; the adapter renders it with a fixed template (`python-pptx`)
-and uploads the file to S3/OSS-compatible object storage, then streams a
-short-lived presigned download URL to the client (`x_adapter_artifact` SSE block).
-Per-request opt-in: the caller sends `gen_pptx: true` (top-level or in `extra_body`)
-on `/v1/agent/.../chat/completions`.
+Deterministic file generation. The model emits **structured content** via a
+`generate_*` tool; the adapter renders it with a fixed template and uploads the
+file to S3/OSS-compatible object storage, then streams a short-lived presigned
+download URL to the client (`x_adapter_artifact` SSE block). The model never
+writes rendering code (A 铁律). Generators (v0.6.0 B+): `generate_pptx`
+(`python-pptx`), `generate_xlsx` (`openpyxl`), `generate_docx` (`python-docx`),
+`generate_csv` / `generate_html` (stdlib; HTML body is sanitized).
 
-If `python-pptx` / `oss2` are missing, or the object-storage env below is
-incomplete, the feature degrades off and the rest of the adapter still runs.
+Two per-request opt-in flags on `/v1/agent/.../chat/completions` (top-level or in
+`extra_body`):
+- `gen_pptx: true` — **explicit PPTX**: only `generate_pptx` is mounted, forced first turn.
+- `gen_file: true` — **auto multi-type** (B+): all `generate_*` mounted, `tool_choice=auto`,
+  the model picks the type or declines (normal answer). Mutually exclusive; `gen_pptx` wins.
+
+If a generation dep (`python-pptx`/`openpyxl`/`python-docx`) or `oss2` is missing,
+or the object-storage env below is incomplete, the whole file-gen path degrades
+off and the rest of the adapter still runs.
 🔴 The two credentials are read **only** from the runtime environment — never
 commit them or write them to any file/log/response.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `ADAPTER_ENABLE_PPTX_GEN` | `1` | Master kill-switch for the whole PPTX path |
+| `ADAPTER_ENABLE_FILE_GEN` | `1` | Master kill-switch for the whole file-gen path. **Falls back to legacy `ADAPTER_ENABLE_PPTX_GEN`** if unset (v0.5.0 deploys keep working) |
 | `OSS_ENDPOINT` | _(empty)_ | Generic endpoint fallback, e.g. `https://oss-<region>.example.com` |
 | `OSS_INTERNAL_ENDPOINT` | _(= OSS_ENDPOINT)_ | **Upload** endpoint (use the in-network/internal one when the service runs inside the provider's network — faster, no egress cost) |
 | `OSS_PUBLIC_ENDPOINT` | _(= OSS_ENDPOINT)_ | **Presign** endpoint — must be **browser-reachable** (public), or the presigned URL won't resolve for end users |
@@ -103,17 +111,24 @@ commit them or write them to any file/log/response.
 | `OSS_ACCESS_KEY_SECRET` | _(empty)_ | 🔴 credential — env only |
 | `OSS_ARTIFACT_PREFIX` | `ai-center/artifacts/` | Object key prefix; set a bucket lifecycle TTL on this prefix |
 | `OSS_PRESIGN_EXPIRE_SECONDS` | `900` | Presigned URL TTL (clamped 60–3600) |
-| `PPTX_ACCENT_COLOR` | `008042` | Hex accent color for the slide template (no `#`) |
+| `FILE_GEN_ACCENT_COLOR` | `008042` | Hex accent for xlsx/docx/html templates (no `#`). Falls back to `PPTX_ACCENT_COLOR` |
+| `PPTX_ACCENT_COLOR` | `008042` | Hex accent for the slide template (no `#`) |
 | `PPTX_FOOTER_TEXT` | _(empty)_ | Optional footer label rendered on each slide |
 
 > **Two-endpoint rule:** uploads use the internal endpoint, presigns use the
 > public one — same bucket, two URLs. Signing a presigned URL against an
 > internal-only endpoint produces links that fail outside the network.
 
-> **Re-sign endpoint:** `GET /v1/artifact/{id}/url?ext=pptx&name=<filename>` →
-> `{ "downloadUrl": ... }`. Rebuilds the deterministic object key from id+ext and
-> re-mints a presigned URL (for when the original expires). The frontend BFF
-> proxies to it so OSS credentials stay in the adapter only.
+> **Re-sign endpoint:** `GET /v1/artifact/{id}/url?ext=<ext>&name=<filename>` →
+> `{ "downloadUrl": ... }`. `ext` whitelist = `pptx|xlsx|docx|csv|html|pdf`.
+> Rebuilds the deterministic object key from id+ext and re-mints a presigned URL
+> (for when the original expires). The frontend BFF proxies to it so OSS
+> credentials stay in the adapter only.
+
+> **Health probe:** `GET /health` reports `file_gen_enabled` (bool),
+> `file_gen_types` (list), `pptx_gen_enabled` (legacy alias), and
+> `object_storage.configured`. Deploy success = `file_gen_enabled: true` +
+> `object_storage.configured: true`.
 
 ## SearXNG Setup (recommended search provider)
 

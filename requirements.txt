@@ -1,12 +1,16 @@
 pypdf>=6.0.0
 PyMuPDF>=1.24.0
+# python-docx / openpyxl: input-side parsing (PDF/Excel ingest) AND v0.6.0 B+
+# output-side generation (docx_generator / xlsx_generator). csv/html generators
+# are stdlib-only (no dep).
 python-docx>=1.1.0
 openpyxl>=3.1.0
 # Agentic web — web_view screenshot tool (optional; web_view is skipped if absent)
 playwright>=1.40.0
 Pillow>=10.0.0
-# File-artifact generation (PPTX) + object storage upload/presign. If a dep is
-# absent at runtime the feature degrades off and the rest of the adapter still
-# boots (see adapter.py _PPTX_GEN_AVAILABLE guard / oss_store graceful import).
+# File-artifact generation (pptx/xlsx/docx/csv/html) + object storage upload/presign.
+# If a dep is absent at runtime the whole file-gen path degrades off and the rest of
+# the adapter still boots (see adapter.py _FILE_GEN_AVAILABLE guard / oss_store
+# graceful import). python-pptx is the only generation dep not already listed above.
 python-pptx>=1.0.0
 oss2>=2.18.0

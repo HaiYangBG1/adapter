@@ -52,6 +52,12 @@ COPY agentic_web.py /app/agentic_web.py
 # v0.5.0 B(文件生成 MVP):PPTX 确定性渲染 + 对象存储模块
 COPY pptx_generator.py /app/pptx_generator.py
 COPY oss_store.py /app/oss_store.py
+# v0.6.0 B+(多类型扩展):共享助手 + xlsx/docx/csv/html 确定性渲染模块
+COPY file_gen_common.py /app/file_gen_common.py
+COPY xlsx_generator.py /app/xlsx_generator.py
+COPY docx_generator.py /app/docx_generator.py
+COPY csv_generator.py /app/csv_generator.py
+COPY html_generator.py /app/html_generator.py
 
 EXPOSE 8000
 
