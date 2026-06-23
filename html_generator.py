@@ -1,21 +1,24 @@
 """Deterministic HTML generator (五期 B+ 多类型扩展).
 
-Two input shapes, both producing a single self-contained ``.html`` file:
+Produces a single self-contained ``.html`` file from one of two input shapes:
 
-1. **Raw body** — the model writes the page body HTML directly (``html`` field).
-   Per the 06-14 decision, model-authored HTML is an accepted pattern (it is
-   *data*, never server-executed code — A 铁律 holds: we only write bytes, the
-   user's own browser renders the downloaded file). We still **sanitize**
-   conservatively (defense-in-depth) before wrapping it in a clean document
-   shell with the product's typography + accent.
+1. **Model-authored HTML** (``html`` field) — the model writes the page directly.
+   It may be a **complete document** (``<!DOCTYPE html>…`` — used verbatim) or a
+   **body fragment** (wrapped in a clean document shell with the product's
+   typography). Per the **2026-06-23 PM decision「允许 js」**, generated HTML
+   **may contain `<script>` / `<style>` / charts** (chart.js etc.) so that
+   "可视化看板" requests get real interactive charts.
 2. **Structured** — title + sections (heading / paragraphs / bullets), rendered
-   by us into safe markup. Used when no raw ``html`` is supplied.
+   by us into HTML-escaped markup. Used when no raw ``html`` is supplied.
 
-Sanitization is regex-based best-effort (not a full HTML parser): it strips
-``<script>`` / external-resource / framing tags, inline ``on*`` event handlers,
-and ``javascript:`` / ``vbscript:`` URLs. Adequate for an MVP whose output is a
-*downloaded* file from a trusted model source; a full DOM sanitizer is a future
-hardening if HTML is ever rendered inline in-app.
+🔒 **Security posture (decision 2026-06-23, blast radius bounded)**: we **no
+longer sanitize** the model's HTML. This is a *deliberate* relaxation, contained
+to **generated download files**: the artifact is served ``Content-Disposition:
+attachment`` and opened by the user as a local ``file://`` document — an isolated
+origin that **cannot reach ai.lxjchina cookies / storage / our app**. We do NOT
+render model HTML anywhere in our own origin. Residual risk = prompt-injection
+producing a malicious download (PM accepted). If model HTML is ever rendered
+**in-app**, this must be revisited (sandboxed iframe + DOM sanitizer).
 
 Public API:
     normalize_html(raw) -> dict         # validate + clamp into a canonical shape
@@ -26,58 +29,23 @@ Public API:
 from __future__ import annotations
 
 import html as _html
-import re
 from typing import Any
 
 import file_gen_common as common
 
 MAX_TITLE_CHARS = 200
-MAX_BODY_CHARS = 200_000
+MAX_BODY_CHARS = 400_000  # a chart dashboard with inline data can be large
 MAX_SECTIONS = 80
 MAX_PARAS_PER_SECTION = 80
 MAX_BULLETS_PER_SECTION = 80
 MAX_PARA_CHARS = 8000
 MAX_BULLET_CHARS = 1000
 
-# Tags removed wholesale (content + tag): active code, external loaders, framing,
-# and author <style> (the doc shell supplies styling; <style> can carry url()/
-# expression() vectors — the tool prompt already tells the model not to emit it).
-_DANGEROUS_BLOCK_TAGS = ("script", "iframe", "object", "embed", "noscript", "template", "style")
-# Void / standalone tags removed (no closing tag): external links, refresh metas, applets.
-_DANGEROUS_VOID_TAGS = ("link", "base")
-# URL-bearing attributes that can carry javascript:/vbscript: payloads.
-_URL_ATTRS = "href|src|formaction|action|xlink:href"
 
-
-def _sanitize_fragment(fragment: str) -> str:
-    """Best-effort strip of active/loader vectors from a model-authored HTML body.
-
-    Regex-based (not a full DOM parser) — adequate for an MVP whose output is a
-    *downloaded* file from a trusted model source. Covers the common vectors:
-    <script>/<style>/framing/loader tags, meta-refresh, inline ``on*`` handlers,
-    and ``javascript:``/``vbscript:`` URLs (both quoted and unquoted).
-    """
-    s = fragment or ""
-    # 1) block tags with their content (handles unclosed by also nuking a dangling open tag)
-    for tag in _DANGEROUS_BLOCK_TAGS:
-        s = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}\s*>", "", s, flags=re.IGNORECASE | re.DOTALL)
-        s = re.sub(rf"<{tag}\b[^>]*>", "", s, flags=re.IGNORECASE)
-        s = re.sub(rf"</{tag}\s*>", "", s, flags=re.IGNORECASE)
-    # 2) standalone loader tags
-    for tag in _DANGEROUS_VOID_TAGS:
-        s = re.sub(rf"<{tag}\b[^>]*/?>", "", s, flags=re.IGNORECASE)
-    # 3) meta refresh (redirect vector)
-    s = re.sub(r"<meta\b[^>]*http-equiv\s*=\s*['\"]?refresh[^>]*>", "", s, flags=re.IGNORECASE)
-    # 4) inline event handlers: on...="..." / '...' / unquoted
-    s = re.sub(r"\son[a-zA-Z]+\s*=\s*\"[^\"]*\"", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\son[a-zA-Z]+\s*=\s*'[^']*'", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\son[a-zA-Z]+\s*=\s*[^\s>]+", "", s, flags=re.IGNORECASE)
-    # 5) javascript:/vbscript: URLs in url-bearing attrs — quoted then unquoted.
-    s = re.sub(rf"({_URL_ATTRS})\s*=\s*([\"'])\s*(?:javascript|vbscript)\s*:[^\"']*\2",
-               r'\1=\2#\2', s, flags=re.IGNORECASE)
-    s = re.sub(rf"({_URL_ATTRS})\s*=\s*(?:javascript|vbscript)\s*:[^\s>\"']*",
-               r'\1=#', s, flags=re.IGNORECASE)
-    return s
+def _is_full_document(html: str) -> bool:
+    """True when the model already emitted a complete HTML document (use as-is)."""
+    head = (html or "").lstrip()[:256].lower()
+    return head.startswith("<!doctype") or head.startswith("<html")
 
 
 def normalize_html(raw: Any) -> dict[str, Any]:
@@ -85,10 +53,11 @@ def normalize_html(raw: Any) -> dict[str, Any]:
 
     Canonical shape::
 
-        {"title": str, "body_html": str | None, "sections": [ {heading, paragraphs, bullets} ]}
+        {"title": str, "body_html": str | None, "full_doc": bool,
+         "sections": [ {heading, paragraphs, bullets} ]}
 
-    ``body_html`` (sanitized) wins when present; otherwise ``sections`` are
-    rendered. Never raises.
+    ``body_html`` (model-authored, **not** sanitized — see module docstring) wins
+    when present; otherwise ``sections`` are rendered. Never raises.
     """
     if not isinstance(raw, dict):
         raw = {}
@@ -96,8 +65,11 @@ def normalize_html(raw: Any) -> dict[str, Any]:
 
     body_raw = raw.get("html") or raw.get("body") or raw.get("content")
     body_html: str | None = None
+    full_doc = False
     if isinstance(body_raw, str) and body_raw.strip():
-        body_html = _sanitize_fragment(body_raw[:MAX_BODY_CHARS])
+        # length-cap only; do NOT clean_text (would mangle JS/CSS/whitespace).
+        body_html = body_raw[:MAX_BODY_CHARS]
+        full_doc = _is_full_document(body_html)
 
     sections: list[dict[str, Any]] = []
     raw_sections = raw.get("sections")
@@ -114,10 +86,9 @@ def normalize_html(raw: Any) -> dict[str, Any]:
                 break
 
     if body_html is None and not sections:
-        # minimal renderable page
         sections = [{"heading": title, "paragraphs": [], "bullets": []}]
 
-    return {"title": title, "body_html": body_html, "sections": sections}
+    return {"title": title, "body_html": body_html, "full_doc": full_doc, "sections": sections}
 
 
 def _norm_str_list(raw: Any, limit_chars: int, max_items: int) -> list[str]:
@@ -161,7 +132,7 @@ _DOC_TEMPLATE = """<!DOCTYPE html>
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
       "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
     line-height: 1.7; background: #fff; }}
-  main {{ max-width: 760px; margin: 0 auto; }}
+  main {{ max-width: 960px; margin: 0 auto; }}
   h1 {{ color: var(--ink); font-size: 28px; margin: 0 0 8px;
     border-bottom: 3px solid var(--accent); padding-bottom: 12px; }}
   h2 {{ color: var(--accent); font-size: 20px; margin: 32px 0 12px; }}
@@ -172,7 +143,7 @@ _DOC_TEMPLATE = """<!DOCTYPE html>
   table {{ border-collapse: collapse; width: 100%; margin: 0 0 14px; }}
   th, td {{ border: 1px solid #e5e5e5; padding: 8px 10px; text-align: left; }}
   th {{ background: var(--accent); color: #fff; }}
-  img {{ max-width: 100%; height: auto; }}
+  img, canvas, svg {{ max-width: 100%; height: auto; }}
 </style>
 </head>
 <body>
@@ -186,8 +157,16 @@ _DOC_TEMPLATE = """<!DOCTYPE html>
 
 
 def build_html(data: Any) -> bytes:
-    """Render a (canonical or loose) payload into a standalone ``.html`` (UTF-8)."""
+    """Render a (canonical or loose) payload into a standalone ``.html`` (UTF-8).
+
+    - model wrote a **full document** → used verbatim (interactive charts intact);
+    - model wrote a **body fragment** → wrapped in the doc shell (script/style kept);
+    - **structured sections** only → rendered HTML-escaped inside the shell.
+    """
     data = normalize_html(data)
+    if data["body_html"] is not None and data["full_doc"]:
+        # model authored a complete page (e.g. chart.js dashboard) — use as-is.
+        return data["body_html"].encode("utf-8")
     title_esc = _html.escape(data["title"])
     body = data["body_html"] if data["body_html"] is not None else _render_sections(data["sections"])
     doc = _DOC_TEMPLATE.format(title=title_esc, accent=common.accent_hex(), body=body)
@@ -201,34 +180,28 @@ def safe_filename(title: str, ext: str = "html") -> str:
 if __name__ == "__main__":  # pragma: no cover — local smoke test
     import sys
 
-    # Sanitizer unit assertions — test the FRAGMENT cleaner directly (the full doc
-    # always contains the shell's own legitimate <style>, so assert on the fragment).
-    malicious = (
-        "<h2>ok</h2>"
-        "<script>alert('xss')</script>"  # block tag + content
-        "<style>body{background:url(javascript:alert(2))}</style>"  # author style block
-        "<a href=\"javascript:alert(1)\">q</a>"  # quoted js:
-        "<a href=javascript:alert(3)>u</a>"  # UNQUOTED js: (P1-2)
-        "<button formaction=javascript:alert(4)>b</button>"  # formaction
-        "<img src=x onerror=alert(5)>"  # inline handler
+    # 1) full document with chart.js → preserved verbatim (interactive charts work)
+    full = (
+        "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        "<title>成绩看板</title><script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>"
+        "</head><body><canvas id=\"c\"></canvas>"
+        "<script>new Chart(document.getElementById('c'),{type:'bar',data:{labels:['语文','数学'],datasets:[{data:[88,95]}]}});</script>"
+        "</body></html>"
     )
-    cleaned = _sanitize_fragment(malicious).lower()
-    assert "<script" not in cleaned, "script not stripped!"
-    assert "<style" not in cleaned, "author style not stripped!"
-    assert "javascript:" not in cleaned, "js url not neutralized!"
-    assert "onerror" not in cleaned, "inline handler not stripped!"
-    assert "<h2>ok</h2>" in cleaned, "benign content wrongly removed!"
+    out_full = build_html({"title": "成绩看板", "html": full}).decode("utf-8")
+    assert "<script" in out_full and "chart.js" in out_full and "new Chart" in out_full, "full-doc script not preserved!"
+    assert out_full.count("<!DOCTYPE") == 1, "full doc should not be double-wrapped"
 
-    sample = {
-        "title": "产品发布说明",
-        "html": (
-            "<h2>核心特性</h2><p>本次发布带来三项能力。</p>"
-            "<ul><li>多类型文件生成</li><li>自动识别意图</li></ul>"
-        ),
-    }
-    data = build_html(sample)
+    # 2) body fragment with a script → wrapped in shell, script kept
+    frag = build_html({"title": "图表", "html": "<canvas id='x'></canvas><script>console.log('ok')</script>"}).decode("utf-8")
+    assert "<script>console.log('ok')</script>" in frag and frag.count("<!DOCTYPE") == 1, "fragment script not kept / not wrapped"
+
+    # 3) structured sections → escaped rendering in shell
+    structured = build_html({"title": "说明", "sections": [{"heading": "概述", "bullets": ["要点A", "要点B"]}]}).decode("utf-8")
+    assert "<h2>概述</h2>" in structured and "要点A" in structured
+
     out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/sample.html"
     with open(out, "wb") as f:
-        f.write(data)
-    print(f"OK: {len(data)} bytes, sanitizer assertions passed → {out}")
-    print(f"filename: {safe_filename(sample['title'])}")
+        f.write(out_full.encode("utf-8"))
+    print(f"OK: full-doc {len(out_full)}B (script preserved) + fragment + structured 全部通过 → {out}")
+    print(f"filename: {safe_filename('成绩看板')}")
