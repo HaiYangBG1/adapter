@@ -1847,15 +1847,21 @@ _ARTIFACT_EXT_MIME: dict[str, str] = {
 # v0.6.3 B+(2026-06-23 PM 拍「方案2 自由写 HTML + 卡片一致」):generate_html 工具只收
 # 短 brief(模型填短参不偷懒);拦截后由本 builder **单独发一个自由生成调用**让模型自由
 # 写出完整含图表 HTML(自由写=模型强项,实测工具长 string arg 写空壳)。再走文件卡流程。
+# v0.6.5(2026-06-23):viz live 验证抓到 8000 token 截断 —— 模型把预算全花在华丽 CSS,
+# 到不了末尾的 `<script>new Chart()</script>` 初始化脚本 → 下载件是空 canvas、图表不渲染。
+# 修:prompt 加「篇幅纪律」逼模型优先保证图表脚本完整(宁可样式朴素),并把图表初始化
+# 显式列为「最关键、必须完整写完」。配合 MAX_TOKENS 适度抬到 10000(见下)。
 HTML_BUILDER_PROMPT = (
-    "你是一个网页生成器。根据用户给的标题和需求,写出一个**完整、内容充实、可直接双击打开**"
-    "的单文件 HTML 页面。\n"
-    "- 输出 `<!DOCTYPE html>` 开头的完整文档(<head> 含标题 + <style> 样式,<body> 内容)。\n"
-    "- **可视化 / 看板 / 图表需求必须用 chart.js 画真实交互图表**:在 <head> 引入 "
+    "你是一个网页生成器。根据用户给的标题和需求,写出一个**完整、可直接双击打开**的单文件 HTML 页面。\n"
+    "- 输出从 `<!DOCTYPE html>` 开头到 `</html>` 结尾的**完整**文档,中途绝不截断。\n"
+    "- **可视化 / 看板 / 图表需求必须用 chart.js 画真实交互图表**:<head> 引入 "
     "`<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>`,<body> 放 <canvas>,"
-    "末尾 <script> 用 `new Chart(...)` 填入数据初始化。柱/折线/饼按数据语义选。\n"
-    "- 用户没给具体数据就用合理示例数据把图表 / 表格填满,绝不留空。\n"
-    "- 样式美观克制(主色 #008042),响应式;中文内容直接写中文。\n"
+    "**文档末尾的 <script> 里用 `new Chart(...)` 把每一个 <canvas> 都初始化、填上数据 —— "
+    "这是图表能不能显示的关键,必须完整写完,绝不能写一半。柱/折线/饼按数据语义选。**\n"
+    "- ⚠️ **篇幅纪律**:CSS 样式克制简洁(主色 #008042,响应式即可),**不要写大段动画/渐变/"
+    "装饰性样式**;把 token 预算优先留给「结构 + 每个图表的 `new Chart()` 初始化脚本完整输出」,"
+    "宁可样式朴素也绝不能让末尾的图表脚本被截断。\n"
+    "- 用户没给具体数据就用合理示例数据把图表填满,绝不留空;中文内容直接写中文。\n"
     "- **只输出完整 HTML 源码**,不要任何解释文字,不要 markdown 代码围栏(```)。"
 )
 # v0.6.4(2026-06-23):默认 150→240。viz live 自验(ECS→adapter 复刻 BFF gen_file
@@ -1866,7 +1872,10 @@ HTML_BUILDER_PROMPT = (
 # 抬超时(给 ~33 tok/s 留余量),max_tokens 8000 不动。⚠️ builder 运行期 adapter→下游
 # SSE 静默,真机验收须确认 240s 静默不被内层 LB idle 掐(150s 静默此前 ECS 实测可活)。
 _HTML_BUILDER_TIMEOUT = int(os.environ.get("ADAPTER_HTML_BUILDER_TIMEOUT", "240"))
-_HTML_BUILDER_MAX_TOKENS = int(os.environ.get("ADAPTER_HTML_BUILDER_MAX_TOKENS", "8000"))
+# v0.6.5:8000→10000。viz live 验证:8000 token 不够模型写完一个完整看板,末尾图表
+# 初始化脚本被截断(空 canvas 不渲染)。抬到 10000 给完整 `new Chart()` 脚本留头 +
+# 上方 prompt「篇幅纪律」逼模型别在 CSS 上挥霍 token。10000@~56tok/s≈178s,仍 <240 超时。
+_HTML_BUILDER_MAX_TOKENS = int(os.environ.get("ADAPTER_HTML_BUILDER_MAX_TOKENS", "10000"))
 
 
 def _strip_md_fence(text: str) -> str:

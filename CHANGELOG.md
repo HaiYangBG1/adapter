@@ -7,7 +7,22 @@
 
 ---
 
-## [v0.6.4-20260623] — viz builder 超时修复 + K2.6 工具 token 流式泄漏清洗 · 🚧 待部署
+## [v0.6.5-20260623] — viz HTML 截断修复:篇幅纪律 prompt + max_tokens 10000 · 🚧 待部署
+> **v0.6.4 上线后 viz live 自验**(ECS→adapter 直打,真调 generate_html 一次:`ok=true` 142s
+> builder 完成、artifact `ready` 24KB、无泄漏 —— **timeout + 泄漏修复证实有效**)发现**新坏法**:产物
+> 被 `max_tokens=8000` **截断** —— 模型把预算全花在华丽 CSS,文档在「产品线占比」标题处戛然而止,
+> **末尾 `<script>new Chart()</script>` 初始化脚本整段被切**(只剩 1 个空 `<canvas>`,无 `new Chart()`、
+> 不以 `</html>` 收尾)→ 下载件是空 canvas、图表不渲染。v0.6.4「保 8000 token 求丰富度」前提被证伪
+> (8000 不够写完一个完整看板)。
+> - **`HTML_BUILDER_PROMPT` 加「篇幅纪律」**:逼模型 CSS 克制、把 token 预算优先留给「结构 + 每个图表的
+>   `new Chart()` 初始化脚本**完整写完**」,并显式声明图表初始化是「能不能显示的关键、必须完整」。
+> - **`_HTML_BUILDER_MAX_TOKENS` 8000→10000**(默认):给完整图表脚本留头;10000@~56tok/s≈178s 仍 <240
+>   超时,timeout 不动。env 旋钮名不变。
+> - 本地:py_compile 绿 + 知识点(MAX_TOKENS=10000 / prompt 含篇幅纪律)+ leak guard 回归无破。
+> - 🔴 验收:部署后 ECS→adapter 自验「可视化看板」→ 产物须 **以 `</html>` 收尾 + 含 ≥1 个 `new Chart()` +
+>   canvas 数==图表数**(完整渲染),才算闭环。
+
+## [v0.6.4-20260623] — viz builder 超时修复 + K2.6 工具 token 流式泄漏清洗 · ✅ 已上线(digest 122ef5df,ChangeOrder a6be3c7e ~55s,PreStop 保留)
 > **全栈 viz live 自验**(绕 B6 BFF 鉴权,从 VPC 内 ECS RunCommand 直打 adapter pod 复刻 gen_file
 > 请求)发现 v0.6.3 的「可视化看板」**生产稳定失败**:`generate_html` 的 `_call_upstream_html_builder`
 > 非流式串行生成一个完整含 chart.js 的仪表盘(~8000 token @K2.6 ~50 tok/s)耗时 ≈ 150s,**恰好顶满
