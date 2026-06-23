@@ -7,7 +7,7 @@
 
 ---
 
-## [v0.6.5-20260623] — viz HTML 截断修复:篇幅纪律 prompt + max_tokens 10000 · 🚧 待部署
+## [v0.6.5-20260623] — viz HTML 截断修复:篇幅纪律 prompt + max_tokens 10000 · ✅ 已上线(digest ccf76a06,ChangeOrder ac7105b1,PreStop 保留)
 > **v0.6.4 上线后 viz live 自验**(ECS→adapter 直打,真调 generate_html 一次:`ok=true` 142s
 > builder 完成、artifact `ready` 24KB、无泄漏 —— **timeout + 泄漏修复证实有效**)发现**新坏法**:产物
 > 被 `max_tokens=8000` **截断** —— 模型把预算全花在华丽 CSS,文档在「产品线占比」标题处戛然而止,
@@ -19,8 +19,12 @@
 > - **`_HTML_BUILDER_MAX_TOKENS` 8000→10000**(默认):给完整图表脚本留头;10000@~56tok/s≈178s 仍 <240
 >   超时,timeout 不动。env 旋钮名不变。
 > - 本地:py_compile 绿 + 知识点(MAX_TOKENS=10000 / prompt 含篇幅纪律)+ leak guard 回归无破。
-> - 🔴 验收:部署后 ECS→adapter 自验「可视化看板」→ 产物须 **以 `</html>` 收尾 + 含 ≥1 个 `new Chart()` +
->   canvas 数==图表数**(完整渲染),才算闭环。
+> - ✅ **全栈 ECS→adapter 自验出图 PASS**:批量 4 连发全完美 —— 产物以 `</html>` 收尾、2 canvas、
+>   2 个 `new Chart()`(`type:'line'` 季度趋势 + `type:'pie'` 产品线占比,真数据 120/150/180/210,
+>   交互 tooltip/hover,主色 #008042)。**篇幅纪律生效**:产物精炼到 ~10-13KB(v0.6.4 截断版是 24-35KB)、
+>   builder ~55-69s 完成(远低于 240 超时,也低于怕的 3-4min)。`ok=true` 无泄漏。**timeout/截断/泄漏三坑全闭环**。
+>   🔴 剩(非 adapter):① 登录态 BFF E2E 带图(测试域,规则⑧;BFF 只代理、未改,风险低)② model 偶发
+>   「narrate 不调 generate_html」(~20-30% 样本,intent-leak 守卫漏认「我来」)= 独立 follow-up,见 status/全栈。
 
 ## [v0.6.4-20260623] — viz builder 超时修复 + K2.6 工具 token 流式泄漏清洗 · ✅ 已上线(digest 122ef5df,ChangeOrder a6be3c7e ~55s,PreStop 保留)
 > **全栈 viz live 自验**(绕 B6 BFF 鉴权,从 VPC 内 ECS RunCommand 直打 adapter pod 复刻 gen_file
