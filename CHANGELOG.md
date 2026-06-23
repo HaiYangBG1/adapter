@@ -7,7 +7,7 @@
 
 ---
 
-## [v0.6.8-20260624] — file_gen auto 路径 narrate 续轮兜底:治 ~20-30%「我来生成…」不出文件 · 🟡 待部署
+## [v0.6.8-20260624] — file_gen auto 路径 narrate 续轮兜底:治 ~20-30%「我来生成…」不出文件 · ✅ 已上线(digest b919c587,ChangeOrder d0c43759,PreStop+33env 保留)
 > **背景**:B9(v0.6.6)「生成文件」force chip(`tool_choice=required`)已治**显式**路径 narrate(force 16 次 0 narrate);但 **auto** 路径(`gen_file:true` 不含 `gen_file_force` —— 前端 `detectFileGenIntent` 预路由命中、用户没点 chip)仍 `tool_choice=auto`,给模型「不生成只文字」退路 → 偶发 ~20-30% 只回「我来为您生成一个 Excel…」**不 emit tool_call**,用户干等拿不到文件。NOW.md 🟡 viz follow-up 登记的独立项。
 > **根因(双重,比文档记的更深)**:① **检测漏** —— 既有全局 intent-leak 检测器(`_INTENT_LEAD_PHRASES`/`_INTENT_NARRATE_RE`/`_DANGLING_INTENT_RE`)是给 web/excel「查询/分析」场景调校的:引导词无「我来」、动作词只有 查询/分析/调用/获取…,**完全漏掉 file_gen 场景的「我来…生成…文件」**;② **续轮强制不了** —— 就算命中,file_gen auto 不设 `force_required_tool`/`force_first_tool_name`,intent-leak 续轮的 `force_tool_choice_next` 在主循环两个强制分支都进不去 → 续轮仍 `auto`,模型可能继续 narrate。
 > **修(architecture 兜底为主、prompt 为辅;只在 file_gen auto 叠加 → web/excel/pptx 零回归)**:
@@ -18,7 +18,7 @@
 > - **prompt 强化**:`FILE_GEN_PROMPT` + `FILE_GEN_FORCE_PROMPT`【严禁】段对称补「禁止只宣告我来生成…却不 emit tool_call」。
 > - **自测**:py_compile 绿 + **检测函数真代码单测 21/21**(11 POS narrate 含大写 Excel/PPT、口语「要不我来做」全命中;10 NEG 分析/解读/建议/提议/征询全放过)+ **reviewer 核查门过**(逻辑「首轮 auto/续轮 required」、B9 零影响、web·excel·pptx 零回归、A 铁律 全 PASS;P0 契约登记 / P2 prompt 同步+注释 已补;误伤实测确认 borderline「我来做个图表方案」命中=可接受〈auto 语境前端已判文件意图,强制出图符合原意〉)。
 > - 🔴 **gotcha(reviewer P1-1)**:`AgentConfig.max_intent_leak_retries` dataclass 默认 0(generic 模块保守语义)、生产经 `ADAPTER_AGENT_MAX_INTENT_LEAK_RETRIES`(env 默认 1)注入才生效;**独立单测直接 `AgentConfig()` 须显式设 =1**,否则续轮静默不触发(false negative)。
-> - **待**:部署(授权,image-only env 不动 + `--PreStop`)→ ECS→pod auto 自验复刻 narrate(直打 pod `gen_file:true` 不带 force)→ 测试域 authed E2E auto 路径 N 次统计 narrate 率。⚠️ **无请求字段 / SSE 信封变更,前端无感**(`contracts/PROTOCOL.md` §4 已登记)。
+> - **✅ 已上线(2026-06-24)**:fast_path 增量 build(FROM `v0.6.7-20260623`,镜像内自检 `SELFCHECK_OK file_gen exts` PASS,digest `b919c587…`,git `62f609b`)→ SAE image-only 部署(ChangeOrder `d0c43759` Status→2 ~70s;`describeApplicationConfig` 核 ImageUrl=v0.6.8 + PreStop sleep25 保留 + 33 env 保留 + Replicas=2;2 pod healthy `version=v0.6.8 git_sha=62f609b`)。**ECS→pod auto 自验**(绕 B6 直打 pod,`gen_file:true` **不带 force**):viz html **3/4 出文件 ready**(60/86/113s),第 4 次 builder 慢被客户端 `--max-time` 切断(非 narrate,narrate痕迹=0)→ **auto 路径不回归坐实**;这几次模型均首轮直接出文件(未自然触发 narrate,~20-30% 没碰上),续轮兜底逻辑由单测 21/21 + reviewer 保证,**生产 narrate 率统计 → 测试域 authed E2E**。漂移基线刷 v0.6.7→v0.6.8。⚠️ **无请求字段 / SSE 信封变更,前端无感**(`contracts/PROTOCOL.md` §4 已登记)。runbook `lxj-adapter-deploy/runbooks/deploy-2026-06-24-adapter-v0.6.8-narrate.md`。
 
 ## [v0.6.7-20260623] — viz HTML builder 改流式:治 504 ~37%(撞 183s 静默墙)· ✅ 已上线(digest 225ba9d1,ChangeOrder b8de07a4,PreStop 保留)
 > **上线 + ECS→pod 真 builder 自验 PASS**(2026-06-23):image-only 部署(33env+PreStop sleep25 保留,Replicas 2)。**慢 viz 不再 504**:两个刻意详尽的 viz `gen_file` 请求 —— 199s「全国多分公司经营看板.html」46660B + 184s「电商运营数据大屏.html」33179B —— **都 >183s 墙且都出 ready 文件**(修复前这正是 504 的耗时区:测试域见 504 都 ≥184s)。漂移基线刷 v0.6.6→v0.6.7。配套前端 0.17.7 同期。🟡 治"慢"不治"大":超大文件截断/退化 = 分多步生成另立项(用户已记下、当下未决)。
