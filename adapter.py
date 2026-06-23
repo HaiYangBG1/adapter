@@ -3359,6 +3359,10 @@ class Handler(BaseHTTPRequestHandler):
                 # auto(意图预路由命中):tool_choice=auto,模型自决类型 / 是否生成
                 #(只是聊天/分析则直接文字作答)。不设 force_required_tool / force_first。
                 cfg.system_prompt = FILE_GEN_PROMPT
+                # v0.6.8(A)narrate 修:首轮仍 auto 自决(不硬出文件),但若模型 narrate
+                # 「我来为您生成…」不 emit tool_call → intent-leak 续轮强制 required 逼出
+                # 文件(治 auto 路径 ~20-30% narrate)。见 agentic_web AgentConfig 字段注释。
+                cfg.force_required_on_intent_leak = True
         else:
             registry = _build_agent_registry(excel_dataset_id, enable_plan=enable_plan_for_request)
         # 带数据集时,**整体替换**为 Excel 专用系统提示词(而非在联网提示词上追加)

@@ -7,6 +7,19 @@
 
 ---
 
+## [v0.6.8-20260624] — file_gen auto 路径 narrate 续轮兜底:治 ~20-30%「我来生成…」不出文件 · 🟡 待部署
+> **背景**:B9(v0.6.6)「生成文件」force chip(`tool_choice=required`)已治**显式**路径 narrate(force 16 次 0 narrate);但 **auto** 路径(`gen_file:true` 不含 `gen_file_force` —— 前端 `detectFileGenIntent` 预路由命中、用户没点 chip)仍 `tool_choice=auto`,给模型「不生成只文字」退路 → 偶发 ~20-30% 只回「我来为您生成一个 Excel…」**不 emit tool_call**,用户干等拿不到文件。NOW.md 🟡 viz follow-up 登记的独立项。
+> **根因(双重,比文档记的更深)**:① **检测漏** —— 既有全局 intent-leak 检测器(`_INTENT_LEAD_PHRASES`/`_INTENT_NARRATE_RE`/`_DANGLING_INTENT_RE`)是给 web/excel「查询/分析」场景调校的:引导词无「我来」、动作词只有 查询/分析/调用/获取…,**完全漏掉 file_gen 场景的「我来…生成…文件」**;② **续轮强制不了** —— 就算命中,file_gen auto 不设 `force_required_tool`/`force_first_tool_name`,intent-leak 续轮的 `force_tool_choice_next` 在主循环两个强制分支都进不去 → 续轮仍 `auto`,模型可能继续 narrate。
+> **修(architecture 兜底为主、prompt 为辅;只在 file_gen auto 叠加 → web/excel/pptx 零回归)**:
+> - **`AgentConfig.force_required_on_intent_leak`**(新字段):file_gen auto 专用。**首轮仍 auto**(`force_tool_choice_next` 首轮为 False → 不进 required 分支,模型自决要不要出文件、只聊天/分析不硬出);**仅当本轮 narrate-then-stop 命中**,续轮才升 `tool_choice=required` 逼出文件。兼作「当前 file_gen auto 模式」标记。`adapter.py` file_gen auto 分支置 True(B9 force 分支不设、仍 `force_required_tool=True`)。
+> - **`_looks_like_file_gen_narrate()` + `_FILE_GEN_NARRATE_RE`(re.IGNORECASE)+ `_FILE_GEN_OFFER_RE`**(新检测):引导词(我来/这就/我马上/让我/我帮你…)+ 动作(生成/制作/做/导出/创建/整理成/写…,**故意不含「分析」**)+ 文件类名词(文件/表格/Excel/PPT/Word/HTML/看板/图表/csv…)。只看**开头 40 字**(narrate-then-stop 开门见山宣告,天然避开句中「…如果需要我可以生成」提议)+ **征询排除**(「要不要我帮你做个表?」是完整问句、不强制)。
+> - **叠加点**:`run_agent_stream` content 路径 `looks_intent`(流式主路径,命中→续轮 required **真出文件**)+ `_finalize_answer` `needs_synthesis`(非流式终结兜底,命中→合成文字,出不了文件但比 narrate 戛然而止强)。两处均以 `cfg.force_required_on_intent_leak and …` 短路 → 其他模式根本不调用新检测。
+> - **续轮强制分支**:`if … and (cfg.force_required_tool or (cfg.force_required_on_intent_leak and force_tool_choice_next))` —— file_gen auto 续轮复用 B9 已验证的 `required + 全 generate_*` 出文件路径(**等价回归**,无新出文件风险)。
+> - **prompt 强化**:`FILE_GEN_PROMPT` + `FILE_GEN_FORCE_PROMPT`【严禁】段对称补「禁止只宣告我来生成…却不 emit tool_call」。
+> - **自测**:py_compile 绿 + **检测函数真代码单测 21/21**(11 POS narrate 含大写 Excel/PPT、口语「要不我来做」全命中;10 NEG 分析/解读/建议/提议/征询全放过)+ **reviewer 核查门过**(逻辑「首轮 auto/续轮 required」、B9 零影响、web·excel·pptx 零回归、A 铁律 全 PASS;P0 契约登记 / P2 prompt 同步+注释 已补;误伤实测确认 borderline「我来做个图表方案」命中=可接受〈auto 语境前端已判文件意图,强制出图符合原意〉)。
+> - 🔴 **gotcha(reviewer P1-1)**:`AgentConfig.max_intent_leak_retries` dataclass 默认 0(generic 模块保守语义)、生产经 `ADAPTER_AGENT_MAX_INTENT_LEAK_RETRIES`(env 默认 1)注入才生效;**独立单测直接 `AgentConfig()` 须显式设 =1**,否则续轮静默不触发(false negative)。
+> - **待**:部署(授权,image-only env 不动 + `--PreStop`)→ ECS→pod auto 自验复刻 narrate(直打 pod `gen_file:true` 不带 force)→ 测试域 authed E2E auto 路径 N 次统计 narrate 率。⚠️ **无请求字段 / SSE 信封变更,前端无感**(`contracts/PROTOCOL.md` §4 已登记)。
+
 ## [v0.6.7-20260623] — viz HTML builder 改流式:治 504 ~37%(撞 183s 静默墙)· ✅ 已上线(digest 225ba9d1,ChangeOrder b8de07a4,PreStop 保留)
 > **上线 + ECS→pod 真 builder 自验 PASS**(2026-06-23):image-only 部署(33env+PreStop sleep25 保留,Replicas 2)。**慢 viz 不再 504**:两个刻意详尽的 viz `gen_file` 请求 —— 199s「全国多分公司经营看板.html」46660B + 184s「电商运营数据大屏.html」33179B —— **都 >183s 墙且都出 ready 文件**(修复前这正是 504 的耗时区:测试域见 504 都 ≥184s)。漂移基线刷 v0.6.6→v0.6.7。配套前端 0.17.7 同期。🟡 治"慢"不治"大":超大文件截断/退化 = 分多步生成另立项(用户已记下、当下未决)。
 > **测试域生产实证 escalate**(B9 收口附带,orthogonal 非 force):`generate_html` viz 生产 **504 ~37%**,
