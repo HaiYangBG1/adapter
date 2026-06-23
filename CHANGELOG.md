@@ -7,6 +7,30 @@
 
 ---
 
+## [v0.6.6-B9] — 「生成文件」force 单开关:tool_choice=required 治 narrate · 🟡 code-complete 待部署
+> **B9 工单**(`pm/五期-需求-生成文件单开关-B9.md`):旧「生成 PPT」chip 泛化为「生成文件」force 单开关。
+> 命门 = 治 narrate —— file_gen auto 模式(`tool_choice=auto`)给模型「不生成只文字作答」的退路,
+> 偶发 ~20-30% 只回「我来为您生成…」不出文件;force 用 `tool_choice="required"` 杜绝该退路,模型
+> 只能从 generate_* 里选一个调 → 出文件率 ~100%。
+> - **新请求字段 `gen_file_force:true`**(隶属 `gen_file`):chip 开 → adapter 在 file_gen 模式内把
+>   `tool_choice` 升为 `required`(挂全部 generate_*,模型**只判类型、强制必调其一**)。
+> - **`AgentConfig.force_required_tool`**(新字段):True 时主循环 `_force_this_turn` 处注入
+>   `tool_choice="required"`(与 `force_first_tool_name` 的 named-tool 分支互斥,required 分支优先)。
+> - **`FILE_GEN_FORCE_PROMPT`**(新 prompt):去掉 auto prompt 的「先判断要不要生成」整段,只留「选哪种
+>   类型 + 填全参数」—— 用户已点 chip 明确要文件,不该再留犹豫空间。
+> - **adapter.py**:`gen_file_force_req` 读(顶层 + extra_body)→ `file_gen_mode` 分支按 force/auto 分流
+>   (force=FORCE_PROMPT+force_required_tool;auto 不变);`gen_file_force` 同 `gen_pptx`/`gen_file` 从上游
+>   payload 双层剔除(私有控制字段不透传)。旧 `gen_pptx` 路径保留兼容(前端已停发)。
+> - 🔴 **先验**:`tool_choice=required` 在 K2.6/vLLM0.18 **实测支持**(生产网关 `lxj` 裸名,required+
+>   thinking-off → tool_calls:1、finish_reason=tool_calls、模型选对 generate_xlsx)。老 SGLang 0.5.9
+>   「指定工具名比 required 稳」顾虑(v0.2.25 runbook)对新引擎过时。
+> - 🔴 **铁律**:force 轮必须关 thinking —— 实测开 thinking 时 reasoning 2500 token 还没 emit 就
+>   `finish_reason=length` 出不来 tool_call;adapter 首轮 `intermediate_thinking_enabled` 默认 False
+>   已满足。
+> - 自测:py_compile 绿 + reviewer 核查门两端过(无 P0;P1×2 文档已修)+ 前端 tsc 绿。
+> - **待**:部署(授权,带 `--PreStop`,runbook)→ `/health` 不变(force 是 per-request 非 capability)
+>   → 测试域 force 治 narrate N≥10 出文件率带图实测(命门证据)。
+
 ## [v0.6.5-20260623] — viz HTML 截断修复:篇幅纪律 prompt + max_tokens 10000 · ✅ 已上线(digest ccf76a06,ChangeOrder ac7105b1,PreStop 保留)
 > **v0.6.4 上线后 viz live 自验**(ECS→adapter 直打,真调 generate_html 一次:`ok=true` 142s
 > builder 完成、artifact `ready` 24KB、无泄漏 —— **timeout + 泄漏修复证实有效**)发现**新坏法**:产物

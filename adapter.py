@@ -49,6 +49,7 @@ from agentic_web import (
     EXCEL_AGENT_PLAN_PROMPT,  # v0.3.0 D Phase 1
     EXCEL_QUERY_TOOL,
     FILE_GEN_PROMPT,     # v0.6.0 B+ 自动识别模式系统提示词
+    FILE_GEN_FORCE_PROMPT,  # v0.6.6 B9「生成文件」force 单开关系统提示词
     GENERATE_PPTX_TOOL,  # v0.5.0 B 文件生成 MVP(显式 PPTX 模式)
     PPTX_GEN_PROMPT,     # v0.5.0 B 文件生成 MVP(显式 PPTX 模式)
     SUBMIT_ANALYSIS_PLAN_TOOL,  # v0.3.0 D Phase 1
@@ -3299,6 +3300,10 @@ class Handler(BaseHTTPRequestHandler):
         #     模型自决类型 / 是否生成(轻量意图预路由把疑似文件请求导到这条)。
         gen_pptx_req = bool(payload.get("gen_pptx")) or bool(_client_extra_body_check.get("gen_pptx"))
         gen_file_req = bool(payload.get("gen_file")) or bool(_client_extra_body_check.get("gen_file"))
+        # v0.6.6 B9:「生成文件」chip 显式开关 → file_gen 模式内把 tool_choice 升为
+        #   required(force 必出文件,模型只判类型,治 narrate)。隶属 gen_file,仅在
+        #   file_gen_mode 内生效(单独发 gen_file_force 而无 gen_file 不触发)。
+        gen_file_force_req = bool(payload.get("gen_file_force")) or bool(_client_extra_body_check.get("gen_file_force"))
         pptx_mode = gen_pptx_req and ADAPTER_ENABLE_FILE_GEN and _FILE_GEN_AVAILABLE
         file_gen_mode = (
             gen_file_req and not pptx_mode and ADAPTER_ENABLE_FILE_GEN and _FILE_GEN_AVAILABLE
@@ -3318,13 +3323,21 @@ class Handler(BaseHTTPRequestHandler):
             cfg.file_renderer = _make_file_renderer()
             cfg.citation_guard = False  # 文件生成无 URL 概念,关引用合规审计
         elif file_gen_mode:
-            # v0.6.0 B+:挂全部 generate_*,不强制(tool_choice=auto),模型自决类型/是否生成。
+            # v0.6.0 B+:挂全部 generate_*,模型自决类型;auto 还是 force 看 gen_file_force。
             registry = _build_agent_registry(enable_file_gen=True)
-            cfg.system_prompt = FILE_GEN_PROMPT
             cfg.enable_file_gen = True
-            # 不设 force_first_tool_name → auto;模型可选择不生成、直接文字作答。
             cfg.file_renderer = _make_file_renderer()
             cfg.citation_guard = False
+            if gen_file_force_req:
+                # v0.6.6 B9 force(「生成文件」chip 开):tool_choice=required,模型**只判
+                # 类型、强制必调其一**(治 narrate)。换 FORCE prompt(去掉「先判断要不要
+                # 生成」整段)。force 轮 thinking 由 _build_iteration_extra 默认关。
+                cfg.system_prompt = FILE_GEN_FORCE_PROMPT
+                cfg.force_required_tool = True
+            else:
+                # auto(意图预路由命中):tool_choice=auto,模型自决类型 / 是否生成
+                #(只是聊天/分析则直接文字作答)。不设 force_required_tool / force_first。
+                cfg.system_prompt = FILE_GEN_PROMPT
         else:
             registry = _build_agent_registry(excel_dataset_id, enable_plan=enable_plan_for_request)
         # 带数据集时,**整体替换**为 Excel 专用系统提示词(而非在联网提示词上追加)
@@ -3373,15 +3386,17 @@ class Handler(BaseHTTPRequestHandler):
                 "parallel_tool_calls", "excel_dataset_id", "extra_body",
                 "gen_pptx",  # v0.5.0 B:adapter 私有控制字段,不透传上游
                 "gen_file",  # v0.6.0 B+:同上(自动多类型触发字段)
+                "gen_file_force",  # v0.6.6 B9:同上(force 单开关字段)
             }
         }
         # extra_body 字段不能覆盖顶层已有同名键(顶层优先 —— 保留显式控制权)
         for _k, _v in client_extra_body.items():
             extra.setdefault(_k, _v)
-        # v0.5.0 B / v0.6.0 B+:gen_pptx / gen_file 可能从 extra_body 解包进来 —— 在
-        # setdefault 之后剔除,确保不透传上游(adapter 私有控制字段)。
+        # v0.5.0 B / v0.6.0 B+ / v0.6.6 B9:gen_pptx / gen_file / gen_file_force 可能从
+        # extra_body 解包进来 —— 在 setdefault 之后剔除,确保不透传上游(adapter 私有字段)。
         extra.pop("gen_pptx", None)
         extra.pop("gen_file", None)
+        extra.pop("gen_file_force", None)
         # Inject a sane max_tokens default when the client didn't set one —
         # agentic answers need headroom or they truncate mid-thought.
         if not extra.get("max_tokens") and not extra.get("max_completion_tokens"):
