@@ -7,6 +7,20 @@
 
 ---
 
+## [v0.6.3-20260623] — viz 方案2:generate_html 自由生成 + 卡片一致 · ✅ 已上线(live 验证 gated)
+> PM 拍「方案2 自由写 HTML + 卡片一致」(decisions 2026-06-23 viz 行)。解 v0.6.1/v0.6.2 的「模型
+> 在工具长 string arg 写空壳」:**短 brief 工具参数 + 拦截后单独自由生成调用**两全。
+> - `GENERATE_HTML_TOOL` 改收短 `brief`(模型填短参不偷懒,绕开长 string arg 弱点);`FILE_GEN_PROMPT` html 段同步。
+> - adapter `HTML_BUILDER_PROMPT` + `_call_upstream_html_builder`(无工具、自由生成的上游调用,模型写完整含
+>   chart.js 的 HTML,自由写=强项)+ `_strip_md_fence`(抠净 HTML 去围栏);`_render` special-case generate_html
+>   走 builder→`html_generator.build_html`(full-doc 直用)→OSS→文件卡(与 pptx/xlsx 同款三态卡,UX 一致)。
+>   env 旋钮 `ADAPTER_HTML_BUILDER_TIMEOUT`(默认 150s)/`ADAPTER_HTML_BUILDER_MAX_TOKENS`(默认 8000)。
+> - 本地全验:`_strip_md_fence`(raw / fenced+解释抠净 script 保留)+ renderer html 分支(mock 上游)+ 空返回
+>   优雅 error + 5 类型 dispatch 重构无回归;镜像内自检 file_gen 5 类。git `be8c9da`,digest `576a6ce7…`,
+>   ChangeOrder `e5781d4e`。image-only(env 不动)。
+> - ⚠️ **live 验证 gated**:B6 文件路由鉴权(前端 0.17.4)后无法无登录 BFF 触发 gen_file 验证 → 交 PM 登录态
+>   实测「给我一个可视化看板」是否出 chart.js 图 / 或测试域 authed E2E。模型自由写富 HTML 有截图实证,风险有限。
+
 ## [v0.6.2-20260623] — generate_html 允许 js(可视化)· ✅ 已上线(⚠️ viz 成色待解)
 > PM 拍「允许 js」(decisions 2026-06-23):让「可视化看板」能有 chart.js 交互图。
 > - **v0.6.1**:`html_generator` 停止消毒,允许 `<script>/<style>/图表库`;full-doc 直用 / fragment 套壳。
