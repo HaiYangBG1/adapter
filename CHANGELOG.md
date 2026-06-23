@@ -7,7 +7,8 @@
 
 ---
 
-## [v0.6.6-B9] — 「生成文件」force 单开关:tool_choice=required 治 narrate · 🟡 code-complete 待部署
+## [v0.6.6-20260623] — 「生成文件」force 单开关:tool_choice=required 治 narrate · ✅ 已上线(digest 82d3f934,ChangeOrder d89ab452,PreStop 保留)
+> **上线 + 全栈 ECS→pod force 自验 PASS**(2026-06-23):`/health` `version=v0.6.6 git_sha=dce2577 file_gen_enabled=true object_storage.configured=true`;**force 自验 4 类型全出文件**(`gen_file_force:true` 直打 pod):xlsx 各门店销售情况.xlsx 5306B / pptx Q4营收复盘.pptx 52766B / docx 项目实施方案.docx 38075B / **html 各产品线销售额可视化看板.html 9401B**(auto 模式 narrate 重灾区,force 下稳定出文件)—— **命门「force 治 narrate + 类型自判」机制证实**。image-only 部署(33 env + PreStop sleep25 保留,Replicas 2);漂移基线刷 v0.6.5→v0.6.6。配套前端 0.17.6 同期。剩 = 测试域 N≥10 统计带图 + 前端 BFF authed E2E。
 > **B9 工单**(`pm/五期-需求-生成文件单开关-B9.md`):旧「生成 PPT」chip 泛化为「生成文件」force 单开关。
 > 命门 = 治 narrate —— file_gen auto 模式(`tool_choice=auto`)给模型「不生成只文字作答」的退路,
 > 偶发 ~20-30% 只回「我来为您生成…」不出文件;force 用 `tool_choice="required"` 杜绝该退路,模型
