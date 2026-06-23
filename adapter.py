@@ -1896,10 +1896,18 @@ def _strip_md_fence(text: str) -> str:
 
 
 def _call_upstream_html_builder(title: str, brief: str) -> str:
-    """单独发一个**无工具、自由生成**的上游调用,让模型写出完整 HTML(自由写=强项)。
+    """单独发一个**无工具、自由生成、流式**的上游调用,让模型写出完整 HTML(自由写=强项)。
 
     返回抠净的 HTML 源码;失败/空返回 ""(调用方兜成 error artifact)。
     🔴 与 agent loop 同一上游凭据(env),不落盘。
+
+    v0.6.6(2026-06-23,修 viz 504 ~37%):**改流式 `stream:True`**。非流式时整个
+    ~178s 生成期 adapter→EAS **一个字节都不发**(静默),被上游 EAS 网关 ~183s idle
+    超时掐成 504(测试域生产实证:成功 viz ≤182s、504 的 ≥184s,顺序+并发都现,与
+    B9 force 无关)。流式下模型边生成边吐 token、连接一直有字节流动 → idle 计时永远
+    到不了 183s → 撞墙消除。生成总时长不变(~178s),只是不再静默。
+    累积 `delta.content`(天然跳过 reasoning_content,与原读 message.content 同字段);
+    urlopen 的 timeout 是 per-read(逐 chunk 重置),流式不连续超 240s 即活。
     """
     base = UPSTREAM.rstrip("/")
     url = base + "/chat/completions" if base.endswith("/v1") else base + "/v1/chat/completions"
@@ -1909,7 +1917,7 @@ def _call_upstream_html_builder(title: str, brief: str) -> str:
             {"role": "system", "content": HTML_BUILDER_PROMPT},
             {"role": "user", "content": f"网页标题:{title}\n需求:{brief}"},
         ],
-        "stream": False,
+        "stream": True,
         "max_tokens": _HTML_BUILDER_MAX_TOKENS,
         "temperature": 0.7,
     }
@@ -1920,11 +1928,24 @@ def _call_upstream_html_builder(title: str, brief: str) -> str:
         url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers=headers, method="POST",
     )
+    parts: list[str] = []
     with urllib.request.urlopen(req, timeout=_HTML_BUILDER_TIMEOUT) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    choices = data.get("choices") or []
-    content = (((choices[0] if choices else {}) or {}).get("message") or {}).get("content") or ""
-    return _strip_md_fence(content)
+        for raw in resp:  # 逐行读 SSE —— 每个 token chunk 一来就消费,连接不静默
+            line = raw.decode("utf-8", "replace").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                obj = json.loads(data_str)
+            except Exception:  # noqa: BLE001 — 半行/keepalive 跳过
+                continue
+            delta = (((obj.get("choices") or [{}])[0]) or {}).get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                parts.append(piece)
+    return _strip_md_fence("".join(parts))
 
 
 def _make_file_renderer() -> Callable[[str, dict, str], dict]:

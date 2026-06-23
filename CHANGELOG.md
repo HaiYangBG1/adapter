@@ -7,6 +7,23 @@
 
 ---
 
+## [v0.6.7-B10viz] — viz HTML builder 改流式:治 504 ~37%(撞 183s 静默墙)· 🟡 code-complete 待部署
+> **测试域生产实证 escalate**(B9 收口附带,orthogonal 非 force):`generate_html` viz 生产 **504 ~37%**,
+> 顺序+并发都现(推翻"并发争用"假设)。**根因**:`_call_upstream_html_builder` 用 `stream:False` 非流式
+> —— 整个 ~178s 生成期 adapter→EAS **一个字节都不发**(静默),被上游 EAS 网关 **~183s idle 超时**掐成
+> 504(测试域:成功 viz ≤182s、504 的 ≥184s;adapter 自己 240s timeout 在其上游够不着)。代码注释
+> v0.6.4 早预见此风险(「240s 静默不被内层 LB idle 掐」)。
+> - **修**:`_call_upstream_html_builder` 改 **`stream:True`** + 逐行读 SSE 累积 `delta.content`
+>   (天然跳过 reasoning_content,与原读 message.content 同字段)。流式下边生成边吐 token、连接一直有
+>   字节 → idle 计时永远到不了 183s → 撞墙消除。生成总时长不变,只是不再静默。`_strip_md_fence`/
+>   `_render` 兜底/`MAX_TOKENS`/`TIMEOUT` 全不动。
+> - 🔴 **先验 PASS(ECS→pod passthrough,不需部署新码)**:`stream:true` + max_tokens 12000 逼生成
+>   **216s** → `[DONE]` 收尾、12000 chunks、**无 504**(非流式同时长必死)→ **流式扛过 183s 墙坐实**。
+>   (旁证:12000 token 处模型退化乱码 = 过度施压,真 builder 10000 token 不及;**截断/退化是 token
+>   上限问题、属"分多步生成"范畴,流式治"慢"不治"大"**。)
+> - 自测:py_compile 绿。**治"大"(超大文件分多步)= 另立项**(用户已记下、当下未决)。
+> - **待**:部署(授权,带 --PreStop)→ ECS→pod 自验真 builder 慢 viz 出文件不再 504。
+
 ## [v0.6.6-20260623] — 「生成文件」force 单开关:tool_choice=required 治 narrate · ✅ 已上线(digest 82d3f934,ChangeOrder d89ab452,PreStop 保留)
 > **上线 + 全栈 ECS→pod force 自验 PASS**(2026-06-23):`/health` `version=v0.6.6 git_sha=dce2577 file_gen_enabled=true object_storage.configured=true`;**force 自验 4 类型全出文件**(`gen_file_force:true` 直打 pod):xlsx 各门店销售情况.xlsx 5306B / pptx Q4营收复盘.pptx 52766B / docx 项目实施方案.docx 38075B / **html 各产品线销售额可视化看板.html 9401B**(auto 模式 narrate 重灾区,force 下稳定出文件)—— **命门「force 治 narrate + 类型自判」机制证实**。image-only 部署(33 env + PreStop sleep25 保留,Replicas 2);漂移基线刷 v0.6.5→v0.6.6。配套前端 0.17.6 同期。剩 = 测试域 N≥10 统计带图 + 前端 BFF authed E2E。
 > **B9 工单**(`pm/五期-需求-生成文件单开关-B9.md`):旧「生成 PPT」chip 泛化为「生成文件」force 单开关。
