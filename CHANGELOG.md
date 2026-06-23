@@ -7,6 +7,18 @@
 
 ---
 
+## [v0.6.2-20260623] — generate_html 允许 js(可视化)· ✅ 已上线(⚠️ viz 成色待解)
+> PM 拍「允许 js」(decisions 2026-06-23):让「可视化看板」能有 chart.js 交互图。
+> - **v0.6.1**:`html_generator` 停止消毒,允许 `<script>/<style>/图表库`;full-doc 直用 / fragment 套壳。
+>   爆炸半径界定(模块注释):产物是下载件,用户 file:// 打开 = 隔离 origin,够不到我方应用;前端
+>   从不在应用内渲染该 HTML(Artifact 只有 downloadUrl、previewKind=none)。`GENERATE_HTML_TOOL` +
+>   `FILE_GEN_PROMPT` 改「可写完整页 + 图表库」。git `b0d0a29`,digest `9c73de2d…`,ChangeOrder `3f4e1711`。
+> - **v0.6.2**:强化 html prompt(逼模型写完整含图表页面、严禁空壳)。git `2aaf77c`,digest `548a045a…`,ChangeOrder `58f8d09e`。
+> - ✅ 代码验证:本地 chart.js/script 保留 + full-doc 不双套壳 + 集成 dispatch 5 类型全过;生产新外壳实证(960px)。
+> - ⚠️ **未达成 viz**:实测模型在 **gen_file 工具模式**下把 `html`(超长 string arg)写成**空壳**(只 `<h2>标题</h2>`,1288B),
+>   即便强 prompt 也压不动;**同版本同模式 xlsx(结构化 arg)5341B 富** —— 确证是 LLM「长自由文本塞进工具参数偷懒」
+>   的弱点(对比普通对话自由生成能写完整 chart.js 看板)。**修复方向待 PM 拍**(结构化图表渲染 vs 自由写 HTML 提取)。
+
 ## [v0.6.0-20260622] — B+ 多类型文件生成 + 自动识别 · ✅ 已上线生产
 > 五期 B+(decisions 2026-06-22)。把 PPTX 生成泛化为**多类型**(+ Excel/CSV/Word/HTML)+
 > **模型自动识别**触发。纯加法,**显式 PPTX(`gen_pptx`)路径行为不变**(无回归)。
