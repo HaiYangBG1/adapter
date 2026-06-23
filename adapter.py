@@ -1858,7 +1858,14 @@ HTML_BUILDER_PROMPT = (
     "- 样式美观克制(主色 #008042),响应式;中文内容直接写中文。\n"
     "- **只输出完整 HTML 源码**,不要任何解释文字,不要 markdown 代码围栏(```)。"
 )
-_HTML_BUILDER_TIMEOUT = int(os.environ.get("ADAPTER_HTML_BUILDER_TIMEOUT", "150"))
+# v0.6.4(2026-06-23):默认 150→240。viz live 自验(ECS→adapter 复刻 BFF gen_file
+# 请求)实证:builder 非流式串行生成一个完整含 chart.js 的仪表盘(~8000 token @K2.6
+# ~50 tok/s)耗时 ≈ 150s,恰好顶满 150 超时墙 → generate_html `ok=false`
+# `elapsed_ms=150104`、稳定失败(用户得 error 卡 + token 泄漏)。产物落 OSS、不流式给
+# 用户,故唯一旋钮是 等待时长⟷丰富度;PM 拍「保丰富度」(decisions 2026-06-23)→
+# 抬超时(给 ~33 tok/s 留余量),max_tokens 8000 不动。⚠️ builder 运行期 adapter→下游
+# SSE 静默,真机验收须确认 240s 静默不被内层 LB idle 掐(150s 静默此前 ECS 实测可活)。
+_HTML_BUILDER_TIMEOUT = int(os.environ.get("ADAPTER_HTML_BUILDER_TIMEOUT", "240"))
 _HTML_BUILDER_MAX_TOKENS = int(os.environ.get("ADAPTER_HTML_BUILDER_MAX_TOKENS", "8000"))
 
 

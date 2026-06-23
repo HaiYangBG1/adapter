@@ -141,6 +141,13 @@ def _shape_web_search_sources(result: Any) -> list[dict[str, Any]] | None:
 # Patterns for stripping tool-call markup that leaks into content text when
 # the upstream parser is bypassed (e.g. when tools=[] is sent but the model
 # still tries to invoke tools — see Phase 2 testing).
+# v0.6.4(2026-06-23):补 K2.6(Kimi/Moonshot)管道式 sentinel。K2.6 工具调用格式
+# 不是 Qwen 的 <tool_call>…</tool_call>,而是
+#   <|tool_calls_section_begin|><|tool_call_begin|>functions.NAME:N
+#   <|tool_call_argument_begin|>{args}<|tool_call_end|><|tool_calls_section_end|>
+# 当上游 tool-call 解析被绕过(典型:工具报错后模型在 forced/streamed 最终答案里
+# "重试"工具),这串 sentinel 原样泄漏进正文。viz 超时自验实证(generate_html
+# 超时 → 模型重试 → token 泄漏)。旧 guard 只认 <tool_call> 子串故 leaks_stripped=0。
 _TOOL_CALL_LEAK_PATTERNS = (
     re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL),
     re.compile(r"<function_call>.*?</function_call>", re.DOTALL),
@@ -148,17 +155,27 @@ _TOOL_CALL_LEAK_PATTERNS = (
     re.compile(r"<tool_call>.*", re.DOTALL),
     re.compile(r"</?tool_call>"),
     re.compile(r"</?function_call>"),
+    # K2.6 管道式:整段(配对)→ 截断未闭合 tail → 散落的单个 sentinel。顺序重要:
+    # 先吃配对块(把 functions.NAME:N + args 连同 sentinel 整段清掉),再吃截断 tail
+    # 与零散 sentinel。section 包裹是 K2.6 工具调用的实际形态(viz 泄漏自验实证)。
+    re.compile(r"<\|tool_calls_section_begin\|>.*?<\|tool_calls_section_end\|>", re.DOTALL),
+    re.compile(r"<\|tool_calls_section_begin\|>.*", re.DOTALL),
+    re.compile(r"<\|tool_call[a-z_]*\|>"),
 )
+
+# 子串探针:任一出现才进清洗(便宜短路)。
+_TOOL_CALL_LEAK_PROBES = ("<tool_call>", "<function_call>", "<|tool_call")
 
 
 def _strip_tool_call_leaks(text: str) -> tuple[str, int]:
-    """Remove leaked <tool_call> markup from a content string.
+    """Remove leaked tool-call markup from a content string.
 
+    覆盖 Qwen 式 <tool_call> 与 K2.6 管道式 <|tool_call…|>。
     Returns (cleaned_text, num_blocks_removed). Cleanup is best-effort: matches
     are removed greedily. Used only on the *final* iteration where we expect
     pure natural-language output.
     """
-    if not text or "<tool_call>" not in text and "<function_call>" not in text:
+    if not text or not any(p in text for p in _TOOL_CALL_LEAK_PROBES):
         return text, 0
     removed = 0
     cleaned = text
@@ -168,6 +185,112 @@ def _strip_tool_call_leaks(text: str) -> tuple[str, int]:
         cleaned = new_cleaned
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned, removed
+
+
+def _chunk_with_content(chunk: dict[str, Any], content: str) -> dict[str, Any]:
+    """返回 SSE chunk 的浅拷贝,只把 choices[0].delta.content 换成 content。
+
+    不改原 chunk(避免污染上游缓存);其余字段(id/model/created/delta 其他键)原样保留。
+    """
+    choices = chunk.get("choices") or [{}]
+    ch0 = dict(choices[0] or {})
+    delta = dict(ch0.get("delta") or {})
+    delta["content"] = content
+    ch0["delta"] = delta
+    new = dict(chunk)
+    new["choices"] = [ch0] + list(choices[1:])
+    return new
+
+
+class _StreamToolLeakGuard:
+    """流式正文守卫:抑制 K2.6 工具 sentinel 块,块前后正文照常流。**fail-open**。
+
+    v0.6.4(2026-06-23):agent loop 的 `answered_streamed` 路径**裸透传**上游 content
+    delta(见 stream loop「正文已流出」)。K2.6 在工具报错后会把整段
+    ``<|tool_calls_section_begin|>…<|tool_calls_section_end|>`` 当正文逐 token 流出
+    (viz builder 超时自验实证)→ 用户看到原始 sentinel。后处理 `_strip_tool_call_leaks`
+    拦不住已发的流,故在 emit 点做流式抑制。
+
+    行为:
+      - 普通态遇 ``<|tool_calls_section_begin|>`` → 进抑制态,emit 它之前的正文;
+      - 抑制态遇 ``<|tool_calls_section_end|>`` → 回普通态,emit 它之后的正文
+        (**块前后正文都保留**,因 K2.6 泄漏前有「让我再试」、泄漏后有「很抱歉…超时」);
+      - section 外散落的单 sentinel(``<|tool_call_begin|>`` 等)直接吞掉;
+      - **split-safe**:正文尾巴若是某 watch token 的前缀(跨 chunk 的半个 sentinel),
+        hold 住等下一片再判。
+    只锚定 ``<|tool…`` 前缀 → 正常中英文散文几乎不含;真有 ``<|`` 非 sentinel 续不上时
+    立即释放,延迟 ≈ 1 片、零丢字。误伤面极小。
+    """
+
+    _BEGIN = "<|tool_calls_section_begin|>"
+    _END = "<|tool_calls_section_end|>"
+    _STRAY = re.compile(r"<\|tool_call[a-z_]*\|>")
+    # 用于 split-safe hold 判定:任一 watch token 的前缀都可能跨 chunk
+    _WATCH = (
+        "<|tool_calls_section_begin|>", "<|tool_calls_section_end|>",
+        "<|tool_call_begin|>", "<|tool_call_end|>", "<|tool_call_argument_begin|>",
+    )
+    _MAXLEN = max(len(t) for t in _WATCH)
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._suppress = False
+        self.removed = 0  # 抑制块计数(诊断/trace)
+
+    @classmethod
+    def _hold_len(cls, buf: str, tokens: tuple[str, ...]) -> int:
+        """buf 末尾「是 tokens 中某个的前缀」的最长后缀长度(split-safe hold)。"""
+        for k in range(min(len(buf), cls._MAXLEN), 0, -1):
+            suf = buf[-k:]
+            if any(t.startswith(suf) for t in tokens):
+                return k
+        return 0
+
+    def feed(self, delta: str) -> str:
+        self._buf += delta
+        out: list[str] = []
+        while True:
+            if self._suppress:
+                i = self._buf.find(self._END)
+                if i < 0:
+                    # 仍在块内,丢弃,但保留可能跨 chunk 的 END 前缀
+                    hold = self._hold_len(self._buf, (self._END,))
+                    self._buf = self._buf[len(self._buf) - hold:] if hold else ""
+                    break
+                self._buf = self._buf[i + len(self._END):]
+                self._suppress = False
+                self.removed += 1
+                continue
+            i = self._buf.find(self._BEGIN)
+            if i >= 0:
+                out.append(self._buf[:i])
+                self._buf = self._buf[i + len(self._BEGIN):]
+                self._suppress = True
+                continue
+            m = self._STRAY.search(self._buf)
+            if m:
+                out.append(self._buf[:m.start()])
+                self._buf = self._buf[m.end():]
+                self.removed += 1
+                continue
+            hold = self._hold_len(self._buf, self._WATCH)
+            if hold:
+                out.append(self._buf[:len(self._buf) - hold])
+                self._buf = self._buf[len(self._buf) - hold:]
+            else:
+                out.append(self._buf)
+                self._buf = ""
+            break
+        return "".join(out)
+
+    def flush(self) -> str:
+        """流结束:抑制态未闭合 → 整段丢;普通态 hold 的尾巴(非真 sentinel)放出。"""
+        if self._suppress:
+            self._buf = ""
+            return ""
+        out = self._buf
+        self._buf = ""
+        return out
 
 
 # =============================================================================
@@ -2992,6 +3115,9 @@ def _speculative_iteration(
     reasoning_buf = ""            # 累积所有 reasoning_content delta
     tool_call_fragments: list = []
     finish_reason = ""
+    # v0.6.4:流式抑制 K2.6 工具 sentinel 泄漏(裸透传路径,见下方 content 分支)。
+    leak_guard = _StreamToolLeakGuard()
+    last_content_chunk: Optional[dict[str, Any]] = None  # flush 残留时复用作模板
 
     try:
         for chunk in _stream_upstream(cfg, messages, tools, extra, tool_choice=tool_choice):
@@ -3041,7 +3167,7 @@ def _speculative_iteration(
 
             # content delta:v0.2.14 只在非空白时承诺
             if isinstance(content_delta, str) and content_delta:
-                content_buf += content_delta  # 始终累积,用于 empty 检测
+                content_buf += content_delta  # 始终累积原始(用于 empty/citation 检测)
                 if not content_started and not tool_calls_started:
                     if content_delta.strip():
                         # 真正承诺 content 路径:flush pre_decision_chunks + 转发当前 chunk
@@ -3049,12 +3175,19 @@ def _speculative_iteration(
                         for buffered in pre_decision_chunks:
                             yield ("chunk", buffered)
                         pre_decision_chunks = []
-                        yield ("chunk", chunk)
+                        safe = leak_guard.feed(content_delta)  # v0.6.4 流式守卫
+                        if safe:
+                            last_content_chunk = chunk
+                            yield ("chunk", _chunk_with_content(chunk, safe))
                     else:
                         # 空白 content delta(如 "\\n\\n"):尚未承诺,buffer 起来
+                        # (纯空白无 sentinel,免守卫;承诺时原样 flush)
                         pre_decision_chunks.append(chunk)
                 elif content_started:
-                    yield ("chunk", chunk)
+                    safe = leak_guard.feed(content_delta)  # v0.6.4 流式守卫
+                    if safe:
+                        last_content_chunk = chunk
+                        yield ("chunk", _chunk_with_content(chunk, safe))
                 # tool_calls_started + 后续 content delta:静默丢弃
                 continue
 
@@ -3074,6 +3207,12 @@ def _speculative_iteration(
             "finish_reason": finish_reason,
         })
         return
+
+    # v0.6.4:stream 收尾,放出守卫 hold 的尾巴(普通态非 sentinel 残留;抑制态未闭合→丢)
+    if content_started and last_content_chunk is not None:
+        residual = leak_guard.flush()
+        if residual:
+            yield ("chunk", _chunk_with_content(last_content_chunk, residual))
 
     # 决定最终 path
     assembled: list[dict[str, Any]] = []
@@ -3554,7 +3693,14 @@ def run_agent_stream(
                 # _inject_force_answer_hint 把 hint 拼到头部 system,避开 EAS 校验。
                 # v0.2.30 原写法 `augmented + [leak_assistant_msg, leak_recover_hint]`
                 # 在续轮触发时会必然 400,实测 v0.3.1 Phase 3 trace 复现。
-                leak_assistant_msg = {"role": "assistant", "content": content_buf}
+                # v0.6.4(reviewer P1-1):content_buf 是**原始**累积(含可能泄漏的
+                # K2.6/Qwen tool sentinel)。intent-leak 续轮把它当 assistant 消息塞回
+                # history → 裸 sentinel 喂回模型/EAS(EAS tool 格式校验 400 或诱发再次
+                # 泄漏)。先 strip 再入 history(复用已有清洗,成本极低)。
+                leak_assistant_msg = {
+                    "role": "assistant",
+                    "content": _strip_tool_call_leaks(content_buf)[0],
+                }
                 leak_recover_hint_text = (
                     "【纠正 — v0.2.30 intent-leak guard】你上一条 assistant 消息"
                     "只用自然语言宣告了下一步动作,**没有真正 emit tool_calls** ——"

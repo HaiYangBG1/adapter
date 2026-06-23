@@ -7,6 +7,27 @@
 
 ---
 
+## [v0.6.4-20260623] — viz builder 超时修复 + K2.6 工具 token 流式泄漏清洗 · 🚧 待部署
+> **全栈 viz live 自验**(绕 B6 BFF 鉴权,从 VPC 内 ECS RunCommand 直打 adapter pod 复刻 gen_file
+> 请求)发现 v0.6.3 的「可视化看板」**生产稳定失败**:`generate_html` 的 `_call_upstream_html_builder`
+> 非流式串行生成一个完整含 chart.js 的仪表盘(~8000 token @K2.6 ~50 tok/s)耗时 ≈ 150s,**恰好顶满
+> 150s 超时墙** → `generate_html ok=false elapsed_ms=150104` → 用户得 error 卡 + 道歉转 Excel + 残留
+> K2.6 工具 sentinel(`<|tool_calls_section_begin|>…`)泄漏进正文(超时后模型重试、agent loop 到 max iter)。
+> - **builder 超时 150→240**(`adapter.py` `_HTML_BUILDER_TIMEOUT` 默认):PM 拍「保丰富度」(decisions
+>   2026-06-23)→ 抬超时给 ~33 tok/s 留余量,`MAX_TOKENS` 8000 不动。产物落 OSS 不流式给用户,唯一旋钮
+>   是 等待时长⟷丰富度,选丰富度。⚠️ builder 运行期 adapter→下游 SSE 静默 240s,真机验收须确认不被内层
+>   LB idle 掐(150s 静默此前 ECS 实测可活)。核实:无 <240 的外层 agent 总超时会先掐(`AGENT_TIMEOUT=120`
+>   只管 agent LLM 流式调用、首次实测 builder 跑到 150104ms>120 即证;`AGENT_PLAN_*` 是 plan 模式专用)。
+> - **K2.6 工具 token 泄漏清洗**(`agentic_web.py`):① `_strip_tool_call_leaks` + `_TOOL_CALL_LEAK_PATTERNS`
+>   扩 K2.6 管道式 sentinel(旧 guard 只认 Qwen `<tool_call>` 子串故 `leaks_stripped=0`)——覆盖缓冲路径
+>   (synthesis/forced/finalize)。② 新增 `_StreamToolLeakGuard`(块抑制 `<|tool_calls_section_begin|>…
+>   <|tool_calls_section_end|>`、split-across-chunks 安全、fail-open、块前后正文保留)+ `_chunk_with_content`,
+>   接进 stream loop content 透传分支——因 `answered_streamed` 是裸逐 token 流出,后处理拦不住已发的流。
+>   ③ reviewer P1-1:intent-leak 续轮入 history 前 strip content_buf(防裸 sentinel 喂回 EAS 致 400)。
+> - **自测**:py_compile 绿 + 15 项行为测试全过(buffered strip / 流式块抑制 / 逐字符==整喂 split-safe /
+>   正常散文含 `<`·`<|`·`<html>` 零误伤 / 块前后正文保留 / 未闭合抑制 / resume after end)。reviewer 核查门
+>   过(无 P0;P1-1 已修;P1-2=240s 静默真机验收 gated;P2 边界不影响生产)。**契约 `x_adapter_artifact` 未变**。
+
 ## [v0.6.3-20260623] — viz 方案2:generate_html 自由生成 + 卡片一致 · ✅ 已上线(live 验证 gated)
 > PM 拍「方案2 自由写 HTML + 卡片一致」(decisions 2026-06-23 viz 行)。解 v0.6.1/v0.6.2 的「模型
 > 在工具长 string arg 写空壳」:**短 brief 工具参数 + 拦截后单独自由生成调用**两全。
