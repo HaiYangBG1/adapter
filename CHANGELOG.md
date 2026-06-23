@@ -7,7 +7,8 @@
 
 ---
 
-## [v0.6.7-B10viz] — viz HTML builder 改流式:治 504 ~37%(撞 183s 静默墙)· 🟡 code-complete 待部署
+## [v0.6.7-20260623] — viz HTML builder 改流式:治 504 ~37%(撞 183s 静默墙)· ✅ 已上线(digest 225ba9d1,ChangeOrder b8de07a4,PreStop 保留)
+> **上线 + ECS→pod 真 builder 自验 PASS**(2026-06-23):image-only 部署(33env+PreStop sleep25 保留,Replicas 2)。**慢 viz 不再 504**:两个刻意详尽的 viz `gen_file` 请求 —— 199s「全国多分公司经营看板.html」46660B + 184s「电商运营数据大屏.html」33179B —— **都 >183s 墙且都出 ready 文件**(修复前这正是 504 的耗时区:测试域见 504 都 ≥184s)。漂移基线刷 v0.6.6→v0.6.7。配套前端 0.17.7 同期。🟡 治"慢"不治"大":超大文件截断/退化 = 分多步生成另立项(用户已记下、当下未决)。
 > **测试域生产实证 escalate**(B9 收口附带,orthogonal 非 force):`generate_html` viz 生产 **504 ~37%**,
 > 顺序+并发都现(推翻"并发争用"假设)。**根因**:`_call_upstream_html_builder` 用 `stream:False` 非流式
 > —— 整个 ~178s 生成期 adapter→EAS **一个字节都不发**(静默),被上游 EAS 网关 **~183s idle 超时**掐成
