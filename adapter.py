@@ -1844,6 +1844,71 @@ _ARTIFACT_EXT_MIME: dict[str, str] = {
     "pdf": "application/pdf",
 }
 
+# v0.6.3 B+(2026-06-23 PM 拍「方案2 自由写 HTML + 卡片一致」):generate_html 工具只收
+# 短 brief(模型填短参不偷懒);拦截后由本 builder **单独发一个自由生成调用**让模型自由
+# 写出完整含图表 HTML(自由写=模型强项,实测工具长 string arg 写空壳)。再走文件卡流程。
+HTML_BUILDER_PROMPT = (
+    "你是一个网页生成器。根据用户给的标题和需求,写出一个**完整、内容充实、可直接双击打开**"
+    "的单文件 HTML 页面。\n"
+    "- 输出 `<!DOCTYPE html>` 开头的完整文档(<head> 含标题 + <style> 样式,<body> 内容)。\n"
+    "- **可视化 / 看板 / 图表需求必须用 chart.js 画真实交互图表**:在 <head> 引入 "
+    "`<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>`,<body> 放 <canvas>,"
+    "末尾 <script> 用 `new Chart(...)` 填入数据初始化。柱/折线/饼按数据语义选。\n"
+    "- 用户没给具体数据就用合理示例数据把图表 / 表格填满,绝不留空。\n"
+    "- 样式美观克制(主色 #008042),响应式;中文内容直接写中文。\n"
+    "- **只输出完整 HTML 源码**,不要任何解释文字,不要 markdown 代码围栏(```)。"
+)
+_HTML_BUILDER_TIMEOUT = int(os.environ.get("ADAPTER_HTML_BUILDER_TIMEOUT", "150"))
+_HTML_BUILDER_MAX_TOKENS = int(os.environ.get("ADAPTER_HTML_BUILDER_MAX_TOKENS", "8000"))
+
+
+def _strip_md_fence(text: str) -> str:
+    """从模型输出里抠出纯 HTML:去 markdown 围栏,并裁剪到 <!doctype/<html>…</html>。"""
+    t = (text or "").strip()
+    m = re.search(r"```(?:html)?\s*(.*?)```", t, re.DOTALL | re.IGNORECASE)
+    if m:
+        t = m.group(1).strip()
+    low = t.lower()
+    start = low.find("<!doctype")
+    if start < 0:
+        start = low.find("<html")
+    end = low.rfind("</html>")
+    if start >= 0 and end > start:
+        t = t[start:end + len("</html>")]
+    return t.strip()
+
+
+def _call_upstream_html_builder(title: str, brief: str) -> str:
+    """单独发一个**无工具、自由生成**的上游调用,让模型写出完整 HTML(自由写=强项)。
+
+    返回抠净的 HTML 源码;失败/空返回 ""(调用方兜成 error artifact)。
+    🔴 与 agent loop 同一上游凭据(env),不落盘。
+    """
+    base = UPSTREAM.rstrip("/")
+    url = base + "/chat/completions" if base.endswith("/v1") else base + "/v1/chat/completions"
+    payload = {
+        "model": AGENT_MODEL or "lxj",
+        "messages": [
+            {"role": "system", "content": HTML_BUILDER_PROMPT},
+            {"role": "user", "content": f"网页标题:{title}\n需求:{brief}"},
+        ],
+        "stream": False,
+        "max_tokens": _HTML_BUILDER_MAX_TOKENS,
+        "temperature": 0.7,
+    }
+    headers = {"Content-Type": "application/json"}
+    if UPSTREAM_API_KEY:
+        headers[UPSTREAM_AUTH_HEADER] = f"Bearer {UPSTREAM_API_KEY}"
+    req = urllib.request.Request(
+        url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=_HTML_BUILDER_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    choices = data.get("choices") or []
+    content = (((choices[0] if choices else {}) or {}).get("message") or {}).get("content") or ""
+    return _strip_md_fence(content)
+
 
 def _make_file_renderer() -> Callable[[str, dict, str], dict]:
     """v0.5.0 B / v0.6.0 B+:依赖注入的多类型文件渲染器(分发器)。
@@ -1878,16 +1943,39 @@ def _make_file_renderer() -> Callable[[str, dict, str], dict]:
     def _render(tool_name: str, args: dict, artifact_id: str) -> dict:
         if not _FILE_GEN_AVAILABLE:
             return {"ok": False, "error": "文件生成依赖未安装"}
-        entry = spec.get(tool_name)
-        if entry is None:
-            return {"ok": False, "error": f"不支持的文件类型:{tool_name}"}
-        normalize_fn, build_fn, name_fn, ext, mime = entry
+        if not isinstance(args, dict):
+            args = {}
         if not oss_store.is_configured():
             return {
                 "ok": False,
                 "error": "文件存储未配置,暂时无法生成可下载文件(请联系管理员配置对象存储)",
             }
         try:
+            # v0.6.3:generate_html 走「自由写」—— 模型工具参数只给短 brief,这里单独发
+            # 一个自由生成调用让模型写出完整含图表 HTML(html_generator 只做套壳/full-doc 直用)。
+            if tool_name == "generate_html":
+                _t = args.get("title")
+                title = _t.strip() if isinstance(_t, str) else ""
+                brief = str(
+                    args.get("brief") or args.get("html") or args.get("content")
+                    or args.get("spec") or ""
+                ).strip() or (title or "一个简单的网页")
+                html_src = _call_upstream_html_builder(title or "网页", brief)
+                if not html_src or "<" not in html_src:
+                    return {"ok": False, "error": "网页生成失败(模型未返回有效 HTML),请重试"}
+                data = html_generator.build_html({"title": title or "网页", "html": html_src})
+                name = html_generator.safe_filename(title or "网页", "html")
+                mime = "text/html; charset=utf-8"
+                download_url, object_key, _ttl = oss_store.upload_and_presign(
+                    artifact_id, "html", data, mime, name,
+                )
+                return {"ok": True, "name": name, "mime": mime, "size": len(data),
+                        "download_url": download_url, "object_key": object_key}
+
+            entry = spec.get(tool_name)
+            if entry is None:
+                return {"ok": False, "error": f"不支持的文件类型:{tool_name}"}
+            normalize_fn, build_fn, name_fn, ext, mime = entry
             canonical = normalize_fn(args)
             data = build_fn(canonical)
             title = canonical.get("title", "") if isinstance(canonical, dict) else ""
