@@ -7,6 +7,16 @@
 
 ---
 
+## [v0.6.11-20260624] — B14 文件生成扩展:md / txt(文件能力优化标准包)· ✅ 已上线 2026-06-24
+> **背景**:用户「继续做优化」,文件能力优化标准包(decisions 06-24)。原只生成 pptx/xlsx/docx/csv/html 5 类,补常见 **markdown(.md)** + **纯文本(.txt)**。
+> **改**(纯加法,A 铁律):
+> - 新增 `md_generator.py` / `txt_generator.py`(仿 `csv_generator.py`,**纯 stdlib 零新依赖**)。模型直接在 `body` 写 markdown / 纯文本(= 内容非渲染代码),退化兼容 docx 式 `sections`;`_clean_body` 保留 markdown 显著空白(代码块/表格/缩进)vs `clean_text` 折叠。
+> - `agentic_web.py`:`GENERATE_MD_TOOL` / `GENERATE_TXT_TOOL` + `ALL_FILE_GEN_TOOLS` + `FILE_GEN_TOOL_META` + 两 prompt「选哪种文件」。
+> - `adapter.py`:import md/txt generator(try/except)+ `_make_file_renderer` spec + `_ARTIFACT_EXT_MIME`(md/txt)+ `/health.file_gen_types`(7 类型)。**md/txt 单片**(不进 `_FILE_GEN_PART_KEYS`)。
+> - `Dockerfile`:COPY md/txt generator。
+> - 自验:py_compile + md/txt smoke(保留表格/代码块/换行)+ grep 7 类注册点一致 + 前端 tsc EXIT=0。reviewer 核查门过(subagent `a57540ba`,0 P0/P1,3 P2 非阻塞)。
+> **✅ 已上线(2026-06-24)**:fast_path build(FROM v0.6.10,镜像内自检 `assert _FILE_GEN_AVAILABLE` 过 = md/txt 导入成功)→ image-only 部署 digest `sha256:09865de17d24bd3a7971fb018ac9084971fd8606f758615ca8293a768fdaaf84`,ChangeOrder `e2b4501d-c756-48a9-8b13-92908ef261e1`,**33 env + PreStop sleep25 保留**,Replicas 2。git `9b1c5de`。🔴 **待测试域**:md/txt 生成→下载带图。
+
 ## [v0.6.10-20260624] — B12 组合模式:修「分析表+做看板」看板编造数据(测试域 live FAIL)· ✅ 已上线 2026-06-24
 > **背景**:B12(v0.6.9)给 html builder 注入了对话上下文,但**测试域 authed live 验收 FAIL** —— 「分析上传 Excel→做柱状图看板」产出的看板**数字是编的**(上传表真实值 `73219/48571/91864` 一个没进图,chart 填假数据 + 假月份标签)。
 > **根因**:file_gen 与 excel 模式**架构互斥**。force chip 路径前端虽同时发 `gen_file_force`+`excel_dataset_id`,但 adapter `file_gen_mode` **忽略 excel_dataset_id**、首轮强制 `generate_html`,**没先跑 `excel_query`** → builder 无真数据 → 编造。v0.6.9 的 context 注入只在「先分析→再做看板」两轮流才有数据,单请求拿不到。
