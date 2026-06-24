@@ -7,6 +7,18 @@
 
 ---
 
+## [v0.6.10-20260624] — B12 组合模式:修「分析表+做看板」看板编造数据(测试域 live FAIL)· ✅ 已上线 2026-06-24
+> **背景**:B12(v0.6.9)给 html builder 注入了对话上下文,但**测试域 authed live 验收 FAIL** —— 「分析上传 Excel→做柱状图看板」产出的看板**数字是编的**(上传表真实值 `73219/48571/91864` 一个没进图,chart 填假数据 + 假月份标签)。
+> **根因**:file_gen 与 excel 模式**架构互斥**。force chip 路径前端虽同时发 `gen_file_force`+`excel_dataset_id`,但 adapter `file_gen_mode` **忽略 excel_dataset_id**、首轮强制 `generate_html`,**没先跑 `excel_query`** → builder 无真数据 → 编造。v0.6.9 的 context 注入只在「先分析→再做看板」两轮流才有数据,单请求拿不到。
+> **修 = 组合模式(`excel_file_gen_mode`)**:
+> - handler:`gen_file` + `excel_dataset_id` 同时在 → 组合模式(**优先于纯 file_gen_mode**)。
+> - `_build_agent_registry`:`enable_file_gen` + `excel_dataset_id` → 挂 **`excel_query`(真 impl)+ 全部 `generate_*`(schema-only,拦截渲染)** 两套。
+> - **首轮 `force_first_tool_name="excel_query"`** 查真数据(**不** `force_required_tool`,否则首轮就生成、没数据),后续轮模型自决调 `generate_html` 用真数值。
+> - `EXCEL_FILE_GEN_PROMPT`(新):铁律「先 `excel_query` 查真数据 → 再 `generate_*` 用真数值,**严禁编造**」。
+> - **三重保真**:首轮强制查表 + 模型把真值写进 generate_html brief + B12 context 注入(augmented 含 excel_query 结果)。**前端 force 已发两字段,无需改**。
+> - 自测:组合 registry 挂 `excel_query`+`generate_*`(html/xlsx/pptx/docx/csv)+ 纯 file_gen(无 dataset)零回归 + py_compile 绿。
+> **✅ 已上线(2026-06-24)**:image-only(FROM v0.6.9,ChangeOrder `af613156-860e-4c51-8d44-7bf587f42b1a`,33env+PreStop 保留,自检 SELFCHECK_OK file_gen)。git `a3b61aa`。🔴 **待测试域复验**:「分析+看板」单请求 → 看板含真实数值带图。
+
 ## [v0.6.9-20260624] — B11 大文件分多步生成 + B12 Excel→看板 + B13 excel-poc 越权透传 · ✅ 已上线 2026-06-24
 > 五期 B11/B12/B13 三项后端改动合并发布。
 
