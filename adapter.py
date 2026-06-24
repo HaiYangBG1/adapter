@@ -297,7 +297,11 @@ AGENT_FETCH_FALLBACK_MIN_CHARS = int(os.environ.get("ADAPTER_AGENT_FETCH_FALLBAC
 # truncates the answer and the model degrades into repetition before the cut.
 # v0.2.26: 2000 → 8000,EAS 升 1M context 后留更长输出空间,长 PPT/多文档
 # 总结这种场景不再因输出 token 不够被截。
-AGENT_DEFAULT_MAX_TOKENS = int(os.environ.get("ADAPTER_AGENT_DEFAULT_MAX_TOKENS", "8000"))
+# v0.6.9 B11(大文件治「大」Phase 0): 8000 → 12000。文件生成是「模型一次性出
+# 结构化大纲/数据 → 确定性渲染」,大 PPT(30+ 页)/大表(数百行)的大纲 JSON 会
+# 撞 8000 顶 → finish_reason=length 截断、末页/末行丢。抬到 12000 覆盖绝大多数
+# 真实场景(~40-60 页 PPT / 数百行表);常规 agent/web/excel 极少触顶,无回归。
+AGENT_DEFAULT_MAX_TOKENS = int(os.environ.get("ADAPTER_AGENT_DEFAULT_MAX_TOKENS", "12000"))
 
 # excel_query 工具 —— 把表格数据集的精确计算交给外部「代码执行」服务。
 # 该服务地址走环境变量(开源仓库不写死内网地址);留空则不注册 excel_query。
@@ -1746,22 +1750,33 @@ def _get_agent_registry() -> ToolRegistry:
     return _agent_registry_singleton
 
 
-def _call_excel_backend(dataset_id: str, question: str) -> dict[str, Any]:
+def _call_excel_backend(dataset_id: str, question: str,
+                        user_id: str = "") -> dict[str, Any]:
     """调外部代码执行服务对表格数据集做一次精确计算,返回精简结果。
 
     服务以 stream=false 同步返回 {answer, sql_log, verify, ...};这里只回传
     模型作答真正需要的部分(答案 + 所用 SQL + 校验告警),丢掉冗长的原始行集
     —— 工具结果还会被 agent loop 的 max_tool_result_chars 兜底截断。
+
+    B13(越权修复):excel-poc 已按 user_id 隔离数据集存储,**必须**带身份头
+    ``X-User-Id``(由 BFF 从已登录 session 注入、经 /v1/agent payload.excel_user_id
+    透到这里)。空 user_id → excel-poc 返 400(fail-closed,不静默放行)。
     """
     if not EXCEL_BACKEND_URL:
         return {"error": "excel backend 未配置(ADAPTER_EXCEL_BACKEND_URL)"}
+    # B13 reviewer P1-1:空 user_id 短路返清晰错误(省一次注定 400 的往返 + 自解释,
+    # 错误进 Langfuse trace 可观测)。正常链路 BFF 必注入 excel_user_id;空值只会出现在
+    # 绕过 BFF 直连 adapter 的非标准调用。
+    if not (user_id or "").strip():
+        return {"error": "excel_query 缺少用户身份(excel_user_id 未注入)——表格分析需经 ChickChat 登录后使用"}
     url = EXCEL_BACKEND_URL.rstrip("/") + "/ask"
     payload = json.dumps(
         {"file_id": dataset_id, "question": question, "stream": False}
     ).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload, method="POST",
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json",
+                 "X-User-Id": user_id or ""},
     )
     try:
         with urllib.request.urlopen(req, timeout=EXCEL_QUERY_TIMEOUT) as resp:
@@ -1787,15 +1802,18 @@ def _call_excel_backend(dataset_id: str, question: str) -> dict[str, Any]:
     return out
 
 
-def _make_excel_query_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
-    """为某个数据集生成绑定的 excel_query 实现 —— 数据集 id 由闭包捕获,模型
-    只需给出要计算的子问题,无需(也无法误传)数据集 id。"""
+def _make_excel_query_impl(dataset_id: str,
+                           user_id: str = "") -> Callable[[dict[str, Any]], Any]:
+    """为某个数据集生成绑定的 excel_query 实现 —— 数据集 id + user_id 由闭包捕获,
+    模型只需给出要计算的子问题,无需(也无法误传)数据集 id / 身份。
+
+    B13:user_id 闭包捕获,透给 _call_excel_backend 做 per-user 隔离。"""
 
     def _impl(args: dict[str, Any]) -> Any:
         question = str(args.get("question") or "").strip()
         if not question:
             return {"error": "excel_query 需要 question 参数(要计算的子问题)"}
-        return _call_excel_backend(dataset_id, question)
+        return _call_excel_backend(dataset_id, question, user_id)
 
     return _impl
 
@@ -1805,9 +1823,10 @@ def _make_excel_query_impl(dataset_id: str) -> Callable[[dict[str, Any]], Any]:
 # adapter.py 这边只保留依赖反转的 _make_excel_run_step 工厂函数。
 
 
-def _make_excel_run_step(dataset_id: str) -> Callable[[str, int], Any]:
+def _make_excel_run_step(dataset_id: str,
+                         user_id: str = "") -> Callable[[str, int], Any]:
     """v0.4.0 D 重构:依赖反转的注入函数。返回 (question, timeout_s) → result
-    callable,绑定 dataset_id。由 do_POST handler 在 plan 模式下塞进
+    callable,绑定 dataset_id + user_id(B13)。由 do_POST handler 在 plan 模式下塞进
     cfg.plan_step_runner,_execute_plan_streaming generator 调用它执行 step。
 
     内部包 _call_excel_backend:question 为空时直接返 error;timeout_s 参数当前
@@ -1827,7 +1846,7 @@ def _make_excel_run_step(dataset_id: str) -> Callable[[str, int], Any]:
         # _execute_plan_streaming 已经在 plan_deadline / completed_q.get 那层
         # 兜底。未来可改 _call_excel_backend 接 timeout_s 透到 backend deadline。
         _ = timeout_s  # acknowledge param
-        return _call_excel_backend(dataset_id, question)
+        return _call_excel_backend(dataset_id, question, user_id)
 
     return _run_step
 
@@ -1876,7 +1895,11 @@ _HTML_BUILDER_TIMEOUT = int(os.environ.get("ADAPTER_HTML_BUILDER_TIMEOUT", "240"
 # v0.6.5:8000→10000。viz live 验证:8000 token 不够模型写完一个完整看板,末尾图表
 # 初始化脚本被截断(空 canvas 不渲染)。抬到 10000 给完整 `new Chart()` 脚本留头 +
 # 上方 prompt「篇幅纪律」逼模型别在 CSS 上挥霍 token。10000@~56tok/s≈178s,仍 <240 超时。
-_HTML_BUILDER_MAX_TOKENS = int(os.environ.get("ADAPTER_HTML_BUILDER_MAX_TOKENS", "10000"))
+# v0.6.9 B11(大文件治「大」Phase 0):10000→14000。复杂多图大看板仍会撞 10000 截
+# 断(末脚本丢=空 canvas)。builder 已是流式(v0.6.6),_HTML_BUILDER_TIMEOUT 是
+# **per-read 逐 chunk** 超时(不是总时长上限)→ 14000@~56tok/s≈250s 总时长不触发
+# idle 超时,安全。给大看板足够头部写全部 `new Chart()`。
+_HTML_BUILDER_MAX_TOKENS = int(os.environ.get("ADAPTER_HTML_BUILDER_MAX_TOKENS", "14000"))
 
 
 def _strip_md_fence(text: str) -> str:
@@ -1895,11 +1918,57 @@ def _strip_md_fence(text: str) -> str:
     return t.strip()
 
 
-def _call_upstream_html_builder(title: str, brief: str) -> str:
+def _digest_context_for_builder(context_messages: Optional[list], cap: int = 6000) -> str:
+    """B12:把对话历史蒸馏成给看板 builder 的「参考数据」文本块。
+
+    看板 builder 原本只看 title+brief、看不到对话里的真实数据(Excel 分析结果 /
+    用户贴的数据 / excel_query 工具结果)→ 只能编数字。这里抽取 user/assistant/tool
+    的文本内容(跳过 system 提示词、跳过纯 tool_call 无正文的 assistant 占位),
+    拼成上下文,塞进 builder 的 user message,逼它用真实数值。
+
+    末尾 cap 字符截断(保留最近的内容 —— 分析结论通常在后面),防把 builder 输入撑爆。
+    """
+    if not context_messages or not isinstance(context_messages, list):
+        return ""
+    chunks: list[str] = []
+    for m in context_messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role not in ("user", "assistant", "tool"):
+            continue  # 跳过 system(builder 有自己的 system prompt)
+        content = m.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):  # 多模态/分段 content
+            text = "".join(
+                str(seg.get("text", "")) for seg in content
+                if isinstance(seg, dict) and seg.get("type") == "text"
+            )
+        text = (text or "").strip()
+        if not text:
+            continue  # 纯 tool_call(无正文)的 assistant 占位跳过
+        label = {"user": "用户", "assistant": "助手", "tool": "数据/工具结果"}[role]
+        chunks.append(f"【{label}】{text}")
+    if not chunks:
+        return ""
+    joined = "\n".join(chunks)
+    if len(joined) > cap:
+        joined = "…(略)\n" + joined[-cap:]
+    return joined
+
+
+def _call_upstream_html_builder(title: str, brief: str,
+                                context_messages: Optional[list] = None) -> str:
     """单独发一个**无工具、自由生成、流式**的上游调用,让模型写出完整 HTML(自由写=强项)。
 
     返回抠净的 HTML 源码;失败/空返回 ""(调用方兜成 error artifact)。
     🔴 与 agent loop 同一上游凭据(env),不落盘。
+
+    B12(Excel→看板):``context_messages`` 非空时,把对话历史(含 Excel 分析的
+    真实数据)蒸馏后塞进 user message,让看板用真实数值作图、不编造。纯 generate_html
+    (无 Excel 上下文)时 context_messages 为空 → 行为与修前完全一致(零回归)。
 
     v0.6.6(2026-06-23,修 viz 504 ~37%):**改流式 `stream:True`**。非流式时整个
     ~178s 生成期 adapter→EAS **一个字节都不发**(静默),被上游 EAS 网关 ~183s idle
@@ -1911,11 +1980,22 @@ def _call_upstream_html_builder(title: str, brief: str) -> str:
     """
     base = UPSTREAM.rstrip("/")
     url = base + "/chat/completions" if base.endswith("/v1") else base + "/v1/chat/completions"
+    # B12:有对话上下文(Excel 分析数据等)时,把它作为「参考数据」前置到 user message,
+    # 并明确要求用真实数值。无上下文时退化成原始 title+brief(零回归)。
+    ctx = _digest_context_for_builder(context_messages)
+    if ctx:
+        user_content = (
+            "以下是本次对话的上下文(含已分析出的真实数据),做图表/看板时"
+            "**必须使用其中的真实数值,不得编造**:\n"
+            f"{ctx}\n\n———\n网页标题:{title}\n需求:{brief}"
+        )
+    else:
+        user_content = f"网页标题:{title}\n需求:{brief}"
     payload = {
         "model": AGENT_MODEL or "lxj",
         "messages": [
             {"role": "system", "content": HTML_BUILDER_PROMPT},
-            {"role": "user", "content": f"网页标题:{title}\n需求:{brief}"},
+            {"role": "user", "content": user_content},
         ],
         "stream": True,
         "max_tokens": _HTML_BUILDER_MAX_TOKENS,
@@ -1948,8 +2028,65 @@ def _call_upstream_html_builder(title: str, brief: str) -> str:
     return _strip_md_fence("".join(parts))
 
 
-def _make_file_renderer() -> Callable[[str, dict, str], dict]:
+# ── v0.6.9 B11 大文件分多步生成 ────────────────────────────────────────────
+# 治「大」:文件生成是「模型一次性出结构化大纲/数据 → 确定性渲染」,大 PPT(30+ 页)
+# /大表(数千行)/长文档的大纲 JSON 会撞 max_tokens 截断(finish_reason=length,末页
+# /末行丢)。Phase 1 = **数据级分多步累积**:模型把大任务拆成 N 个 part 多次调
+# generate_*(part_index 1→total_parts),每片各自 normalize(≤单次 cap),renderer 在
+# 闭包缓冲里累积,**末片才合并全部 + 渲染一次**。
+#
+# 为什么数据级累积、不做「产物级合并」(提案原文)?合并已渲染的 .pptx/.xlsx 文件极
+# brittle(python-pptx 跨 presentation 拷贝 slide 对 image/theme 出名地坑)。截断的根
+# 因是**模型输出**(结构化 JSON)太长 → 把模型输出分片即根治,而合并结构化 list(slides
+# /sheets/sections 拼接)是平凡操作、确定性渲染一次即可。同样彻底解截断,可靠得多。
+# HTML 看板不走分片(自由生成,非结构化)—— 由 Phase 0 的 _HTML_BUILDER_MAX_TOKENS=14000 兜。
+_FILE_GEN_MULTIPART = os.environ.get("ADAPTER_FILE_GEN_MULTIPART", "1").lower() not in ("0", "false", "no")
+# 可分多步的类型 → 累积时拼接的「内容列表键」。
+_FILE_GEN_PART_KEYS = {"generate_pptx": "slides", "generate_xlsx": "sheets", "generate_docx": "sections"}
+# 合并后的总上限(突破单次 normalize 的 per-call cap,但仍设天花板防滥用/失控)。
+_FILE_GEN_PART_TOTAL_CAP = {"generate_pptx": 200, "generate_xlsx": 40, "generate_docx": 400}
+# 单文件最多累积几片(防模型 total_parts 失控刷轮)。
+_FILE_GEN_MAX_PARTS = int(os.environ.get("ADAPTER_FILE_GEN_MAX_PARTS", "12"))
+
+
+def _merge_part_canonicals(tool_name: str, canonicals: list) -> dict:
+    """把多个已 normalize 的分片 canonical 合并成一个(取首片元数据 + 拼接内容列表)。
+
+    pptx/docx:直接拼接 slides/sections(各片是不同的页/节)。
+    xlsx:**按 sheet name 合并 rows**(治「大单表分多片」—— 同名表把 rows 接起来、
+    headers 用首见),不同名表则各自成表。全部裁到总上限。
+    """
+    key = _FILE_GEN_PART_KEYS[tool_name]
+    cap = _FILE_GEN_PART_TOTAL_CAP[tool_name]
+    base = dict(canonicals[0]) if canonicals else {}
+    if tool_name == "generate_xlsx":
+        merged: dict[str, dict] = {}
+        order: list[str] = []
+        for c in canonicals:
+            for sh in (c.get(key) or []):
+                nm = (sh.get("name") or "Sheet") if isinstance(sh, dict) else "Sheet"
+                if nm not in merged:
+                    merged[nm] = {"name": nm,
+                                  "headers": list(sh.get("headers") or []),
+                                  "rows": list(sh.get("rows") or [])}
+                    order.append(nm)
+                else:
+                    merged[nm]["rows"].extend(sh.get("rows") or [])
+        base[key] = [merged[nm] for nm in order][:cap]
+    else:
+        combined: list = []
+        for c in canonicals:
+            combined.extend(c.get(key) or [])
+        base[key] = combined[:cap]
+    return base
+
+
+def _make_file_renderer() -> Callable[..., dict]:
     """v0.5.0 B / v0.6.0 B+:依赖注入的多类型文件渲染器(分发器)。
+
+    签名 ``(tool_name, args, artifact_id, context_messages=None) -> dict``。
+    B12:context_messages 给 generate_html 看板用(注入对话里的真实数据),
+    其他类型忽略它。agentic_web 调用处传入当前对话 messages。
 
     返回 (tool_name, args, artifact_id) -> result dict,按 tool name 路由到对应的
     本仓确定性 generator(pptx/xlsx/docx/csv/html;写死模板,模型只出结构化数据)+
@@ -1977,8 +2114,14 @@ def _make_file_renderer() -> Callable[[str, dict, str], dict]:
         "generate_html": (html_generator.normalize_html, html_generator.build_html,
                           html_generator.safe_filename, "html", "text/html; charset=utf-8"),
     }
+    # B11 分多步:闭包内每请求一份的分片缓冲(dict 便于 _render 内 mutate 无需 nonlocal)。
+    # {"tool": 当前累积的工具名, "items": [已 normalize 的分片 canonical]}。
+    _part_state: dict = {"tool": None, "items": []}
 
-    def _render(tool_name: str, args: dict, artifact_id: str) -> dict:
+    def _render(tool_name: str, args: dict, artifact_id: str,
+                context_messages: Optional[list] = None,
+                part_index: int = 1, total_parts: int = 1,
+                finalize: bool = False) -> dict:
         if not _FILE_GEN_AVAILABLE:
             return {"ok": False, "error": "文件生成依赖未安装"}
         if not isinstance(args, dict):
@@ -1998,7 +2141,7 @@ def _make_file_renderer() -> Callable[[str, dict, str], dict]:
                     args.get("brief") or args.get("html") or args.get("content")
                     or args.get("spec") or ""
                 ).strip() or (title or "一个简单的网页")
-                html_src = _call_upstream_html_builder(title or "网页", brief)
+                html_src = _call_upstream_html_builder(title or "网页", brief, context_messages)
                 if not html_src or "<" not in html_src:
                     return {"ok": False, "error": "网页生成失败(模型未返回有效 HTML),请重试"}
                 data = html_generator.build_html({"title": title or "网页", "html": html_src})
@@ -2014,7 +2157,37 @@ def _make_file_renderer() -> Callable[[str, dict, str], dict]:
             if entry is None:
                 return {"ok": False, "error": f"不支持的文件类型:{tool_name}"}
             normalize_fn, build_fn, name_fn, ext, mime = entry
-            canonical = normalize_fn(args)
+
+            # ── B11 分多步累积:末片才合并渲染;非末片缓冲后返 partial ──────────
+            batchable = _FILE_GEN_MULTIPART and tool_name in _FILE_GEN_PART_KEYS
+            if finalize:
+                # 模型提前停(没发末片)的兜底:用已缓冲的合并出文件;空缓冲 → 错误。
+                if not _part_state["items"]:
+                    return {"ok": False, "error": "无可合并的内容(分多步未收到任何分片)"}
+                canonical = _merge_part_canonicals(
+                    _part_state["tool"] or tool_name, _part_state["items"])
+                _part_state["tool"], _part_state["items"] = None, []
+            elif batchable and isinstance(total_parts, int) and total_parts > 1:
+                if _part_state["tool"] not in (None, tool_name):
+                    _part_state["items"] = []  # 工具切换(异常)→ 丢旧缓冲重开
+                _part_state["tool"] = tool_name
+                _part_state["items"].append(normalize_fn(args))
+                not_last = (
+                    isinstance(part_index, int) and part_index < total_parts
+                    and len(_part_state["items"]) < _FILE_GEN_MAX_PARTS
+                )
+                if not_last:
+                    # 非末片:只累积、不渲染,返 partial 让 agentic_web 提示模型继续出下一片。
+                    return {"ok": True, "partial": True,
+                            "received": len(_part_state["items"]), "total": total_parts}
+                # 末片(或达分片上限):合并全部分片 → 渲染一次。
+                canonical = _merge_part_canonicals(tool_name, _part_state["items"])
+                _part_state["tool"], _part_state["items"] = None, []
+            else:
+                # 单次(零回归):清掉可能的残留缓冲,正常 normalize。
+                _part_state["tool"], _part_state["items"] = None, []
+                canonical = normalize_fn(args)
+
             data = build_fn(canonical)
             title = canonical.get("title", "") if isinstance(canonical, dict) else ""
             name = name_fn(title, ext)
@@ -2040,6 +2213,7 @@ def _make_file_renderer() -> Callable[[str, dict, str], dict]:
 def _build_agent_registry(
     excel_dataset_id: str = "", enable_plan: bool = False,
     enable_pptx: bool = False, enable_file_gen: bool = False,
+    excel_user_id: str = "",
 ) -> ToolRegistry:
     """无表格数据集时复用 web 工具单例;带数据集时新建一个 registry。
 
@@ -2087,7 +2261,7 @@ def _build_agent_registry(
     reg.register(WEB_FETCH_TOOL, _tool_impl_web_fetch)
     if AGENT_WEB_VIEW_ENABLED:
         reg.register(WEB_VIEW_TOOL, _tool_impl_web_view)
-    reg.register(EXCEL_QUERY_TOOL, _make_excel_query_impl(excel_dataset_id))
+    reg.register(EXCEL_QUERY_TOOL, _make_excel_query_impl(excel_dataset_id, excel_user_id))
     return reg
 
 
@@ -3310,6 +3484,11 @@ class Handler(BaseHTTPRequestHandler):
         # 本次请求挂一个绑定该数据集的 excel_query 工具。它是 adapter 私有控制
         # 字段,不能透传给上游模型 API,故从 extra 里排除。
         excel_dataset_id = str(payload.get("excel_dataset_id") or "").strip()
+        # B13(越权修复):excel_user_id 由 BFF 从已登录 session 服务端注入(/api/agent
+        # 覆盖客户端值),据此让 excel-poc 按 user 隔离解析数据集。与 excel_dataset_id
+        # 同属 adapter 私有控制字段,不透传上游模型 API。空值时 excel-poc 会 400
+        # (fail-closed):正常链路 BFF 必注入,空值只会出现在直连 adapter 的异常调用。
+        excel_user_id = str(payload.get("excel_user_id") or "").strip()
         _client_extra_body_check = payload.get("extra_body") if isinstance(payload.get("extra_body"), dict) else {}
         # v0.5.0 B / v0.6.0 B+(文件生成):两条触发路径,优先级最高、与 excel/web 互斥。
         # 共用总开关 ADAPTER_ENABLE_FILE_GEN + 渲染依赖在位(_FILE_GEN_AVAILABLE)。对象
@@ -3364,7 +3543,8 @@ class Handler(BaseHTTPRequestHandler):
                 # 文件(治 auto 路径 ~20-30% narrate)。见 agentic_web AgentConfig 字段注释。
                 cfg.force_required_on_intent_leak = True
         else:
-            registry = _build_agent_registry(excel_dataset_id, enable_plan=enable_plan_for_request)
+            registry = _build_agent_registry(excel_dataset_id, enable_plan=enable_plan_for_request,
+                                             excel_user_id=excel_user_id)
         # 带数据集时,**整体替换**为 Excel 专用系统提示词(而非在联网提示词上追加)
         # —— 联网那套的「必搜 / 没调工具就加未联网免责声明」会把模型带偏,且需
         # 明确告诉模型「数据集在 excel_query 工具后面、不在上下文里」,否则它会
@@ -3381,7 +3561,7 @@ class Handler(BaseHTTPRequestHandler):
                 cfg.system_prompt = EXCEL_AGENT_PLAN_PROMPT
                 cfg.enable_plan_and_execute = True
                 cfg.force_first_tool_name = "submit_analysis_plan"
-                cfg.plan_step_runner = _make_excel_run_step(excel_dataset_id)
+                cfg.plan_step_runner = _make_excel_run_step(excel_dataset_id, excel_user_id)
                 cfg.agent_plan_parallelism = AGENT_PLAN_PARALLELISM
                 cfg.agent_plan_step_timeout = AGENT_PLAN_STEP_TIMEOUT
                 cfg.agent_plan_total_timeout = AGENT_PLAN_TOTAL_TIMEOUT
@@ -3409,6 +3589,7 @@ class Handler(BaseHTTPRequestHandler):
             if k not in {
                 "messages", "model", "stream", "tools", "tool_choice",
                 "parallel_tool_calls", "excel_dataset_id", "extra_body",
+                "excel_user_id",  # B13:adapter 私有身份字段,不透传上游模型 API
                 "gen_pptx",  # v0.5.0 B:adapter 私有控制字段,不透传上游
                 "gen_file",  # v0.6.0 B+:同上(自动多类型触发字段)
                 "gen_file_force",  # v0.6.6 B9:同上(force 单开关字段)
@@ -3417,11 +3598,12 @@ class Handler(BaseHTTPRequestHandler):
         # extra_body 字段不能覆盖顶层已有同名键(顶层优先 —— 保留显式控制权)
         for _k, _v in client_extra_body.items():
             extra.setdefault(_k, _v)
-        # v0.5.0 B / v0.6.0 B+ / v0.6.6 B9:gen_pptx / gen_file / gen_file_force 可能从
-        # extra_body 解包进来 —— 在 setdefault 之后剔除,确保不透传上游(adapter 私有字段)。
+        # v0.5.0 B / v0.6.0 B+ / v0.6.6 B9 / B13:这些可能从 extra_body 解包进来 ——
+        # 在 setdefault 之后剔除,确保不透传上游(adapter 私有字段)。
         extra.pop("gen_pptx", None)
         extra.pop("gen_file", None)
         extra.pop("gen_file_force", None)
+        extra.pop("excel_user_id", None)
         # Inject a sane max_tokens default when the client didn't set one —
         # agentic answers need headroom or they truncate mid-thought.
         if not extra.get("max_tokens") and not extra.get("max_completion_tokens"):

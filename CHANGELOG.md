@@ -7,6 +7,34 @@
 
 ---
 
+## [v0.6.9-XXXXXXXX] — B11 大文件分多步生成 + B12 Excel→看板 + B13 excel-poc 越权透传 · 🔴 待部署
+> 五期 B11/B12/B13 三项后端改动合并发布。**版本号 v0.6.9,日期戳 / digest / ChangeOrder 待部署填**。
+
+> ### B11 大文件分多步生成(治大纲 JSON 撞顶截断 / 超大文件退化)
+> - **Phase0 扩 token**:`AGENT_DEFAULT_MAX_TOKENS` 8000→12000(`adapter.py`,治大纲 JSON 撞顶截断)+ `_HTML_BUILDER_MAX_TOKENS` 10000→14000(builder 已流式 v0.6.6,`_HTML_BUILDER_TIMEOUT` 是 **per-read 逐 chunk 超时非总时长上限** → 14000@~56tok/s≈250s 安全)。
+> - **Phase1 = 数据级分多步累积**(**非产物级合并**;截断根因是模型输出 JSON 太长,合并已渲染 .pptx 极 brittle):
+>   - `GENERATE_PPTX/XLSX/DOCX_TOOL` schema 加 `part_index` / `total_parts`(`agentic_web.py`)+ `FILE_GEN_PROMPT` / `FILE_GEN_FORCE_PROMPT` 加分多步指引。
+>   - `_make_file_renderer` 闭包累积分片:**非末片返 `{partial:True}` 不渲染**,末片 `_merge_part_canonicals` 合并(slides / sections 拼接、sheets 按名合并 rows,总上限 **200 / 40 / 400**)。
+>   - 拦截分支续片**复用同 artifact_id**;partial **不置 `file_gen_dispatch_done`**;模型提前停的**早停兜底**(content 路径用暂存分片 finalize,守卫避免 intent-leak 二次生成)。
+>   - env 开关:`ADAPTER_FILE_GEN_MULTIPART`(默认**开**)/ `ADAPTER_FILE_GEN_MAX_PARTS`(默认 **12**)。**HTML 看板不分片**(自由生成)由 Phase0 14K 兜。
+> - **自测**:merge 4 项 + renderer 6 项(part1/2 partial、part3 合并出 7 页真 pptx 无截断、单次零回归、finalize 兜底)。
+
+> ### B12 Excel→看板(给 html builder 注入对话上下文,看板用真实数据)
+> - `_call_upstream_html_builder` 加 `context_messages` 参 + 新 `_digest_context_for_builder`(蒸馏对话历史:抽 user/assistant/tool 文本、跳 system、跳纯 tool_call 占位、末尾 cap **6000 字**)塞进 builder user message + 明确「**做图表必须用其中真实数值,不得编造**」。
+> - `_make_file_renderer._render` 签名加第 4 参 `context_messages`,`agentic_web.py` 拦截点传 `augmented`,`AgentConfig.file_renderer` 类型放宽。
+> - **无上下文时零回归**(退化原 title+brief)。自测 digest 4 项过。
+> - ⚠️ **file_gen 与 excel 模式互斥** → 「分析+看板」走两轮流。
+
+> ### B13 adapter 透传(B13 提案漏的缺口:adapter 也调 excel-poc `/ask`)
+> - `_call_excel_backend` / `_make_excel_query_impl` / `_make_excel_run_step` 透 `user_id` → 发 `X-User-Id` header。
+> - handler 从 `payload.excel_user_id` 取(BFF 注入,**从透传上游模型 API 的 extra 剔除**,不泄私有字段)。
+> - **空 uid 短路返清晰错误**(reviewer P1-1)。
+
+> ### 部署
+> - 🔴 **未部署**。**部署顺序必须 BFF+adapter 先 → excel-poc 最后**(excel-poc 强制要 `X-User-Id`)。
+> - ⚠️ **无 PROTOCOL 信封变更,前端无感**(`excel_user_id` 由 BFF 注入)。
+> - runbook `lxj-adapter-deploy/runbooks/deploy-2026-06-24-b13-excel-isolation.md`。
+
 ## [v0.6.8-20260624] — file_gen auto 路径 narrate 续轮兜底:治 ~20-30%「我来生成…」不出文件 · ✅ 已上线(digest b919c587,ChangeOrder d0c43759,PreStop+33env 保留)
 > **背景**:B9(v0.6.6)「生成文件」force chip(`tool_choice=required`)已治**显式**路径 narrate(force 16 次 0 narrate);但 **auto** 路径(`gen_file:true` 不含 `gen_file_force` —— 前端 `detectFileGenIntent` 预路由命中、用户没点 chip)仍 `tool_choice=auto`,给模型「不生成只文字」退路 → 偶发 ~20-30% 只回「我来为您生成一个 Excel…」**不 emit tool_call**,用户干等拿不到文件。NOW.md 🟡 viz follow-up 登记的独立项。
 > **根因(双重,比文档记的更深)**:① **检测漏** —— 既有全局 intent-leak 检测器(`_INTENT_LEAD_PHRASES`/`_INTENT_NARRATE_RE`/`_DANGLING_INTENT_RE`)是给 web/excel「查询/分析」场景调校的:引导词无「我来」、动作词只有 查询/分析/调用/获取…,**完全漏掉 file_gen 场景的「我来…生成…文件」**;② **续轮强制不了** —— 就算命中,file_gen auto 不设 `force_required_tool`/`force_first_tool_name`,intent-leak 续轮的 `force_tool_choice_next` 在主循环两个强制分支都进不去 → 续轮仍 `auto`,模型可能继续 narrate。
