@@ -58,6 +58,9 @@ COPY xlsx_generator.py /app/xlsx_generator.py
 COPY docx_generator.py /app/docx_generator.py
 COPY csv_generator.py /app/csv_generator.py
 COPY html_generator.py /app/html_generator.py
+# v0.6.x B14(文件能力优化):md / txt 确定性渲染(纯 stdlib)
+COPY md_generator.py /app/md_generator.py
+COPY txt_generator.py /app/txt_generator.py
 
 EXPOSE 8000
 

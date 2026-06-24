@@ -75,6 +75,8 @@ try:
     import docx_generator  # type: ignore
     import csv_generator   # type: ignore
     import html_generator  # type: ignore
+    import md_generator    # type: ignore  # B14 文件能力优化(.md,纯 stdlib)
+    import txt_generator   # type: ignore  # B14 文件能力优化(.txt,纯 stdlib)
     import oss_store  # type: ignore
     _FILE_GEN_AVAILABLE = True
 except Exception as _file_gen_import_exc:  # noqa: BLE001 — 缺依赖优雅降级
@@ -83,6 +85,8 @@ except Exception as _file_gen_import_exc:  # noqa: BLE001 — 缺依赖优雅降
     docx_generator = None  # type: ignore
     csv_generator = None   # type: ignore
     html_generator = None  # type: ignore
+    md_generator = None    # type: ignore
+    txt_generator = None   # type: ignore
     oss_store = None  # type: ignore
     _FILE_GEN_AVAILABLE = False
 
@@ -1862,6 +1866,8 @@ _ARTIFACT_EXT_MIME: dict[str, str] = {
     "docx": f"{_OOXML}.wordprocessingml.document",
     "csv": "text/csv; charset=utf-8",
     "html": "text/html; charset=utf-8",
+    "md": "text/markdown; charset=utf-8",
+    "txt": "text/plain; charset=utf-8",
     "pdf": "application/pdf",
 }
 
@@ -2112,6 +2118,10 @@ def _make_file_renderer() -> Callable[..., dict]:
                           docx_generator.safe_filename, "docx", f"{_OOXML}.wordprocessingml.document"),
         "generate_csv": (csv_generator.normalize_table, csv_generator.build_csv,
                          csv_generator.safe_filename, "csv", "text/csv; charset=utf-8"),
+        "generate_md": (md_generator.normalize_md, md_generator.build_md,
+                        md_generator.safe_filename, "md", "text/markdown; charset=utf-8"),
+        "generate_txt": (txt_generator.normalize_txt, txt_generator.build_txt,
+                         txt_generator.safe_filename, "txt", "text/plain; charset=utf-8"),
         "generate_html": (html_generator.normalize_html, html_generator.build_html,
                           html_generator.safe_filename, "html", "text/html; charset=utf-8"),
     }
@@ -3380,7 +3390,7 @@ class Handler(BaseHTTPRequestHandler):
                         # v0.5.0 B / v0.6.0 B+(文件生成):生成通路 + 对象存储就绪状态(非敏感)
                         "file_gen_enabled": bool(ADAPTER_ENABLE_FILE_GEN and _FILE_GEN_AVAILABLE),
                         "file_gen_types": (
-                            ["pptx", "xlsx", "docx", "csv", "html"] if _FILE_GEN_AVAILABLE else []
+                            ["pptx", "xlsx", "docx", "csv", "html", "md", "txt"] if _FILE_GEN_AVAILABLE else []
                         ),
                         # 兼容键:v0.5.0 起前端/测试/运维探针用 pptx_gen_enabled 判部署成功,保留。
                         "pptx_gen_enabled": bool(ADAPTER_ENABLE_FILE_GEN and _FILE_GEN_AVAILABLE),
