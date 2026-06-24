@@ -4320,8 +4320,7 @@ def run_agent_stream(
                     ok = bool(render_result.get("ok"))
 
                     # B11 分多步:非末片累积成功(partial)→ 不出 ready,提示模型继续出下一片。
-                    # 关键:**不置 file_gen_dispatch_done** → 续轮仍挂生成工具/保持 force,
-                    # 模型据 tool_result 提示 emit 下一片(part_index 递增)。
+                    # 关键:**不置 file_gen_dispatch_done** → 续轮仍挂生成工具。
                     if ok and render_result.get("partial"):
                         received = int(render_result.get("received") or part_index)
                         file_gen_pending = {
@@ -4331,6 +4330,12 @@ def run_agent_stream(
                             "kind": f_kind, "ext": f_ext,
                             "mime": f_mime, "preview": f_preview,
                         }
+                        # 🔴 B11 修补(测试域 P1):续片轮**架构强制**必调工具,不靠 prompt 兜。
+                        # _force_this_turn=iteration==1 → 续片轮(iter≥2)默认不 force、降回 auto,
+                        # K2.6 可能 narrate 不出下一片。置 force_tool_choice_next=True → 下轮
+                        # _force_this_turn=True → 进 required 分支(force 模式 force_required_tool /
+                        # auto 模式 force_required_on_intent_leak 任一满足)→ 逼模型 emit 下一片。
+                        force_tool_choice_next = True
                         partial_tool_result = {
                             "ok": True,
                             "partial": True,

@@ -16,8 +16,9 @@
 >   - `GENERATE_PPTX/XLSX/DOCX_TOOL` schema 加 `part_index` / `total_parts`(`agentic_web.py`)+ `FILE_GEN_PROMPT` / `FILE_GEN_FORCE_PROMPT` 加分多步指引。
 >   - `_make_file_renderer` 闭包累积分片:**非末片返 `{partial:True}` 不渲染**,末片 `_merge_part_canonicals` 合并(slides / sections 拼接、sheets 按名合并 rows,总上限 **200 / 40 / 400**)。
 >   - 拦截分支续片**复用同 artifact_id**;partial **不置 `file_gen_dispatch_done`**;模型提前停的**早停兜底**(content 路径用暂存分片 finalize,守卫避免 intent-leak 二次生成)。
+>   - 🔴 **续片架构强制**(测试域核查门 P1,2026-06-24):`_force_this_turn=iteration==1` → force 模式续片轮(iter≥2)默认降回 auto、靠 prompt 兜,K2.6 可能续片时 narrate 不出下一片。**修**:partial 分支置 `force_tool_choice_next=True` → 下轮进 required 分支(force 模式 `force_required_tool` / auto 模式 `force_required_on_intent_leak` 任一满足)→ **架构强制**必调工具续片(复用 v0.2.30 续轮基建,无 intent-leak content 分隔符,只发 progress)。
 >   - env 开关:`ADAPTER_FILE_GEN_MULTIPART`(默认**开**)/ `ADAPTER_FILE_GEN_MAX_PARTS`(默认 **12**)。**HTML 看板不分片**(自由生成)由 Phase0 14K 兜。
-> - **自测**:merge 4 项 + renderer 6 项(part1/2 partial、part3 合并出 7 页真 pptx 无截断、单次零回归、finalize 兜底)。
+> - **自测**:merge 4 项 + renderer 6 项(part1/2 partial、part3 合并出 7 页真 pptx 无截断、单次零回归、finalize 兜底);续片强制 = 控制流逻辑核 + 测试域 live 组合验。
 
 > ### B12 Excel→看板(给 html builder 注入对话上下文,看板用真实数据)
 > - `_call_upstream_html_builder` 加 `context_messages` 参 + 新 `_digest_context_for_builder`(蒸馏对话历史:抽 user/assistant/tool 文本、跳 system、跳纯 tool_call 占位、末尾 cap **6000 字**)塞进 builder user message + 明确「**做图表必须用其中真实数值,不得编造**」。
