@@ -47,6 +47,7 @@ from agentic_web import (
     ALL_FILE_GEN_TOOLS,  # v0.6.0 B+ 多类型文件生成(自动识别模式挂全部 generate_*)
     EXCEL_AGENT_SYSTEM_PROMPT,
     EXCEL_AGENT_PLAN_PROMPT,  # v0.3.0 D Phase 1
+    EXCEL_FILE_GEN_PROMPT,  # v0.6.10 B12 组合模式(分析表+做看板)系统提示词
     EXCEL_QUERY_TOOL,
     FILE_GEN_PROMPT,     # v0.6.0 B+ 自动识别模式系统提示词
     FILE_GEN_FORCE_PROMPT,  # v0.6.6 B9「生成文件」force 单开关系统提示词
@@ -2237,6 +2238,15 @@ def _build_agent_registry(
         reg = ToolRegistry()
         reg.register_schema_only(GENERATE_PPTX_TOOL)
         return reg
+    if enable_file_gen and excel_dataset_id and EXCEL_BACKEND_URL:
+        # v0.6.10 B12 组合模式(「分析表+做看板」):挂 excel_query(真 impl,查真实数据)
+        # + 全部 generate_*(schema-only,由 file_gen 拦截分支渲染)。模型**先查表再生成**
+        # → 看板/图表用真数据(治测试域 live FAIL:之前 file_gen 不挂 excel_query,看板编数据)。
+        reg = ToolRegistry()
+        reg.register(EXCEL_QUERY_TOOL, _make_excel_query_impl(excel_dataset_id, excel_user_id))
+        for tool in ALL_FILE_GEN_TOOLS:
+            reg.register_schema_only(tool)
+        return reg
     if enable_file_gen:
         # v0.6.0 B+:挂全部 generate_* schema(register_schema_only)—— impl 同样由
         # file_gen 拦截分支按 tool name 路由处理,不走 dispatch。不设 force_first →
@@ -3505,8 +3515,16 @@ class Handler(BaseHTTPRequestHandler):
         #   file_gen_mode 内生效(单独发 gen_file_force 而无 gen_file 不触发)。
         gen_file_force_req = bool(payload.get("gen_file_force")) or bool(_client_extra_body_check.get("gen_file_force"))
         pptx_mode = gen_pptx_req and ADAPTER_ENABLE_FILE_GEN and _FILE_GEN_AVAILABLE
+        # v0.6.10 B12:组合模式 —— 用户上传了表格数据集 + 想要文件/看板(gen_file)。挂
+        # excel_query + generate_*,先查表再生成,看板用真数据。优先于纯 file_gen_mode
+        # (前端 force 时 body 同时带 gen_file + excel_dataset_id;此前 file_gen 忽略后者→编数据)。
+        excel_file_gen_mode = (
+            gen_file_req and bool(excel_dataset_id) and bool(EXCEL_BACKEND_URL)
+            and not pptx_mode and ADAPTER_ENABLE_FILE_GEN and _FILE_GEN_AVAILABLE
+        )
         file_gen_mode = (
-            gen_file_req and not pptx_mode and ADAPTER_ENABLE_FILE_GEN and _FILE_GEN_AVAILABLE
+            gen_file_req and not pptx_mode and not excel_file_gen_mode
+            and ADAPTER_ENABLE_FILE_GEN and _FILE_GEN_AVAILABLE
         )
         # v0.3.0 D Phase 1:Plan-and-Execute 模式 per-request 开关(env 控制,client
         # extra_body.enable_plan_and_execute 可覆盖,便于灰度)。仅作用于带数据集的请求。
@@ -3522,6 +3540,18 @@ class Handler(BaseHTTPRequestHandler):
             cfg.force_first_tool_name = "generate_pptx"
             cfg.file_renderer = _make_file_renderer()
             cfg.citation_guard = False  # 文件生成无 URL 概念,关引用合规审计
+        elif excel_file_gen_mode:
+            # v0.6.10 B12:组合模式 —— excel_query + generate_* 都挂。**首轮强制 excel_query**
+            # 查真数据(防直接 generate_html 编数据 / 防 narrate),后续轮模型自决调 generate_*
+            # 把真数据做成看板。B12 context 注入(augmented 含 excel_query 结果)→ builder 用真数据。
+            # 不用 force_required_tool(那会逼首轮就生成,没数据);用 force_first=excel_query。
+            registry = _build_agent_registry(excel_dataset_id, enable_file_gen=True,
+                                             excel_user_id=excel_user_id)
+            cfg.system_prompt = EXCEL_FILE_GEN_PROMPT
+            cfg.enable_file_gen = True
+            cfg.file_renderer = _make_file_renderer()
+            cfg.force_first_tool_name = "excel_query"  # 首轮先查表
+            cfg.citation_guard = False
         elif file_gen_mode:
             # v0.6.0 B+:挂全部 generate_*,模型自决类型;auto 还是 force 看 gen_file_force。
             registry = _build_agent_registry(enable_file_gen=True)
@@ -3549,7 +3579,7 @@ class Handler(BaseHTTPRequestHandler):
         # —— 联网那套的「必搜 / 没调工具就加未联网免责声明」会把模型带偏,且需
         # 明确告诉模型「数据集在 excel_query 工具后面、不在上下文里」,否则它会
         # 误判「没材料」而拒答。文件生成模式(pptx/file_gen)与 excel 互斥,跳过此段。
-        if not pptx_mode and not file_gen_mode and excel_dataset_id and EXCEL_BACKEND_URL:
+        if not pptx_mode and not file_gen_mode and not excel_file_gen_mode and excel_dataset_id and EXCEL_BACKEND_URL:
             if enable_plan_for_request:
                 # v0.4.0 D 重构:Plan-and-Execute 一等公民模式
                 # 1. system prompt 用 PLAN(不是旧 SYSTEM)
