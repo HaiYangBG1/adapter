@@ -7,8 +7,8 @@
 
 ---
 
-## [v0.6.9-XXXXXXXX] — B11 大文件分多步生成 + B12 Excel→看板 + B13 excel-poc 越权透传 · 🔴 待部署
-> 五期 B11/B12/B13 三项后端改动合并发布。**版本号 v0.6.9,日期戳 / digest / ChangeOrder 待部署填**。
+## [v0.6.9-20260624] — B11 大文件分多步生成 + B12 Excel→看板 + B13 excel-poc 越权透传 · ✅ 已上线 2026-06-24
+> 五期 B11/B12/B13 三项后端改动合并发布。
 
 > ### B11 大文件分多步生成(治大纲 JSON 撞顶截断 / 超大文件退化)
 > - **Phase0 扩 token**:`AGENT_DEFAULT_MAX_TOKENS` 8000→12000(`adapter.py`,治大纲 JSON 撞顶截断)+ `_HTML_BUILDER_MAX_TOKENS` 10000→14000(builder 已流式 v0.6.6,`_HTML_BUILDER_TIMEOUT` 是 **per-read 逐 chunk 超时非总时长上限** → 14000@~56tok/s≈250s 安全)。
@@ -32,7 +32,7 @@
 > - **空 uid 短路返清晰错误**(reviewer P1-1)。
 
 > ### 部署
-> - 🔴 **未部署**。**部署顺序必须 BFF+adapter 先 → excel-poc 最后**(excel-poc 强制要 `X-User-Id`)。
+> - **✅ 已上线(2026-06-24)**:image-only 部署(digest `sha256:205890f1fb1613220babb92857a349353b3b294199d7bfb9df00b5ce54011906`,ChangeOrder `838a9b0f-b800-4c6d-82c0-e93227cda725`;**33 env + PreStop sleep25 保留**,镜像内自检 `SELFCHECK_OK file_gen`,RUNNING 2 实例)。**部署顺序锁满足**:bus-check 实证前端 0.17.11 + adapter v0.6.9 **先 live**(都在发 `X-User-Id`)→ excel-poc v0.3.0 最后上,**无 400 中断窗口**。漂移基线刷 v0.6.8→v0.6.9。
 > - ⚠️ **无 PROTOCOL 信封变更,前端无感**(`excel_user_id` 由 BFF 注入)。
 > - runbook `lxj-adapter-deploy/runbooks/deploy-2026-06-24-b13-excel-isolation.md`。
 
