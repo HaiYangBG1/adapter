@@ -7,6 +7,15 @@
 
 ---
 
+## [v0.6.12-20260626] — agent 文件生成计入鸡分额度(Bug1 Step1)· ✅ 已上线 2026-06-26
+> **背景**:agent(文件生成)请求原 EAS 直连、绕过 LiteLLM → 算力不计用户鸡分。让其计费(用户拍「① 开始消耗积分 ② 进行中不中断」)。
+> **改**(`adapter.py`,纯加法、无新依赖,fast-path build):
+> - 新增 env `ADAPTER_BILLING_UPSTREAM_BASE_URL`(= LiteLLM main `https://llm.lxjchina.com.cn/v1`)+ `ADAPTER_BILLING_MODEL`(=`lxj`)。
+> - `_build_agent_config(model, user_llm_key)`:BFF 经头 `X-User-LLM-Key` 传登录用户 LiteLLM key 时,基座调用改走 **LiteLLM main**(裸名 `lxj`,防 `chick-lxj` 回环)+ 该用户 key 鉴权(硬用 `Authorization`)→ spend 计在用户 key;无头 → 回退 EAS 现状、不计、零回归。
+> - `_call_upstream_html_builder` + `_make_file_renderer(cfg)`:viz/html 自由生成调用沿用同一 cfg 上游(同计费身份)。
+> - 🔴 user key 只本次取用、不落日志/盘。reviewer 核查门过(写者≠审者);py_compile 绿;build 内 `_FILE_GEN_AVAILABLE` 自检过。
+> **上线**:digest `sha256:8fe56877895a83a1cd982e78627eee8f3e5b4dc9a30dcde2fcd8ce0d1fc574c7`,git `44dea3d`。SAE DeployApplication ChangeOrder `0ea32a51-e69b-4c6b-977e-c6a366911364`(Status=2 · batch1),线上 config 实证 ImageUrl `v0.6.12-20260626` + **35 env**(`ADAPTER_BILLING_*` 已加 + 33 原 env/secret 全保)+ **PreStop sleep25 保留** + Replicas 2。配套前端 `0.17.28`(发 `X-User-LLM-Key` + headroom 准入门)。🔴 **前置根因**:LiteLLM `chick-lxj`/`chick-lxj-web`/`lxj` 三模型原 cost=None(chat/agent 都不计费)→ 已配 kimi-k2.6 费率(`/model/update`,LIVE)。🅿️ Step1.1:loop 内 budget-exceeded 优雅收尾兜底(当前靠保守 RESERVE 1.0 元规避)。大表 excel-poc 计费=Step2。
+
 ## [v0.6.11-20260624] — B14 文件生成扩展:md / txt(文件能力优化标准包)· ✅ 已上线 2026-06-24
 > **背景**:用户「继续做优化」,文件能力优化标准包(decisions 06-24)。原只生成 pptx/xlsx/docx/csv/html 5 类,补常见 **markdown(.md)** + **纯文本(.txt)**。
 > **改**(纯加法,A 铁律):
