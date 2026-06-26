@@ -167,6 +167,14 @@ WEB_AI_NEWS_MAX_SOURCES = int(os.environ.get("ADAPTER_WEB_AI_NEWS_MAX_SOURCES", 
 
 # Agentic web — endpoint /v1/agent/chat/completions
 AGENT_MODEL = os.environ.get("ADAPTER_AGENT_MODEL", "")  # if empty, use payload's "model"
+# 计额度(Bug1 / Step1,2026-06-26):BFF 在 /api/agent 带 `X-User-LLM-Key` 头(已登录用户的
+# LiteLLM key)时,本次 agent 的**基座调用改走 LiteLLM**(而非默认 EAS 直连 UPSTREAM),用该用户
+# key 鉴权 → spend 累加在用户 key 上(前端额度行可见)。模型用 LiteLLM 公开**裸名 `lxj`**(直连基座、
+# 不回环 adapter)。无此头(APIKEY 用户/未登录异常)→ 回退 UPSTREAM 现状,不计额度、不回归。
+# 走 main 网关(`llm.lxjchina.com.cn`,带 Langfuse 审计;用户 2026-06-26 拍)。详见
+# `../../pm/changes/20260626-agent模式计入鸡分额度.md`。
+BILLING_UPSTREAM_BASE_URL = os.environ.get("ADAPTER_BILLING_UPSTREAM_BASE_URL", "").rstrip("/")
+BILLING_MODEL = os.environ.get("ADAPTER_BILLING_MODEL", "lxj")
 AGENT_TIMEOUT = int(os.environ.get("ADAPTER_AGENT_TIMEOUT", "120"))
 AGENT_MAX_TOOL_RESULT_CHARS = int(os.environ.get("ADAPTER_AGENT_MAX_TOOL_RESULT_CHARS", "8000"))
 AGENT_PARALLEL_WORKERS = int(os.environ.get("ADAPTER_AGENT_PARALLEL_WORKERS", "4"))
@@ -1967,7 +1975,9 @@ def _digest_context_for_builder(context_messages: Optional[list], cap: int = 600
 
 
 def _call_upstream_html_builder(title: str, brief: str,
-                                context_messages: Optional[list] = None) -> str:
+                                context_messages: Optional[list] = None,
+                                *, upstream_url: str = "", auth_header: str = "",
+                                auth_value: Optional[str] = None, model: str = "") -> str:
     """单独发一个**无工具、自由生成、流式**的上游调用,让模型写出完整 HTML(自由写=强项)。
 
     返回抠净的 HTML 源码;失败/空返回 ""(调用方兜成 error artifact)。
@@ -1985,8 +1995,13 @@ def _call_upstream_html_builder(title: str, brief: str,
     累积 `delta.content`(天然跳过 reasoning_content,与原读 message.content 同字段);
     urlopen 的 timeout 是 per-read(逐 chunk 重置),流式不连续超 240s 即活。
     """
-    base = UPSTREAM.rstrip("/")
-    url = base + "/chat/completions" if base.endswith("/v1") else base + "/v1/chat/completions"
+    # 计额度(Step1):override 非空时用 agent cfg 的同一上游(LiteLLM + 用户 key + lxj),
+    # 让 viz/html 自由生成调用与 agent loop **同一计费身份**;否则回退 UPSTREAM 全局(现状)。
+    if upstream_url:
+        url = upstream_url
+    else:
+        base = UPSTREAM.rstrip("/")
+        url = base + "/chat/completions" if base.endswith("/v1") else base + "/v1/chat/completions"
     # B12:有对话上下文(Excel 分析数据等)时,把它作为「参考数据」前置到 user message,
     # 并明确要求用真实数值。无上下文时退化成原始 title+brief(零回归)。
     ctx = _digest_context_for_builder(context_messages)
@@ -1999,7 +2014,7 @@ def _call_upstream_html_builder(title: str, brief: str,
     else:
         user_content = f"网页标题:{title}\n需求:{brief}"
     payload = {
-        "model": AGENT_MODEL or "lxj",
+        "model": model or AGENT_MODEL or "lxj",
         "messages": [
             {"role": "system", "content": HTML_BUILDER_PROMPT},
             {"role": "user", "content": user_content},
@@ -2008,9 +2023,11 @@ def _call_upstream_html_builder(title: str, brief: str,
         "max_tokens": _HTML_BUILDER_MAX_TOKENS,
         "temperature": 0.7,
     }
+    _hdr = auth_header or UPSTREAM_AUTH_HEADER
+    _auth = auth_value if auth_value is not None else (f"Bearer {UPSTREAM_API_KEY}" if UPSTREAM_API_KEY else "")
     headers = {"Content-Type": "application/json"}
-    if UPSTREAM_API_KEY:
-        headers[UPSTREAM_AUTH_HEADER] = f"Bearer {UPSTREAM_API_KEY}"
+    if _auth:
+        headers[_hdr] = _auth
     req = urllib.request.Request(
         url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers=headers, method="POST",
@@ -2088,7 +2105,7 @@ def _merge_part_canonicals(tool_name: str, canonicals: list) -> dict:
     return base
 
 
-def _make_file_renderer() -> Callable[..., dict]:
+def _make_file_renderer(cfg: Optional[AgentConfig] = None) -> Callable[..., dict]:
     """v0.5.0 B / v0.6.0 B+:依赖注入的多类型文件渲染器(分发器)。
 
     签名 ``(tool_name, args, artifact_id, context_messages=None) -> dict``。
@@ -2152,7 +2169,15 @@ def _make_file_renderer() -> Callable[..., dict]:
                     args.get("brief") or args.get("html") or args.get("content")
                     or args.get("spec") or ""
                 ).strip() or (title or "一个简单的网页")
-                html_src = _call_upstream_html_builder(title or "网页", brief, context_messages)
+                # 计额度(Step1):viz/html 自由生成调用沿用本次 agent cfg 的同一上游凭据
+                # (billing 时 = LiteLLM + 用户 key + lxj),与 agent loop 同一计费身份。
+                html_src = _call_upstream_html_builder(
+                    title or "网页", brief, context_messages,
+                    upstream_url=(cfg.upstream_url if cfg else ""),
+                    auth_header=(cfg.upstream_auth_header if cfg else ""),
+                    auth_value=(cfg.upstream_auth_value if cfg else None),
+                    model=(cfg.model if cfg else ""),
+                )
                 if not html_src or "<" not in html_src:
                     return {"ok": False, "error": "网页生成失败(模型未返回有效 HTML),请重试"}
                 data = html_generator.build_html({"title": title or "网页", "html": html_src})
@@ -2285,18 +2310,32 @@ def _build_agent_registry(
     return reg
 
 
-def _build_agent_config(model_from_payload: str) -> AgentConfig:
-    """Resolve agent config from env + payload."""
-    base = UPSTREAM.rstrip("/")
+def _build_agent_config(model_from_payload: str, user_llm_key: str = "") -> AgentConfig:
+    """Resolve agent config from env + payload.
+
+    计额度(Step1):``user_llm_key`` 非空且 ``BILLING_UPSTREAM_BASE_URL`` 已配 → 基座调用改走
+    LiteLLM(用该用户 key + 裸名 ``BILLING_MODEL``=lxj)→ spend 计在用户 key 上。否则回退 EAS 直连
+    (现状,不计额度)。上游 URL / auth / model 三者一起切,保证整次 agent loop 同一计费身份。
+    """
+    if user_llm_key and BILLING_UPSTREAM_BASE_URL:
+        base = BILLING_UPSTREAM_BASE_URL
+        # LiteLLM 用标准 `Authorization`,**不沿用** EAS 的 UPSTREAM_AUTH_HEADER(reviewer P2:
+        # 二者若不同〈如 EAS 用非标准 token 头〉,billing 路径会发错 header → 计费链断)。
+        auth_header = "Authorization"
+        auth_value = f"Bearer {user_llm_key}"
+        model = BILLING_MODEL or "lxj"
+    else:
+        base = UPSTREAM.rstrip("/")
+        auth_header = UPSTREAM_AUTH_HEADER
+        auth_value = f"Bearer {UPSTREAM_API_KEY}" if UPSTREAM_API_KEY else ""
+        model = AGENT_MODEL or model_from_payload or ""
     if base.endswith("/v1"):
         upstream_url = base + "/chat/completions"
     else:
         upstream_url = base + "/v1/chat/completions"
-    auth_value = f"Bearer {UPSTREAM_API_KEY}" if UPSTREAM_API_KEY else ""
-    model = AGENT_MODEL or model_from_payload or ""
     return AgentConfig(
         upstream_url=upstream_url,
-        upstream_auth_header=UPSTREAM_AUTH_HEADER,
+        upstream_auth_header=auth_header,
         upstream_auth_value=auth_value,
         model=model,
         request_timeout=AGENT_TIMEOUT,
@@ -3496,7 +3535,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": "'messages' is required", "type": "bad_request"}})
             return
         model_from_payload = str(payload.get("model") or "")
-        cfg = _build_agent_config(model_from_payload)
+        # 计额度(Step1,Bug1):BFF 在 /api/agent 注入已登录用户的 LiteLLM key(头
+        # `X-User-LLM-Key`)。有则本次 agent 的基座调用走 LiteLLM、计在该用户 key 上(前端额度
+        # 行可见);无(APIKEY 用户/未登录异常)则回退 EAS 直连现状、不计额度、不回归。🔴 不落日志/盘。
+        user_llm_key = (self.headers.get("X-User-LLM-Key") or "").strip()
+        cfg = _build_agent_config(model_from_payload, user_llm_key)
         if not cfg.model:
             self._send_json(400, {"error": {"message": "'model' is required (or set ADAPTER_AGENT_MODEL)", "type": "bad_request"}})
             return
@@ -3548,7 +3591,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg.system_prompt = PPTX_GEN_PROMPT
             cfg.enable_file_gen = True
             cfg.force_first_tool_name = "generate_pptx"
-            cfg.file_renderer = _make_file_renderer()
+            cfg.file_renderer = _make_file_renderer(cfg)
             cfg.citation_guard = False  # 文件生成无 URL 概念,关引用合规审计
         elif excel_file_gen_mode:
             # v0.6.10 B12:组合模式 —— excel_query + generate_* 都挂。**首轮强制 excel_query**
@@ -3559,14 +3602,14 @@ class Handler(BaseHTTPRequestHandler):
                                              excel_user_id=excel_user_id)
             cfg.system_prompt = EXCEL_FILE_GEN_PROMPT
             cfg.enable_file_gen = True
-            cfg.file_renderer = _make_file_renderer()
+            cfg.file_renderer = _make_file_renderer(cfg)
             cfg.force_first_tool_name = "excel_query"  # 首轮先查表
             cfg.citation_guard = False
         elif file_gen_mode:
             # v0.6.0 B+:挂全部 generate_*,模型自决类型;auto 还是 force 看 gen_file_force。
             registry = _build_agent_registry(enable_file_gen=True)
             cfg.enable_file_gen = True
-            cfg.file_renderer = _make_file_renderer()
+            cfg.file_renderer = _make_file_renderer(cfg)
             cfg.citation_guard = False
             if gen_file_force_req:
                 # v0.6.6 B9 force(「生成文件」chip 开):tool_choice=required,模型**只判
