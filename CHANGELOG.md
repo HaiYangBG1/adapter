@@ -7,14 +7,16 @@
 
 ---
 
-## [v0.6.13] — 大表 plan-and-execute 规划前预取真实表结构(治「盲规划」)· ⏳ code-complete,未部署(待授权)
+## [v0.6.13-20260628] — 大表 plan-and-execute 规划前预取真实表结构(治「盲规划」)· ✅ 已上线 2026-06-28
 > **Bug**(用户报 + 看图坐实):大表分析「多步规划」里,**模型规划时根本不知道表结构** —— plan prompt `EXCEL_AGENT_PLAN_PROMPT` 结尾的 `{schema}` 占位符**从来没被填充**(`adapter.py` 裸赋值 `cfg.system_prompt = EXCEL_AGENT_PLAN_PROMPT`,全仓无 `.format(schema=...)`)。被迫盲规划 → 模型要么瞎猜分析 step 的维度/列名,要么自己加一个「查看表结构」step 当 step_1 却**不给后续 step 填 `depends_on`** → 拓扑排序把多步全塞进同一并行批 → **「查看表结构」还在跑,分析 step 已经各自盲查跑完**(用户截图现象)。更深一层:plan 的 `depends_on` **只排序、不把上游结果喂下游**(`_worker` 只传 `(question, timeout)`),即便串行也救不了。本质是从旧 iterative 模式(首轮强制 `excel_query` 自带「先查表」)切到 plan 模式时丢了 schema 发现、又没把 `{schema}` 注入补回来的**功能回退**。
 > **改**(纯加法,best-effort,可 env 关 / 取不到自动回退,零破坏):
 > - **excel-poc**(`v0.3.1`):新增 `GET /datasets/{id}/schema` → 返回 `prompts.render_schema(profile)` 完整表结构文本(表/列/dtype/明细表 grain 提示/取值样例,与 orchestrator 写 SQL 时**同源同格式**)。带 `X-User-Id`(B13 隔离,他人 dataset_id → 404)。
 > - **adapter**(`adapter.py`):新增 `_fetch_excel_schema(dataset_id, user_id)`(GET 上述端点,**任何错误[老后端无端点 404 / 网络 / 超时]都返回 `""` 回退,不掀翻分析**);plan 分支**规划前预取 schema** → `EXCEL_AGENT_PLAN_PROMPT.replace("{schema}", schema_text)`;取不到则注入回退说明(模型按 prompt 内 `depends_on` 兜底指引自处理)。新增 env `ADAPTER_EXCEL_SCHEMA_PREFETCH`(默认 `1`,可关回退原行为)+ `ADAPTER_EXCEL_SCHEMA_TIMEOUT`(默认 `15`s)。
 > - **prompt**(`agentic_web.py` `EXCEL_AGENT_PLAN_PROMPT`):更新 `depends_on` 指引 —— 「表结构已在【数据集结构】给出,直接用真实列名写 step、**不要再列查表 step**、正常全并行」;仅保留「结构未预取到」时的查表 step + `depends_on` 兜底分支。
 > **效果**:planner 看到真实表名/列名 → step 用真列名不盲猜 → 基本不再产出「查看表结构」step → 彻底消掉「分析 step 在结构未知时并行盲查」的失败模式,正中用户「先得到表结构、再制定计划」。
-> **自验**(未部署,本地逻辑):`py_compile adapter.py agentic_web.py` 绿 + excel-poc `py_compile server/prepare/prompts/orchestrator` 绿;本地脚本 12/12 PASS（`render_schema` 出真实列名 + 端点返回体形状 / prompt 注入无残留 `{schema}`〈真实+兜底两路〉/ `_fetch_excel_schema` 空 user・无 backend・不可达 三容错均返 `""` 不抛）。🅿️ **待部署后活体**:excel-poc 真数据集返 schema + planner 出 schema-grounded plan 不再有查表 step（ECS→pod 自验,待用户授权部署)。**非契约变更**:`/v1/agent` payload 不变;新端点是 adapter↔excel-poc 内部接口,前端 `PROTOCOL.md` 不受影响。
+> **自验**:本地 `py_compile` 两仓绿 + 本地脚本 12/12 PASS（`render_schema` 出真实列名 + prompt 注入无残留 `{schema}`〈真实+兜底两路〉/ `_fetch_excel_schema` 空 user・无 backend・不可达 三容错均返 `""` 不抛）+ reviewer 核查门 🟡 无 P0/P1。
+> **上线**(2026-06-28,按序 excel-poc v0.3.1 先 → adapter v0.6.13 后):image-only fast-path build,digest `sha256:83dd1bf857f8d601131269e967dec077095ae82d9befa4ff5d07f88ef5696081`,git `51f9ccd`;SAE ChangeOrder `fbfb7e8d-2e3a-494c-99b1-0ebd1f485bc1`(Status=2);`describeApplicationConfig` 实证 ImageUrl `v0.6.13-20260628` + **35 env 全保**(`ADAPTER_EXCEL_SCHEMA_PREFETCH` 不在 env → 代码默认 `1` 即开)+ **PreStop sleep25 保留** + Replicas 2。`/health` 实证 `version=v0.6.13 git_sha=51f9ccd agent_plan_and_execute_excel_enabled=true`,pod Running+Healthy。
+> **端到端活体 PASS**(ECS→pod,绕 BFF):合成 40 行 4 列 Excel 建集 → `GET /datasets/{id}/schema` 真返回完整结构文本(门店名称/省份〈可选值 江苏/安徽/浙江〉/营业额〈范围+均值〉/订单数,= 注入 planner 的内容)；无 X-User-Id→400(B13 守住)。🅿️ **post-launch 观察**:真用户大表分析 planner 出 schema-grounded plan、不再有「查看表结构」step(需真 LLM run,留观)。**非契约变更**:`/v1/agent` payload 不变;新端点是 adapter↔excel-poc 内部接口,前端 `PROTOCOL.md` 不受影响。详 runbook `../lxj-adapter-deploy/runbooks/deploy-2026-06-28-schema-prefetch.md`。
 
 ## [v0.6.12-20260626] — agent 文件生成计入鸡分额度(Bug1 Step1)· ✅ 已上线 2026-06-26
 > **背景**:agent(文件生成)请求原 EAS 直连、绕过 LiteLLM → 算力不计用户鸡分。让其计费(用户拍「① 开始消耗积分 ② 进行中不中断」)。
