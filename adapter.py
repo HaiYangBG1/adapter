@@ -321,6 +321,14 @@ AGENT_DEFAULT_MAX_TOKENS = int(os.environ.get("ADAPTER_AGENT_DEFAULT_MAX_TOKENS"
 # 计算可能耗时(写 SQL + 沙箱执行 + 防幻觉校验),超时给得宽。
 EXCEL_BACKEND_URL = os.environ.get("ADAPTER_EXCEL_BACKEND_URL", "")
 EXCEL_QUERY_TIMEOUT = int(os.environ.get("ADAPTER_EXCEL_QUERY_TIMEOUT", "240"))
+# v0.6.13:plan-and-execute 规划前预取真实表结构注入 planner。修「盲规划」——
+# plan prompt 的 {schema} 占位符此前从没被填充,模型不知道列名 → 要么瞎猜 step 的
+# 维度/列名,要么自己加一个「查看表结构」step 却不给后续 step 填 depends_on,导致
+# 分析 step 在结构未知时与结构 step 并行盲查(且 plan 的 depends_on 只排序、不把
+# 上游结果喂下游,串行也救不了)。best-effort:取不到 schema 则回退原盲规划行为。
+ADAPTER_EXCEL_SCHEMA_PREFETCH = os.environ.get(
+    "ADAPTER_EXCEL_SCHEMA_PREFETCH", "1").lower() not in {"0", "false", "no", "off"}
+EXCEL_SCHEMA_TIMEOUT = int(os.environ.get("ADAPTER_EXCEL_SCHEMA_TIMEOUT", "15"))
 
 PYTHONPATH_EXTRA = os.environ.get("ADAPTER_PYTHONPATH_EXTRA", "")
 if PYTHONPATH_EXTRA:
@@ -1813,6 +1821,34 @@ def _call_excel_backend(dataset_id: str, question: str,
     if isinstance(verify, dict) and verify.get("ok") is False:
         out["verify_warning"] = verify.get("note", "")
     return out
+
+
+def _fetch_excel_schema(dataset_id: str, user_id: str) -> str:
+    """v0.6.13:GET excel-poc ``/datasets/{id}/schema`` → 返回 schema 画像文本。
+
+    plan-and-execute 规划前调用,把真实表结构注入 planner system prompt(填
+    EXCEL_AGENT_PLAN_PROMPT 的 {schema} 占位符),让模型按真列名一次性出计划。
+
+    **best-effort,绝不致命**:后端老版本无此端点(404)/ 网络 / 超时 / 非预期
+    返回 —— 一律返回 ""，让上层回退到原「盲规划」prompt。预取失败不能掀翻整条
+    大表分析。B13:带 X-User-Id;空 user_id 直接返 ""(注定 400,省一次往返)。
+    """
+    if not EXCEL_BACKEND_URL or not (user_id or "").strip():
+        return ""
+    url = (EXCEL_BACKEND_URL.rstrip("/")
+           + "/datasets/" + urllib.parse.quote(dataset_id, safe="") + "/schema")
+    req = urllib.request.Request(
+        url, method="GET", headers={"X-User-Id": user_id or ""},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=EXCEL_SCHEMA_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001 — 预取失败回退盲规划,不抛
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    txt = data.get("schema_text")
+    return txt if isinstance(txt, str) else ""
 
 
 def _make_excel_query_impl(dataset_id: str,
@@ -3641,7 +3677,20 @@ class Handler(BaseHTTPRequestHandler):
                 # 4. plan_step_runner 注入 — agentic_web.py 完全不知道 Excel 后端,
                 #    通过这个 callable 解耦,守 AGENTS.md generic 边界
                 # 5. plan-related env 同步到 cfg(_execute_plan_streaming 用)
-                cfg.system_prompt = EXCEL_AGENT_PLAN_PROMPT
+                # v0.6.13:规划前预取真实表结构注入 planner —— 此前 {schema} 占位符
+                # 从没被填,模型盲规划(瞎猜列名 / 自加「查看表结构」step 却不串行)。
+                # best-effort:取不到则注入回退说明,模型按 prompt 内 depends_on 指引自处理。
+                schema_text = (
+                    _fetch_excel_schema(excel_dataset_id, excel_user_id)
+                    if ADAPTER_EXCEL_SCHEMA_PREFETCH else ""
+                )
+                if not schema_text:
+                    schema_text = (
+                        "(表结构未预取到 —— 若不确定表名/列名,先列一个「查看表结构」"
+                        "step 放在 plan 第一个,并给需要它结果的后续 step 填 "
+                        "depends_on,别在结构未知时并行盲查。)"
+                    )
+                cfg.system_prompt = EXCEL_AGENT_PLAN_PROMPT.replace("{schema}", schema_text)
                 cfg.enable_plan_and_execute = True
                 cfg.force_first_tool_name = "submit_analysis_plan"
                 cfg.plan_step_runner = _make_excel_run_step(excel_dataset_id, excel_user_id)

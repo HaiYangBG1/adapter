@@ -62,6 +62,7 @@ deterministically, synthesize once**:
 | Feature | Status | Description |
 |---|---|---|
 | Forced plan submission | Supported | First turn is protocol-locked to `submit_analysis_plan` |
+| Schema-grounded planning | Supported | The host may prefetch the data tool's schema and fill the planner prompt's `{schema}` slot before the forced plan turn, so the model plans against real table/column names instead of blind-guessing (or wasting a step re-discovering structure). Best-effort: if the host injects nothing, the prompt instructs the model to add a structure-lookup step with `depends_on` as a fallback |
 | Dependency scheduling | Supported | Kahn topological sort; cycles are rejected; unknown deps are tolerated |
 | Concurrent batch execution | Supported | Capped by `ADAPTER_AGENT_PLAN_PARALLELISM` |
 | Per-step timeout | Supported | `ADAPTER_AGENT_PLAN_STEP_TIMEOUT` |

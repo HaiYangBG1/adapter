@@ -146,7 +146,7 @@ POST /v1/agent/chat/completions
 
 Plan-and-execute 把"每轮决策"换成 **决策一次、确定性执行、综合一次**：
 
-1. **规划** —— 首轮协议层强制模型 emit 单个 `submit_analysis_plan` 工具调用，里面是它需要的所有步骤（每步含 `id`、自然语言 `question`、可选 `depends_on`）。工具 schema 注册但由 agent 循环 inline 接管，模型无法用叙述绕过。
+1. **规划** —— 首轮协议层强制模型 emit 单个 `submit_analysis_plan` 工具调用，里面是它需要的所有步骤（每步含 `id`、自然语言 `question`、可选 `depends_on`）。工具 schema 注册但由 agent 循环 inline 接管，模型无法用叙述绕过。宿主可在此前**预取数据工具的表结构**填进 planner 提示词的 `{schema}` 槽，让模型按真实列名一次性规划，而不是在结构未知时盲猜（或浪费一步去查结构）。
 2. **执行** —— adapter 校验计划、按 `depends_on` 拓扑排序、分批并发调度（通过注入的 step runner）。执行期间不调模型。
 3. **综合** —— 所有步骤结果收齐后，关闭工具，模型基于聚合结果作答。
 
@@ -425,7 +425,10 @@ deterministically, synthesize once**:
 1. **Plan** — the first turn is protocol-locked to a single `submit_analysis_plan`
    tool call listing every step (each with `id`, a natural-language `question`,
    and optional `depends_on`). The schema is registered but inline-handled, so the
-   model cannot bypass it with prose.
+   model cannot bypass it with prose. Before this turn the host may **prefetch the
+   data tool's schema** and fill the planner prompt's `{schema}` slot, so the model
+   plans against real table/column names instead of blind-guessing (or spending a
+   step to re-discover structure).
 2. **Execute** — the adapter validates the plan, topologically sorts steps by
    `depends_on`, and dispatches each batch concurrently through an injected step
    runner. No model call happens during execution.
