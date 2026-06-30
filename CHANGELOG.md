@@ -7,7 +7,7 @@
 
 ---
 
-## [v0.6.14-20260630] — HTML 文件生成「治截断」:续写分段 + 32K + 关 thinking + 保活心跳 + tab 修复 · 🔄 上线中 2026-06-30
+## [v0.6.14-20260630] — HTML 文件生成「治截断」:续写分段 + 32K + 关 thinking + 保活心跳 + tab 修复 · ✅ 已上线 2026-06-30
 > **背景/需求**(用户报 + 全栈实测复现):文件生成的 **HTML 看板**由模型自由生成整页 HTML,大看板会撞单次 `max_tokens` 被截断(`finish_reason=length`,末尾图表脚本丢=空 canvas/不收尾 `</html>`)。用户拍板:**解决截断,但绝不牺牲「自由生成 + 模型自由写 JS」**(不转结构化)。并修一个并发暴露的 tab bug:模型自由写的 tab 切换 JS 偶发 token 级语法错(如 `color:#hex` 漏引号)→ 整段 `<script>` 解析失败 → `switchTab` 未定义、点 tab 无反应(`node --check` 实证 + 生产产物复现)。
 > **改**(`adapter.py` + `agentic_web.py`,纯后端、**零契约变更**、自由生成路径不动):
 > - **① HTML 续写分段**(`_call_upstream_html_builder` + 新 `_stream_one_html_call`/`_stitch_html`):单段照常自由写;撞 `finish_reason=length` 且没写到 `</html>` → 把已写半成品当 assistant 上下文发「接着写」调用,`_stitch_html` 去接缝重叠后拼接,最多续 `ADAPTER_HTML_BUILDER_MAX_CONT`(默认 3)次。打破单次 token 墙而**不改成结构化**(守住用户「保自由生成 + 自由 JS」)。
@@ -16,7 +16,8 @@
 > - **④ 生成期保活**(`agentic_web.py` `run_agent_stream`):长生成期渲染同步阻塞会让 adapter→前端 SSE 静默被 idle 超时掐流 → **渲染丢 daemon 线程,主 generator 每 `_FILE_GEN_HEARTBEAT_SECS`(20s)吐 `agent_file_gen_progress` 心跳保活 + 反馈**;`_FILE_GEN_MAX_WAIT_SECS`(1500s)backstop 兜渲染器异常卡死。对**所有文件类型通用**,快渲染(首跳前完成)零回归。
 > - **⑤ tab 修复**(`HTML_BUILDER_PROMPT` 补 3 条):JS 对象里颜色/字符串值一律加引号(漏引号=整段 script 失效)、`onclick` 调的函数必定义、隐藏 tab 图表懒初始化或显示后 `chart.resize()`。
 > **自验**:`py_compile`×2 绿;**直连 live LiteLLM 续写实测**(强制小 `max_tokens` 逼多段:1 段 & 3 段/2 接缝 —— 接缝干净、`<!DOCTYPE`×1 不重启、`</html>` 收尾、`node --check` 全过、`<h2>` 无重复);关 thinking 修好「续写返回空」;`max_tokens=32000` 直连实测(接受、19K 自然停、54.7 tok/s、3.38 字符·token⁻¹);`_stitch_html` 单测 6/6(短尾 `</body>` 去重 + 不误删正文);保活逻辑测试 3/3(慢渲染吐心跳 / 快渲染零回归 / 异常兜底);tab 修复 live 3/3 JS 合法。**reviewer 核查门**:P0 无、P1(`_stitch_html` 短尾漏去重,下界 15→4)已修验、P2×2 已处理(渲染卡死 backstop + 续写输入窗口文档化)。**非契约变更**(`x_adapter_artifact` 信封不变;`agent_file_gen_progress` 是 `x_adapter_agent_progress` 新 stage 值,前端 `Playground.tsx` 已加分支对齐)。
-> **上线**:🔄 2026-06-30 上线中,digest / SAE ChangeOrder / `/health` 证据回写见 runbook `../lxj-adapter-deploy/runbooks/deploy-2026-06-30-html-continuation.md`。配套前端 A3 基座 + 心跳标签(前端整包另批)。
+> **上线**(2026-06-30,fast-path build FROM v0.6.13):digest `sha256:40d43baa5b7f54a88127793408ee31b9eb9680678b42a7c2967ad9b18cd75037`,git `82564e9`;SAE ChangeOrder `0f17b8f3-fb42-481b-bb45-54c471a94ae1`(Status=2);`describeApplicationConfig` 实证 ImageUrl `v0.6.14-20260630` + **35 env 全保** + PreStop sleep25 + Replicas 2;两 pod `/health` = `version v0.6.14 git_sha 82564e9`。
+> **部署后大看板活体 PASS**(ECS→pod,绕 BFF):8-tab/24-chart 大看板 → 生成 454s(~7.5min)→ **`agent_file_gen_progress` 心跳 21 个**(每 20s,贯穿全程——没保活这 7.5min 静默必被 idle 掐死)→ artifact ready;产物 58335 字节、`</html>` 收尾、24 canvas/24 new Chart、8 tab、`node --check` 通过;**`finish_reason=length`=0**(25K-token 大看板一次写完,旧 14K 必截断它,32K 兜住)。配套前端 `0.17.46`(A3 基座 + 心跳标签)。详 runbook `../lxj-adapter-deploy/runbooks/deploy-2026-06-30-html-continuation.md`。
 
 ## [v0.6.13-20260628] — 大表 plan-and-execute 规划前预取真实表结构(治「盲规划」)· ✅ 已上线 2026-06-28
 > **Bug**(用户报 + 看图坐实):大表分析「多步规划」里,**模型规划时根本不知道表结构** —— plan prompt `EXCEL_AGENT_PLAN_PROMPT` 结尾的 `{schema}` 占位符**从来没被填充**(`adapter.py` 裸赋值 `cfg.system_prompt = EXCEL_AGENT_PLAN_PROMPT`,全仓无 `.format(schema=...)`)。被迫盲规划 → 模型要么瞎猜分析 step 的维度/列名,要么自己加一个「查看表结构」step 当 step_1 却**不给后续 step 填 `depends_on`** → 拓扑排序把多步全塞进同一并行批 → **「查看表结构」还在跑,分析 step 已经各自盲查跑完**(用户截图现象)。更深一层:plan 的 `depends_on` **只排序、不把上游结果喂下游**(`_worker` 只传 `(question, timeout)`),即便串行也救不了。本质是从旧 iterative 模式(首轮强制 `excel_query` 自带「先查表」)切到 plan 模式时丢了 schema 发现、又没把 `{schema}` 注入补回来的**功能回退**。
