@@ -58,6 +58,7 @@ from agentic_web import (
     WEB_FETCH_TOOL,
     WEB_SEARCH_TOOL,
     WEB_VIEW_TOOL,
+    _build_no_thinking_extra,  # v0.6.14:html builder 关 thinking(K2.6 双 key:chat_template_kwargs.thinking + 顶层 thinking)
     run_agent as _run_agent_loop,
     run_agent_stream as _run_agent_stream,
 )
@@ -1929,6 +1930,14 @@ HTML_BUILDER_PROMPT = (
     "`<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>`,<body> 放 <canvas>,"
     "**文档末尾的 <script> 里用 `new Chart(...)` 把每一个 <canvas> 都初始化、填上数据 —— "
     "这是图表能不能显示的关键,必须完整写完,绝不能写一半。柱/折线/饼按数据语义选。**\n"
+    "- ⚠️ **JS 语法必须零错(否则点 tab 没反应)**:对象里的颜色 / 字符串值**一律加引号** —— "
+    "写 `color: '#334155'`,**绝不能**写 `color: #334155`;漏一个引号就是语法错误,会让整个 "
+    "`<script>` 块作废,里面的图表初始化和 tab 切换函数一起失效。每个 `<script>` 必须能独立解析通过。\n"
+    "- **做 tab / 多视图切换时**:tab 按钮 `onclick` 调用的函数(如 `switchTab`)"
+    "**必须在 `<script>` 里真的定义了**;少定义一个,点击就抛 `ReferenceError`、整个交互失效。\n"
+    "- **图表放在默认隐藏的 tab 里**:Chart.js 在 `display:none` 容器里量不到尺寸会画成空白 —— "
+    "要么**在该 tab 首次显示时才 `new Chart()`**(懒初始化),要么显示后调 `chart.resize()`;"
+    "默认显示的那个 tab 可以直接初始化。\n"
     "- ⚠️ **篇幅纪律**:CSS 样式克制简洁(主色 #008042,响应式即可),**不要写大段动画/渐变/"
     "装饰性样式**;把 token 预算优先留给「结构 + 每个图表的 `new Chart()` 初始化脚本完整输出」,"
     "宁可样式朴素也绝不能让末尾的图表脚本被截断。\n"
@@ -1950,7 +1959,29 @@ _HTML_BUILDER_TIMEOUT = int(os.environ.get("ADAPTER_HTML_BUILDER_TIMEOUT", "240"
 # 断(末脚本丢=空 canvas)。builder 已是流式(v0.6.6),_HTML_BUILDER_TIMEOUT 是
 # **per-read 逐 chunk** 超时(不是总时长上限)→ 14000@~56tok/s≈250s 总时长不触发
 # idle 超时,安全。给大看板足够头部写全部 `new Chart()`。
-_HTML_BUILDER_MAX_TOKENS = int(os.environ.get("ADAPTER_HTML_BUILDER_MAX_TOKENS", "14000"))
+# v0.6.14(2026-06-29):14000→32000。直连实测(逼 lxj 写超长手册):模型对单次「写超大
+# 文档」请求**自然收尾在 ~19K token**(finish_reason=stop / 64K 字符 / ~5.8min @54.7tok/s /
+# 3.38 字符·token⁻¹),并未撞 32K —— 即上游**接受 max_tokens=32000、不在 14/16K 低位硬截**。
+# 旧 14K 上限会把这类 ~19K 的自然产物截断(length);抬到 32K 让它们**一次写完**(stop)、
+# 少触发续写。续写(_MAX_CONT)继续兜极端 >32K。单次最坏 32K@55tok/s≈10min,但模型自限
+# ~19K 故典型 ~6min;长单次由 per-read 流式 + 前端 _FILE_GEN_HEARTBEAT 心跳保活兜住。
+# 🔴 再改大此值前必直连实测上游真实上限(别拍脑袋,256K 窗口是输入+输出共享)。
+_HTML_BUILDER_MAX_TOKENS = int(os.environ.get("ADAPTER_HTML_BUILDER_MAX_TOKENS", "32000"))
+# v0.6.14(2026-06-29 续写分段):单次撞 max_tokens(finish_reason=length)且还没写到
+# </html> 时,把已写的半成品当 assistant 上下文再发「接着写」调用,拼到收尾为止 —— 治
+# 「大看板单次写不完被截断」而**不牺牲自由生成**(模型照常自由写 HTML/JS,只是分几段写
+# 完,不改成结构化)。每段仍 14000 上限,最多续 _MAX_CONT 次 → 总产出上限 14000×(1+N)。
+# ⚠️ 续写轮把已写半成品(acc)整段当 assistant 上下文回传,**不能截 acc 头**(会丢
+# <!DOCTYPE/整体结构、破坏续写连贯)→ 输入随 N 线性增长。每段上限 32K token,默认 N=3 时
+# 末轮最坏输入 ~96K token(3×32K),仍在 K2.6 256K 窗口内但余量收窄;**再调大 N 或
+# MAX_TOKENS 需自核 N×MAX_TOKENS 不逼近 256K**(输入+输出共享窗口)。
+_HTML_BUILDER_MAX_CONT = int(os.environ.get("ADAPTER_HTML_BUILDER_MAX_CONT", "3"))
+_HTML_CONTINUE_INSTRUCTION = (
+    "上面是你刚写到一半、因长度限制被中断的 HTML(还没写到 </html>)。"
+    "请从被中断的**确切位置接着往下写剩余部分**:绝不重复上面已有的任何内容、"
+    "绝不重新从 <!DOCTYPE 或 <html> 开头、不要任何解释或 markdown 围栏,"
+    "直接续写后续片段,一直写到 </html> 收尾为止。"
+)
 
 
 def _strip_md_fence(text: str) -> str:
@@ -2010,6 +2041,55 @@ def _digest_context_for_builder(context_messages: Optional[list], cap: int = 600
     return joined
 
 
+def _stream_one_html_call(url: str, headers: dict, payload: dict, timeout: int) -> tuple[str, str]:
+    """发一次流式 HTML 生成调用,逐 chunk 累积正文,返回 ``(文本, finish_reason)``。
+
+    ``finish_reason == "length"`` = 撞 max_tokens 被截断,调用方据此决定是否续写。
+    """
+    parts: list[str] = []
+    finish = ""
+    req = urllib.request.Request(
+        url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw in resp:  # 逐行读 SSE —— 每个 token chunk 一来就消费,连接不静默
+            line = raw.decode("utf-8", "replace").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                obj = json.loads(data_str)
+            except Exception:  # noqa: BLE001 — 半行/keepalive 跳过
+                continue
+            choice = ((obj.get("choices") or [{}])[0]) or {}
+            piece = (choice.get("delta") or {}).get("content")
+            if piece:
+                parts.append(piece)
+            fr = choice.get("finish_reason")
+            if fr:
+                finish = fr
+    return "".join(parts), finish
+
+
+def _stitch_html(acc: str, more: str) -> str:
+    """把续写片段接到半成品后:去 markdown 围栏 + 裁掉模型重述的重叠开头(防接缝重复)。"""
+    if not more:
+        return acc
+    m = re.sub(r"^\s*```(?:html)?\s*", "", more.lstrip())
+    window = acc[-400:]
+    # 下界 4(k≥4):覆盖 </p> 起的真实闭合标签重叠(如短尾 </body></html> 的 </body>=7);
+    # 跳过 1-3 字符巧合(避免把正文里偶然重合的几个字符误删)。原下界 15 致 m<16 时 range
+    # 为空、短续写片段完全漏去重(reviewer P1)。取最长匹配优先(从大到小,命中即 break)。
+    for k in range(min(len(window), len(m)), 3, -1):
+        if window.endswith(m[:k]):  # 续写开头重复了 acc 尾部一段 → 去重
+            m = m[k:]
+            break
+    return acc + m
+
+
 def _call_upstream_html_builder(title: str, brief: str,
                                 context_messages: Optional[list] = None,
                                 *, upstream_url: str = "", auth_header: str = "",
@@ -2049,43 +2129,52 @@ def _call_upstream_html_builder(title: str, brief: str,
         )
     else:
         user_content = f"网页标题:{title}\n需求:{brief}"
-    payload = {
-        "model": model or AGENT_MODEL or "lxj",
-        "messages": [
-            {"role": "system", "content": HTML_BUILDER_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        "stream": True,
-        "max_tokens": _HTML_BUILDER_MAX_TOKENS,
-        "temperature": 0.7,
-    }
+    base_messages = [
+        {"role": "system", "content": HTML_BUILDER_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
     _hdr = auth_header or UPSTREAM_AUTH_HEADER
     _auth = auth_value if auth_value is not None else (f"Bearer {UPSTREAM_API_KEY}" if UPSTREAM_API_KEY else "")
     headers = {"Content-Type": "application/json"}
     if _auth:
         headers[_hdr] = _auth
-    req = urllib.request.Request(
-        url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers, method="POST",
-    )
-    parts: list[str] = []
-    with urllib.request.urlopen(req, timeout=_HTML_BUILDER_TIMEOUT) as resp:
-        for raw in resp:  # 逐行读 SSE —— 每个 token chunk 一来就消费,连接不静默
-            line = raw.decode("utf-8", "replace").strip()
-            if not line or not line.startswith("data:"):
-                continue
-            data_str = line[5:].strip()
-            if data_str == "[DONE]":
-                break
-            try:
-                obj = json.loads(data_str)
-            except Exception:  # noqa: BLE001 — 半行/keepalive 跳过
-                continue
-            delta = (((obj.get("choices") or [{}])[0]) or {}).get("delta") or {}
-            piece = delta.get("content")
-            if piece:
-                parts.append(piece)
-    return _strip_md_fence("".join(parts))
+
+    def _payload(messages: list) -> dict:
+        # 🔴 关 thinking:builder 是「写 HTML」生成任务,thinking 不帮忙反而吃 token ——
+        # 续写轮尤其会被 reasoning 吃光 max_tokens 致 content 空(Phase0 自验实证)。
+        # K2.6/vLLM0.18 需双 key(enable_thinking 旧名静默失效)→ 复用 _build_no_thinking_extra。
+        p = {
+            "model": model or AGENT_MODEL or "lxj",
+            "messages": messages,
+            "stream": True,
+            "max_tokens": _HTML_BUILDER_MAX_TOKENS,
+            "temperature": 0.7,
+        }
+        p.update(_build_no_thinking_extra(None))
+        return p
+
+    # 第一段:模型自由写。若撞 max_tokens(finish_reason=length)且还没写到 </html>,把
+    # 半成品当 assistant 上下文「接着写」,拼到收尾 —— 自由生成不变,只打破单次 token 墙。
+    acc, finish = _stream_one_html_call(
+        url, headers, _payload(base_messages), _HTML_BUILDER_TIMEOUT)
+    cont = 0
+    while (
+        finish == "length"
+        and acc.strip()
+        and "</html>" not in acc[-2000:].lower()  # 还没收尾才续
+        and cont < _HTML_BUILDER_MAX_CONT
+    ):
+        cont += 1
+        cont_messages = base_messages + [
+            {"role": "assistant", "content": acc},
+            {"role": "user", "content": _HTML_CONTINUE_INSTRUCTION},
+        ]
+        more, finish = _stream_one_html_call(
+            url, headers, _payload(cont_messages), _HTML_BUILDER_TIMEOUT)
+        if not more.strip():
+            break
+        acc = _stitch_html(acc, more)
+    return _strip_md_fence(acc)
 
 
 # ── v0.6.9 B11 大文件分多步生成 ────────────────────────────────────────────

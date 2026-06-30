@@ -2807,6 +2807,16 @@ def run_agent(
 # =============================================================================
 
 
+# v0.6.14 文件生成保活:渲染丢 daemon 线程后,主 generator 每隔这么多秒吐一个进度心跳,
+# 防长任务(html 续写大文件,可能数分钟)期间 adapter→前端 SSE 静默被 idle 超时掐流。
+# 取 20s —— 远小于常见 CLB/ALB 60s idle 阈值,留足余量;快渲染在首跳前就完成,不发心跳。
+_FILE_GEN_HEARTBEAT_SECS = 20.0
+# 渲染总时长硬上限(兜底):正常最坏 = html 续写 (1+MAX_CONT) 段 ≈ 4×~250s ≈ 1000s。设
+# 1500s backstop —— 渲染器若因未预期原因永不返回(reviewer P2),别让心跳无限发、generator
+# 永不退出;超时按 error 收尾。正常大文件远不到此值,不会误杀。
+_FILE_GEN_MAX_WAIT_SECS = 1500.0
+
+
 def _sse_progress_chunk(model: str, stage: str, message: str, **meta: Any) -> dict[str, Any]:
     """OpenAI-shaped progress chunk carrying our x_adapter_agent_progress extension.
 
@@ -4371,26 +4381,50 @@ def run_agent_stream(
                             "previewKind": f_preview,
                         })
 
-                    # 2) 渲染 + 上传(注入的 file_renderer;agentic_web 不知渲染/OSS 细节)
+                    # 2) 渲染 + 上传(注入的 file_renderer;agentic_web 不知渲染/OSS 细节)。
+                    #    v0.6.14 保活:html builder 续写大文件可能数分钟,期间这段同步阻塞会让
+                    #    adapter→前端 SSE 静默、被 idle 超时掐 → 渲染丢 daemon 线程,主 generator
+                    #    每 _FILE_GEN_HEARTBEAT_SECS 吐一个进度心跳保活 + 给反馈;快渲染(csv/小
+                    #    文件)在首跳前就完成 → 不发心跳,行为同旧(零回归)。
                     file_t0 = time.time()
                     if file_parse_err:
                         render_result = {"ok": False, "error": file_parse_err, "name": prov_name}
                     else:
-                        try:
+                        _render_q: "queue.Queue" = queue.Queue(maxsize=1)
+
+                        def _render_worker() -> None:
                             # B12:传当前对话 messages(augmented)给 renderer —— generate_html
                             # 看板据此用真实数据(Excel 分析结果等);其他类型忽略此参。
                             # B11:传 part_index/total_parts —— 非末片 renderer 累积返 partial。
-                            render_result = cfg.file_renderer(
-                                file_tool_name, file_args, artifact_id, augmented,
-                                part_index, total_parts)
-                            if not isinstance(render_result, dict):
-                                render_result = {"ok": False, "error": "renderer 返回非 dict", "name": prov_name}
-                        except Exception as exc:  # noqa: BLE001 — 渲染失败不能崩 loop
-                            render_result = {
-                                "ok": False,
-                                "error": f"{type(exc).__name__}: {exc}",
-                                "name": prov_name,
-                            }
+                            try:
+                                r = cfg.file_renderer(
+                                    file_tool_name, file_args, artifact_id, augmented,
+                                    part_index, total_parts)
+                                if not isinstance(r, dict):
+                                    r = {"ok": False, "error": "renderer 返回非 dict", "name": prov_name}
+                            except Exception as exc:  # noqa: BLE001 — 渲染失败不能崩 loop
+                                r = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "name": prov_name}
+                            _render_q.put(r)
+
+                        threading.Thread(target=_render_worker, daemon=True).start()
+                        render_result = None
+                        _render_deadline = time.time() + _FILE_GEN_MAX_WAIT_SECS
+                        while render_result is None:
+                            try:
+                                render_result = _render_q.get(timeout=_FILE_GEN_HEARTBEAT_SECS)
+                            except queue.Empty:  # 还在渲染 → 吐心跳保活 + 反馈,回到顶继续等
+                                if time.time() > _render_deadline:  # 渲染器异常卡死兜底(reviewer P2)
+                                    render_result = {"ok": False,
+                                                     "error": "文件生成超时(渲染器长时间无响应)",
+                                                     "name": prov_name}
+                                    break
+                                progress_cb(
+                                    "agent_file_gen_progress",
+                                    f"正在生成{f_kind.upper()}文件，请稍候…（已 {int(time.time() - file_t0)}s）",
+                                    {"elapsed_ms": int((time.time() - file_t0) * 1000),
+                                     "tool": file_tool_name},
+                                )
+                                yield from _drain_queue()
                     file_elapsed = int((time.time() - file_t0) * 1000)
                     ok = bool(render_result.get("ok"))
 
