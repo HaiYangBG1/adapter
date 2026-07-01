@@ -170,12 +170,14 @@ WEB_AI_NEWS_MAX_SOURCES = int(os.environ.get("ADAPTER_WEB_AI_NEWS_MAX_SOURCES", 
 AGENT_MODEL = os.environ.get("ADAPTER_AGENT_MODEL", "")  # if empty, use payload's "model"
 # 计额度(Bug1 / Step1,2026-06-26):BFF 在 /api/agent 带 `X-User-LLM-Key` 头(已登录用户的
 # LiteLLM key)时,本次 agent 的**基座调用改走 LiteLLM**(而非默认 EAS 直连 UPSTREAM),用该用户
-# key 鉴权 → spend 累加在用户 key 上(前端额度行可见)。模型用 LiteLLM 公开**裸名 `lxj`**(直连基座、
-# 不回环 adapter)。无此头(APIKEY 用户/未登录异常)→ 回退 UPSTREAM 现状,不计额度、不回归。
+# key 鉴权 → spend 累加在用户 key 上(前端额度行可见)。模型用 LiteLLM 公开**专名 `lxj-agent`**(直连基座、
+# 不回环 adapter;2026-07-01 从裸名 `lxj` 切走 —— 与外部工具真直连的 `lxj` 区分开,治用量统计污染)。
+# 无此头(APIKEY 用户/未登录异常)→ 回退 UPSTREAM 现状,不计额度、不回归。
 # 走 main 网关(`llm.lxjchina.com.cn`,带 Langfuse 审计;用户 2026-06-26 拍)。详见
 # `../../pm/changes/20260626-agent模式计入鸡分额度.md`。
 BILLING_UPSTREAM_BASE_URL = os.environ.get("ADAPTER_BILLING_UPSTREAM_BASE_URL", "").rstrip("/")
-BILLING_MODEL = os.environ.get("ADAPTER_BILLING_MODEL", "lxj")
+# 🔴 默认值 lxj-agent(非旧 lxj):env 丢失时回退到正确的专名,不重新污染统计(2026-07-01 加固)。
+BILLING_MODEL = os.environ.get("ADAPTER_BILLING_MODEL", "lxj-agent")
 AGENT_TIMEOUT = int(os.environ.get("ADAPTER_AGENT_TIMEOUT", "120"))
 AGENT_MAX_TOOL_RESULT_CHARS = int(os.environ.get("ADAPTER_AGENT_MAX_TOOL_RESULT_CHARS", "8000"))
 AGENT_PARALLEL_WORKERS = int(os.environ.get("ADAPTER_AGENT_PARALLEL_WORKERS", "4"))
@@ -2144,7 +2146,7 @@ def _call_upstream_html_builder(title: str, brief: str,
         # 续写轮尤其会被 reasoning 吃光 max_tokens 致 content 空(Phase0 自验实证)。
         # K2.6/vLLM0.18 需双 key(enable_thinking 旧名静默失效)→ 复用 _build_no_thinking_extra。
         p = {
-            "model": model or AGENT_MODEL or "lxj",
+            "model": model or AGENT_MODEL or "lxj-agent",
             "messages": messages,
             "stream": True,
             "max_tokens": _HTML_BUILDER_MAX_TOKENS,
@@ -2439,7 +2441,7 @@ def _build_agent_config(model_from_payload: str, user_llm_key: str = "") -> Agen
     """Resolve agent config from env + payload.
 
     计额度(Step1):``user_llm_key`` 非空且 ``BILLING_UPSTREAM_BASE_URL`` 已配 → 基座调用改走
-    LiteLLM(用该用户 key + 裸名 ``BILLING_MODEL``=lxj)→ spend 计在用户 key 上。否则回退 EAS 直连
+    LiteLLM(用该用户 key + 专名 ``BILLING_MODEL``=lxj-agent)→ spend 计在用户 key 上。否则回退 EAS 直连
     (现状,不计额度)。上游 URL / auth / model 三者一起切,保证整次 agent loop 同一计费身份。
     """
     if user_llm_key and BILLING_UPSTREAM_BASE_URL:
@@ -2448,7 +2450,7 @@ def _build_agent_config(model_from_payload: str, user_llm_key: str = "") -> Agen
         # 二者若不同〈如 EAS 用非标准 token 头〉,billing 路径会发错 header → 计费链断)。
         auth_header = "Authorization"
         auth_value = f"Bearer {user_llm_key}"
-        model = BILLING_MODEL or "lxj"
+        model = BILLING_MODEL or "lxj-agent"
     else:
         base = UPSTREAM.rstrip("/")
         auth_header = UPSTREAM_AUTH_HEADER
