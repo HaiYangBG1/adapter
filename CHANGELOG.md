@@ -7,6 +7,15 @@
 
 ---
 
+## [v0.6.15-20260701] — lxj-agent 计费专名加固:BILLING_MODEL 默认值/fallback lxj→lxj-agent · ✅ 已上线 2026-07-02
+> **背景**:网页版 agent(文件生成/大表)透传用户 key 走 LiteLLM 计费,原用裸名 `lxj` —— 与外部编程工具**真直连**的 `lxj` 在用量统计里分不开(污染,做用量看板时暴露)。2026-07-01 起后端加 `lxj-agent` 专名区分(LiteLLM `/model/new` 加模型〈cost/credential 复制 lxj〉+ 28 team/40 key 批量授权 + adapter env `ADAPTER_BILLING_MODEL=lxj-agent`)。本次 = **代码层加固**:防 env 万一丢失时回退旧 `lxj` 重新污染。
+> **改**(`adapter.py`,纯默认值/注释,零逻辑、零契约变更):
+> - `BILLING_MODEL` 默认值 `lxj`→`lxj-agent`(:178);`_build_agent_config` fallback `BILLING_MODEL or "lxj"`→`or "lxj-agent"`(:2451);HTML builder `... or "lxj"`→`or "lxj-agent"`(:2147)。三处 env 缺失兜底都指向正确专名。注释 173/2442 同步。
+> - env 模板 `sae-adapter.env.example`(lxj-adapter-deploy 仓)`ADAPTER_BILLING_MODEL=lxj-agent`。
+> **自验**:PM 联网核查门(全 lxj 使用点清单 + agent 计费路径确认走 env,无遗漏硬编码)+ reviewer 代码核。`lxj-agent` 模型 live 调用通。
+> **上线**:镜像 `:v0.6.15-20260701` digest `sha256:13ecc2f5b9bb2df0342875c36a94c28e21a7cb54921d8b227478b77e7900d08a`,git `78b73d6`。⚠️ build 撞 ECS→国外源网络卡(apt `deb.debian.org` / pypi / playwright chromium 全卡)→ 换 **apt+pip 阿里云 mirror**(`mirrors.cloud.aliyuncs.com`)+ **Chromium 官方 CDN**(npmmirror 无该新版本 404)治好。SAE ChangeOrder `c6fb3289-1c6a-4984-9df4-3e0e7ea56939`(Status=2);`describeApplicationConfig` 实证 ImageUrl `:v0.6.15` + `BILLING_MODEL=lxj-agent` + env 35 保全 + PreStop sleep25;chick-lxj 走 adapter 响应正常。
+> 🅿️ build 换源 patch 仅落 ECS build 环境、**未落 Dockerfile** → 下次 adapter build 若网络仍卡需重 patch 或落 Dockerfile(apt/pip mirror);Chromium 保持官方 CDN。
+
 ## [v0.6.14-20260630] — HTML 文件生成「治截断」:续写分段 + 32K + 关 thinking + 保活心跳 + tab 修复 · ✅ 已上线 2026-06-30
 > **背景/需求**(用户报 + 全栈实测复现):文件生成的 **HTML 看板**由模型自由生成整页 HTML,大看板会撞单次 `max_tokens` 被截断(`finish_reason=length`,末尾图表脚本丢=空 canvas/不收尾 `</html>`)。用户拍板:**解决截断,但绝不牺牲「自由生成 + 模型自由写 JS」**(不转结构化)。并修一个并发暴露的 tab bug:模型自由写的 tab 切换 JS 偶发 token 级语法错(如 `color:#hex` 漏引号)→ 整段 `<script>` 解析失败 → `switchTab` 未定义、点 tab 无反应(`node --check` 实证 + 生产产物复现)。
 > **改**(`adapter.py` + `agentic_web.py`,纯后端、**零契约变更**、自由生成路径不动):
