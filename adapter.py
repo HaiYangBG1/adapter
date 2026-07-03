@@ -185,6 +185,15 @@ AGENT_PARALLEL_WORKERS = int(os.environ.get("ADAPTER_AGENT_PARALLEL_WORKERS", "4
 # stress testing put the EAS single-instance comfort zone at ~20 concurrent
 # agentic sessions; requests beyond this limit get HTTP 429 immediately.
 AGENT_MAX_CONCURRENT = int(os.environ.get("ADAPTER_AGENT_MAX_CONCURRENT", "20"))
+# v0.6.16 agent SSE 全局保活 ────────────────────────────────────────────
+# agent loop 的静默段(模型生成工具参数 / 大表 excel-poc 查询执行 / 规划)可长达
+# 数分钟,期间 handler 对下游一个字节不写 → 会被链路上的 idle 墙掐流(BFF Node
+# fetch/undici 默认 bodyTimeout=300s 无字节即断;各层 LB 也有各自空闲阈值),用户
+# 端表现 = 流中途 "network error"、任务白跑(异常看板 2026-07-02 全部 4 条即此)。
+# v0.6.14 只给「文件渲染等待段」加了心跳;这里在 _handle_agent_chat_stream 写出层
+# 统一兜底:距上次真实写出超过该秒数就写一行 SSE 注释 `: hb`(SSE 规范注释行,
+# 前端解析器天然忽略;BFF 逐字节转发,同时刷新其 bodyTimeout)。0 = 关闭。
+AGENT_SSE_HEARTBEAT_SECS = float(os.environ.get("ADAPTER_AGENT_SSE_HEARTBEAT_SECS", "15"))
 # Phase 2: budget control
 AGENT_MAX_ITERATIONS = int(os.environ.get("ADAPTER_AGENT_MAX_ITERATIONS", "6"))
 AGENT_MAX_FETCHES = int(os.environ.get("ADAPTER_AGENT_MAX_FETCHES", "8"))
@@ -3909,6 +3918,41 @@ class Handler(BaseHTTPRequestHandler):
         upstream completion chunks, then a trace chunk, then [DONE]."""
         self._send_stream_headers()
         final_trace: dict[str, Any] | None = None
+        # v0.6.16 全局 SSE 保活:generator 在静默段(生成工具参数/大表查询/规划)可
+        # 数分钟不产出事件,期间对下游零字节 → 被 idle 墙掐流(见 AGENT_SSE_HEARTBEAT_SECS
+        # 常量注释)。后台线程距上次真实写出 ≥ 阈值就写 SSE 注释 `: hb`;写出共用锁,
+        # 注释行只会落在完整事件之间、不会插进半个事件。心跳写失败(客户端已断)只停
+        # 心跳不动主循环 —— 主循环下次写出时按既有路径报错收场。
+        write_lock = threading.Lock()
+        last_write = [time.monotonic()]
+        hb_stop = threading.Event()
+
+        def _hb_loop() -> None:
+            while not hb_stop.wait(1.0):
+                if time.monotonic() - last_write[0] < AGENT_SSE_HEARTBEAT_SECS:
+                    continue
+                with write_lock:
+                    if hb_stop.is_set():
+                        return
+                    try:
+                        self._write_chunked(b": hb\n\n")
+                    except Exception:  # noqa: BLE001 — 客户端断连,心跳退场即可
+                        hb_stop.set()
+                        return
+                last_write[0] = time.monotonic()
+
+        hb_thread: threading.Thread | None = None
+        if AGENT_SSE_HEARTBEAT_SECS > 0:
+            hb_thread = threading.Thread(
+                target=_hb_loop, name="agent-sse-heartbeat", daemon=True
+            )
+            hb_thread.start()
+
+        def _locked_write(fn: Callable[[], None]) -> None:
+            with write_lock:
+                fn()
+            last_write[0] = time.monotonic()
+
         try:
             for event in _run_agent_stream(
                 messages=messages,
@@ -3916,7 +3960,7 @@ class Handler(BaseHTTPRequestHandler):
                 registry=registry,
                 extra_payload=extra,
             ):
-                self._write_sse_data(event)
+                _locked_write(lambda: self._write_sse_data(event))
                 # Echo server-side log mirror for debugging
                 if "x_adapter_agent_progress" in event:
                     prog = event["x_adapter_agent_progress"]
@@ -3927,22 +3971,27 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 if "x_adapter_agent_trace" in event:
                     final_trace = event["x_adapter_agent_trace"]
-            self._write_sse_done()
-            self._finish_chunked()
+            hb_stop.set()
+            _locked_write(self._write_sse_done)
+            _locked_write(self._finish_chunked)
             self.close_connection = True
             if final_trace is not None:
                 self._log_agent_run(final_trace, cfg.model, stream=True)
         except urllib.error.HTTPError as exc:
+            hb_stop.set()
             detail = exc.read().decode("utf-8", errors="replace")[:2000]
-            self._write_sse_error(f"upstream HTTP {exc.code}: {detail}")
-            self._write_sse_done()
-            self._finish_chunked()
+            _locked_write(lambda: self._write_sse_error(f"upstream HTTP {exc.code}: {detail}"))
+            _locked_write(self._write_sse_done)
+            _locked_write(self._finish_chunked)
             self.close_connection = True
         except Exception as exc:  # noqa: BLE001
-            self._write_sse_error(f"{type(exc).__name__}: {exc}")
-            self._write_sse_done()
-            self._finish_chunked()
+            hb_stop.set()
+            _locked_write(lambda: self._write_sse_error(f"{type(exc).__name__}: {exc}"))
+            _locked_write(self._write_sse_done)
+            _locked_write(self._finish_chunked)
             self.close_connection = True
+        finally:
+            hb_stop.set()
 
     def do_POST(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
