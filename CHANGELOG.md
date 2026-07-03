@@ -7,14 +7,16 @@
 
 ---
 
-## [v0.6.16] — agent SSE 写出层全局保活心跳(治长流静默段被 idle 掐流)· 🔵 code-complete 待部署
+## [v0.6.16-20260703] — agent SSE 写出层全局保活心跳(治长流静默段被 idle 掐流)· ✅ 已上线 2026-07-03
 > **背景(异常看板 2026-07-02 全部 4 条未解决 bug)**:文件生成 / 大表分析等 agent 长流**中途断线**,前端报裸 "network error"、任务白跑(许晴×2 / 王燕 / 张超,全部 severity=完全用不了;时间 10:23–15:04,已排除当晚 3 次前端部署的嫌疑)。根因:agent loop 的**静默段**(模型生成工具参数〈xlsx/docx 全文在 tool args 里,数分钟〉/ 大表 excel-poc 查询执行 / 规划期 / narrate 续轮)对下游零字节输出 → 被链路 idle 墙掐流(**前端 BFF 是 Node fetch/undici,默认 `bodyTimeout=300s` 无 body 字节即断**;各层 LB 另有各自阈值)。v0.6.14 只给「文件渲染等待段」加了 20s 心跳,其它静默段裸奔;BFF→浏览器方向有 5s 心跳、adapter→BFF 方向无保活。
 > **改**(`adapter.py`,零契约变更、对所有 agent 模式通用):
 > - 新常量 `AGENT_SSE_HEARTBEAT_SECS`(env `ADAPTER_AGENT_SSE_HEARTBEAT_SECS`,默认 15s,`0`=关)。
 > - `_handle_agent_chat_stream` 写出层加**后台心跳线程**:距上次真实写出 ≥ 阈值就写一行 SSE 注释 `: hb\n\n`(SSE 规范注释,前端解析器只认 `data:` 行天然忽略;BFF 逐字节转发,同时刷新其 undici bodyTimeout)。写出经 `write_lock` 互斥(`_locked_write`),注释只落在完整事件之间、不会插进半个事件;所有收口路径(正常 / HTTPError / Exception + finally)先 `hb_stop.set()` 再锁内写 `[DONE]`/chunked 终止,流结束后心跳不再写;心跳写失败(客户端已断)只停心跳、主循环按既有路径收场。
 > - 选 handler 写出层做**唯一汇聚点**:上游 generator 无论在哪个静默点卡住(args 累积 / excel 步 / 规划 / narrate buffer),这里统一兜底,不必每个静默点各补一次(v0.6.14 的教训)。
 > **自验**:`py_compile` 绿;行为 harness 3 case PASS(5s 静默/2s 阈值 → 恰好 2 个心跳、A/B 事件间只有心跳块、chunked 编码完整;generator 抛异常 → error 事件+DONE+终止收口、异常前有心跳;`0` 关闭无心跳)。配套前端(llm-playground-pro `lib/chat-client.ts`)同批:断流错误由裸 "network error" 换中文文案(部分内容已保留 + 引导「重新生成」)。
-> **上线**:待部署(与前端 0.17.57 无部署顺序依赖,单独可上)。
+> **上线**(2026-07-03,fast-path build FROM v0.6.15):镜像 `:v0.6.16-20260703` digest `sha256:030cca6013628a4f792e24965b37ec9efaf04c22d14923f63f5122a9660ba5d2`,git `c0eeb6e`;镜像内自检(`_FILE_GEN_AVAILABLE`)过。SAE ChangeOrder `d1146079-32aa-456a-92d6-5f51890d3f04`(image-only 不带 --Envs,Status=2);`describeApplicationConfig` 实证 ImageUrl `:v0.6.16-20260703` + **35 env 全保** + PreStop sleep25 + Replicas 2;两 pod(`172.29.0.16`/`172.29.0.19`)`/health` = `version v0.6.16 git_sha c0eeb6e`。
+> **部署后活体 PASS**(ECS→pod 直打,绕 BFF,gen_file_force xlsx 12-sheet 大生成):240s 观察窗收到 **15 个 `: hb` SSE 注释**(≈每 16s 一个),贯穿「工具参数生成」静默段 —— 修复前这段零字节、撞 BFF undici 300s bodyTimeout 必断,现在链路持续有活性字节。事件流本身(iteration_start/首轮 force 等 progress)完整无插坏。
+> **回滚**:镜像回 `v0.6.15-20260701`(零数据副作用);或 env 应急 `ADAPTER_AGENT_SSE_HEARTBEAT_SECS=0` 关心跳(改 env 需重新部署生效)。
 
 ## [v0.6.15-20260701] — lxj-agent 计费专名加固:BILLING_MODEL 默认值/fallback lxj→lxj-agent · ✅ 已上线 2026-07-02
 > **背景**:网页版 agent(文件生成/大表)透传用户 key 走 LiteLLM 计费,原用裸名 `lxj` —— 与外部编程工具**真直连**的 `lxj` 在用量统计里分不开(污染,做用量看板时暴露)。2026-07-01 起后端加 `lxj-agent` 专名区分(LiteLLM `/model/new` 加模型〈cost/credential 复制 lxj〉+ 28 team/40 key 批量授权 + adapter env `ADAPTER_BILLING_MODEL=lxj-agent`)。本次 = **代码层加固**:防 env 万一丢失时回退旧 `lxj` 重新污染。
