@@ -3049,6 +3049,23 @@ def _execute_plan_streaming(
 
     # ── 1. 校验 plan 结构 ───────────────────────────────────────────
     steps_raw = plan_args.get("steps")
+    # v0.6.17 重复 id 自动修复(异常看板 2026-07-05 案:模型给两步都起 'step_1',
+    # 此前整盘 plan_validation_failed → 综合轮无结果可用 → 空作答):后出现的
+    # 重复 id 自动改名 `<id>__<序号>`;depends_on 里对重复 id 的引用仍解析到
+    # 首个(与模型意图一致)。只救重复,其它结构性问题(缺 id/缺 question)照旧报错。
+    if isinstance(steps_raw, list):
+        _seen_ids: set[str] = set()
+        for _i, _s in enumerate(steps_raw):
+            if isinstance(_s, dict) and isinstance(_s.get("id"), str):
+                _sid = _s["id"].strip()
+                if _sid and _sid in _seen_ids:
+                    _new = f"{_sid}__{_i + 1}"
+                    while _new in _seen_ids:
+                        _new += "x"
+                    _s["id"] = _new
+                    _sid = _new
+                if _sid:
+                    _seen_ids.add(_sid)
     err = _validate_plan_steps(steps_raw)
     if err:
         yield ("chunk", _sse_progress_chunk(
@@ -4081,6 +4098,34 @@ def run_agent_stream(
                     trace.stopped_reason = "answered_synthesized"
                 trace.final_finish_reason = "stop"
                 fake_resp = {"id": "agent-intent-leak-synth", "created": int(time.time())}
+                yield from _stream_final_answer(model, synthesized, fake_resp)
+                yield _sse_trace_chunk(model, trace)
+                return
+
+            # ── v0.6.17 空作答兜底(异常看板 2026-07-05 案)────────────────
+            # plan 校验失败等场景下,综合轮可能只流出空白(如 speculation flush
+            # 的 "\n\n")就 finish=stop —— 此前按 answered_streamed 静默收场,
+            # 前端只能兜「模型这一轮没生成任何内容」错误卡。改走既有合成兜底链
+            # (tool-free 强制作答),给用户真答案。刚 finalize 出文件的轮除外
+            # (文件卡即交付物,正文空是正常形态)。
+            if not content_buf.strip() and not _just_finalized_file:
+                progress_cb(
+                    "agent_force_answer_fallback",
+                    "模型本轮只流出空白内容,走合成兜底",
+                    {"iteration": iteration, "reason": "empty_content"},
+                )
+                yield from _drain_queue()
+                synthesized = _synthesize_answer(cfg, augmented, extra_payload, trace)
+                if not synthesized:
+                    synthesized = (
+                        "（抱歉,模型这一轮没有产出有效内容,合成兜底也失败。"
+                        "请重试或换一种问法。）"
+                    )
+                    trace.stopped_reason = "answered_empty_fallback"
+                else:
+                    trace.stopped_reason = "answered_synthesized"
+                trace.final_finish_reason = "stop"
+                fake_resp = {"id": "agent-empty-content-synth", "created": int(time.time())}
                 yield from _stream_final_answer(model, synthesized, fake_resp)
                 yield _sse_trace_chunk(model, trace)
                 return

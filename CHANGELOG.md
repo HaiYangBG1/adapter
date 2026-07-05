@@ -7,6 +7,13 @@
 
 ---
 
+## [v0.6.17] — plan 重复 step id 自动修复 + 空作答合成兜底(治「模型这一轮没生成任何内容」)
+> **背景(异常看板 2026-07-05 新 bug,韩雪艳 12:57 报错自动)**:PPT 出题套模板场景,K2.6 提交的 plan 两个 step 都叫 `step_1` → `_validate_plan_steps` 整盘 `plan_validation_failed` → plan 零结果 → 综合轮(plan_dispatch_done)模型只流出空白就 stop → adapter 记 `answered_streamed`(自以为答了),前端零可见内容,兜底成「模型这一轮没生成任何内容」错误卡。adapter 日志逐秒对上(12:55:10 起跑,plan 校验失败,run 结束 12:57:43 = 上报时刻)。
+> **改**(`agentic_web.py`,零契约变更):
+> - **重复 id 自动修复**:`_execute_plan_streaming` 校验前把后出现的重复 step id 自动改名 `<id>__<序号>`(depends_on 对旧名的引用仍解析到首个,与模型意图一致);只救重复,缺 id/缺 question 等结构问题照旧报错。
+> - **空作答合成兜底**:content 路径 finalize 前,若累积 content 全空白(如 speculation flush 的 `\n\n`)且本轮没 finalize 出文件 → 不再按 `answered_streamed` 静默收场,改走既有 `_synthesize_answer` 合成兜底链(tool-free 强制作答;合成也失败才 `answered_empty_fallback` 致歉文案)。前端「模型这一轮没生成任何内容」错误卡从此只剩真·上游异常一种来源。
+> **自验**:`py_compile` 绿;去重纯函数自测(3×`step_1` → `step_1/step_1__2/step_1__3`,校验通过;非去重路径重复照报)。
+
 ## [v0.6.16-20260703] — agent SSE 写出层全局保活心跳(治长流静默段被 idle 掐流)· ✅ 已上线 2026-07-03
 > **背景(异常看板 2026-07-02 全部 4 条未解决 bug)**:文件生成 / 大表分析等 agent 长流**中途断线**,前端报裸 "network error"、任务白跑(许晴×2 / 王燕 / 张超,全部 severity=完全用不了;时间 10:23–15:04,已排除当晚 3 次前端部署的嫌疑)。根因:agent loop 的**静默段**(模型生成工具参数〈xlsx/docx 全文在 tool args 里,数分钟〉/ 大表 excel-poc 查询执行 / 规划期 / narrate 续轮)对下游零字节输出 → 被链路 idle 墙掐流(**前端 BFF 是 Node fetch/undici,默认 `bodyTimeout=300s` 无 body 字节即断**;各层 LB 另有各自阈值)。v0.6.14 只给「文件渲染等待段」加了 20s 心跳,其它静默段裸奔;BFF→浏览器方向有 5s 心跳、adapter→BFF 方向无保活。
 > **改**(`adapter.py`,零契约变更、对所有 agent 模式通用):
