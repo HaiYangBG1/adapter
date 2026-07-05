@@ -7,11 +7,12 @@
 
 ---
 
-## [v0.6.17] — plan 重复 step id 自动修复 + 空作答合成兜底(治「模型这一轮没生成任何内容」)
+## [v0.6.17-20260705] — plan 重复 step id 自动修复 + 空作答合成兜底(治「模型这一轮没生成任何内容」)· ✅ 已上线 2026-07-05
 > **背景(异常看板 2026-07-05 新 bug,韩雪艳 12:57 报错自动)**:PPT 出题套模板场景,K2.6 提交的 plan 两个 step 都叫 `step_1` → `_validate_plan_steps` 整盘 `plan_validation_failed` → plan 零结果 → 综合轮(plan_dispatch_done)模型只流出空白就 stop → adapter 记 `answered_streamed`(自以为答了),前端零可见内容,兜底成「模型这一轮没生成任何内容」错误卡。adapter 日志逐秒对上(12:55:10 起跑,plan 校验失败,run 结束 12:57:43 = 上报时刻)。
 > **改**(`agentic_web.py`,零契约变更):
 > - **重复 id 自动修复**:`_execute_plan_streaming` 校验前把后出现的重复 step id 自动改名 `<id>__<序号>`(depends_on 对旧名的引用仍解析到首个,与模型意图一致);只救重复,缺 id/缺 question 等结构问题照旧报错。
 > - **空作答合成兜底**:content 路径 finalize 前,若累积 content 全空白(如 speculation flush 的 `\n\n`)且本轮没 finalize 出文件 → 不再按 `answered_streamed` 静默收场,改走既有 `_synthesize_answer` 合成兜底链(tool-free 强制作答;合成也失败才 `answered_empty_fallback` 致歉文案)。前端「模型这一轮没生成任何内容」错误卡从此只剩真·上游异常一种来源。
+> **上线**(2026-07-05,fast-path build FROM v0.6.16):镜像 `:v0.6.17-20260705` digest `sha256:3c4ac03b39b92593e99928f67b0a31192fae70e92281b8b6e992f4e82d5a3fba`,git `d2822f8`。SAE ChangeOrder `c4d8ceae-97b2-4595-9655-eb59580eeb43`(image-only 不带 --Envs,Status=2);两 pod(`172.29.0.13`/`172.29.0.21`)`/health` = `version v0.6.17 git_sha d2822f8`,capabilities 全保。异常看板该条已置「已解决」(生产 `已解决|16`)。**回滚**:镜像回 `v0.6.16-20260703`(零数据副作用)。
 > **自验**:`py_compile` 绿;去重纯函数自测(3×`step_1` → `step_1/step_1__2/step_1__3`,校验通过;非去重路径重复照报)。
 
 ## [v0.6.16-20260703] — agent SSE 写出层全局保活心跳(治长流静默段被 idle 掐流)· ✅ 已上线 2026-07-03
