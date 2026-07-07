@@ -7,12 +7,13 @@
 
 ---
 
-## [v0.6.18-20260707] — 空作答兜底改判「可见缓冲」(治 sentinel 吞流假成功)
+## [v0.6.18-20260707] — 空作答兜底改判「可见缓冲」(治 sentinel 吞流假成功)· ✅ 已上线 2026-07-07
 > **背景(异常看板 2026-07-06 新 bug,韩雪艳 22:11 报错自动,v0.6.17 上线后仍复发)**:大表 plan-and-execute run(22:09–22:11,约 40 个 excel-poc 并行查询全 success,SpendLogs 实证)步骤全成功,**综合轮**(tools=[])K2.6 把「想再调工具」当正文流出 `<|tool_calls_section_begin|>…` sentinel 段且**未闭合** → `_StreamToolLeakGuard` 按设计整段吞掉(flush 抑制态丢弃)→ **客户端 0 字**;但 `content_buf` 是**原始**累积(存着 sentinel,非空)→ v0.6.17 的空作答兜底(判 `content_buf.strip()`)不触发 → `answered_streamed` 假成功 → 前端只能兜「模型这一轮没生成任何内容」错误卡。另佐证:content 路径的承诺条件本就是「出现过非空白 content delta」,`content_buf` 全空白时走的是 `empty` 路径 —— v0.6.17 那个判空条件在 content 路径**近乎死分支**(行为 harness case4 实证)。
 > **改**(`agentic_web.py`,零契约变更):
 > - `_speculative_iteration` 新增 `visible_buf`:累积**实际下发给客户端**的正文(leak_guard `feed()` 放行的 safe 段 + `flush()` 残尾),随 done state 返回;另带 `suppressed_tool_leaks`(守卫吞块计数)供诊断。
 > - content 路径空作答兜底改判 `visible_buf.strip()`(缺 key 回退 `content_buf`,行为同旧):sentinel 吞流 / 任何「content 承诺了但用户一个字没看到」的场景,统一走 `_synthesize_answer` 合成兜底(tool-free 强制作答,plan 结果都在 history 里),不再假成功。progress 事件 reason=`empty_visible_content`,带 `raw_content_chars`/`suppressed_tool_leaks`。
 > **自验**:`py_compile` 绿;行为 harness 5 case PASS(未闭合 sentinel 全吞→visible 判空+兜底条件触发 / 正常回答不受影响 / 配对块前后正文保留 / 纯空白走 empty 路径佐证 / v0.6.17 vs v0.6.18 条件对比)。
+> **上线**(2026-07-07,fast-path build FROM v0.6.17):镜像 `:v0.6.18-20260707` digest `sha256:736878533027b3cfbc0e3fc13e3952d453ad85c746acd5a5e173f31dbb7251e9`,git `c1e97f0`。SAE ChangeOrder `d18d79fd-1112-4c3a-b83a-869faa481059`(image-only 不带 --Envs,Status=2);两 pod(`172.29.0.5`/`172.29.0.12`)`/health` = `version v0.6.18 git_sha c1e97f0`,env 35 全保 + PreStop sleep25 + Replicas 2,capabilities 全保。**活体冒烟 PASS**(ECS→pod `/v1/agent/chat/completions` 流式提问:content 正常逐 token 下发、`answered_streamed` 收口、[DONE] 正常 —— 正常回答路径零回归)。异常看板该条已置「已解决」(生产 `已解决|17`,未解决清零)。
 > **回滚**:镜像回 `v0.6.17-20260705`(零数据副作用)。
 
 ## [v0.6.17-20260705] — plan 重复 step id 自动修复 + 空作答合成兜底(治「模型这一轮没生成任何内容」)· ✅ 已上线 2026-07-05
