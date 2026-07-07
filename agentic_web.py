@@ -3346,6 +3346,12 @@ def _speculative_iteration(
     content_started = False
     tool_calls_started = False
     content_buf = ""              # 累积所有 content delta(含空白,用于 empty 检测)
+    # v0.6.18:实际下发给客户端的可见正文(过 leak_guard 之后)。content_buf 是
+    # **原始**累积 —— K2.6 把工具调用当正文吐 sentinel 段且未闭合时,leak_guard
+    # 会把它整段吞掉(客户端 0 字),但 content_buf 非空 → 空作答兜底(v0.6.17,
+    # 判 content_buf)不触发,answered_streamed 假成功(异常看板 2026-07-06 案)。
+    # 判「用户看没看到答案」必须用这份可见缓冲。
+    visible_buf = ""
     reasoning_buf = ""            # 累积所有 reasoning_content delta
     tool_call_fragments: list = []
     finish_reason = ""
@@ -3412,6 +3418,7 @@ def _speculative_iteration(
                         safe = leak_guard.feed(content_delta)  # v0.6.4 流式守卫
                         if safe:
                             last_content_chunk = chunk
+                            visible_buf += safe
                             yield ("chunk", _chunk_with_content(chunk, safe))
                     else:
                         # 空白 content delta(如 "\\n\\n"):尚未承诺,buffer 起来
@@ -3421,6 +3428,7 @@ def _speculative_iteration(
                     safe = leak_guard.feed(content_delta)  # v0.6.4 流式守卫
                     if safe:
                         last_content_chunk = chunk
+                        visible_buf += safe
                         yield ("chunk", _chunk_with_content(chunk, safe))
                 # tool_calls_started + 后续 content delta:静默丢弃
                 continue
@@ -3436,6 +3444,7 @@ def _speculative_iteration(
             "path": "upstream_error",
             "error": str(exc),
             "content_buf": content_buf,
+            "visible_buf": visible_buf,
             "reasoning_buf": reasoning_buf,
             "tool_call_fragments": tool_call_fragments,
             "finish_reason": finish_reason,
@@ -3446,6 +3455,7 @@ def _speculative_iteration(
     if content_started and last_content_chunk is not None:
         residual = leak_guard.flush()
         if residual:
+            visible_buf += residual
             yield ("chunk", _chunk_with_content(last_content_chunk, residual))
 
     # 决定最终 path
@@ -3467,6 +3477,8 @@ def _speculative_iteration(
     yield ("done", {
         "path": path,
         "content_buf": content_buf,
+        "visible_buf": visible_buf,
+        "suppressed_tool_leaks": leak_guard.removed,  # v0.6.18: 诊断用
         "reasoning_buf": reasoning_buf,
         "tool_call_fragments": tool_call_fragments,
         "assembled_tool_calls": assembled,        # v0.2.15: 已过滤的 tool_calls
@@ -4103,16 +4115,25 @@ def run_agent_stream(
                 return
 
             # ── v0.6.17 空作答兜底(异常看板 2026-07-05 案)────────────────
-            # plan 校验失败等场景下,综合轮可能只流出空白(如 speculation flush
-            # 的 "\n\n")就 finish=stop —— 此前按 answered_streamed 静默收场,
-            # 前端只能兜「模型这一轮没生成任何内容」错误卡。改走既有合成兜底链
-            # (tool-free 强制作答),给用户真答案。刚 finalize 出文件的轮除外
-            # (文件卡即交付物,正文空是正常形态)。
-            if not content_buf.strip() and not _just_finalized_file:
+            # v0.6.18 改判**可见缓冲**(异常看板 2026-07-06 案):content 路径的
+            # 承诺条件是「出现过非空白 content delta」,但那不等于用户看到了字 ——
+            # K2.6 在 tools=[] 综合轮把工具调用当正文吐 `<|tool_calls_section_begin|>`
+            # 段且未闭合时,_StreamToolLeakGuard 会把它整段吞掉(flush 也丢),
+            # 客户端 0 字,而 content_buf 存着原始 sentinel 非空 → 旧判
+            # `content_buf.strip()` 永不触发,answered_streamed 假成功。
+            # 改走既有合成兜底链(tool-free 强制作答),给用户真答案。
+            # 刚 finalize 出文件的轮除外(文件卡即交付物,正文空是正常形态)。
+            _visible_buf = state.get("visible_buf", content_buf)
+            if not _visible_buf.strip() and not _just_finalized_file:
                 progress_cb(
                     "agent_force_answer_fallback",
-                    "模型本轮只流出空白内容,走合成兜底",
-                    {"iteration": iteration, "reason": "empty_content"},
+                    "模型本轮没有流出可见内容,走合成兜底",
+                    {
+                        "iteration": iteration,
+                        "reason": "empty_visible_content",
+                        "raw_content_chars": len(content_buf),
+                        "suppressed_tool_leaks": state.get("suppressed_tool_leaks", 0),
+                    },
                 )
                 yield from _drain_queue()
                 synthesized = _synthesize_answer(cfg, augmented, extra_payload, trace)
