@@ -294,11 +294,13 @@ ADAPTER_DEFAULT_FREQUENCY_PENALTY = float(
 ADAPTER_DEFAULT_PRESENCE_PENALTY = float(
     os.environ.get("ADAPTER_DEFAULT_PRESENCE_PENALTY", "0.2")
 )
-# reasoning_content 累积字符数上限。超阈值后 adapter 主动 abort + 注入兜底文案。
-# Qwen3 thinking 模式正常深度推理 1k-3k token 够用,> 4000 token 大概率
-# 已经陷入 self-doubt 循环。每 4 char ≈ 1 token,16000 char ≈ 4000 token。
+# reasoning 累积字符数上限。超阈值后 adapter 主动 abort + 注入兜底文案。
+# 16000(≈4K token)是 Qwen3 INT8「自我质疑死循环」时代定的值;彼时 agentic_web
+# 只认 reasoning_content 字段,该护栏对 K2.6(思考走 `reasoning`)一直是死代码。
+# v0.6.19 认双字段后护栏重新生效 —— K2.6 复杂任务合法思考可超 4K token,默认放宽
+# 到 60000(中文 ≈3.38 char/token → ≈17K token,仍拦得住真跑飞),防误杀降级思考质量。
 ADAPTER_MAX_REASONING_CHARS = int(
-    os.environ.get("ADAPTER_MAX_REASONING_CHARS", "16000")
+    os.environ.get("ADAPTER_MAX_REASONING_CHARS", "60000")
 )
 # Phase 3: vision tool (web_view) — controls browser screenshot fallback
 AGENT_WEB_VIEW_ENABLED = os.environ.get("ADAPTER_AGENT_WEB_VIEW_ENABLED", "1").lower() not in {"0", "false", "no", "off"}

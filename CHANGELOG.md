@@ -7,6 +7,21 @@
 
 ---
 
+## [v0.6.19] — agent 流稳态三修:K2.6 reasoning 字段 + 静默保活 chunk + 上游瞬时错误重试 · 待部署
+> **背景(异常看板两桩未解决自动上报)**:① 朱鹏飞 2026-07-09 14:45「上游模型生成超时/暂时不可用」(问「可以生成可视化操作界面吗」,走 `/v1/agent`,agent_error=upstream timeout/5xx);② 何金妮 2026-07-08 16:18「Error in input stream」(普通提问 `chick-lxj`,浏览器读 SSE 中断,**`ai_answer` 空 = 一个字都没到就断**)。
+> **根因链**(Langfuse 两时间点均无对应 trace = 死在中段;ALB/CLB/credential 均 CLI live 实查):
+> 1. **60s 静默墙**:LiteLLM ALB(`llm.lxjchina.com.cn`,`lsn-2fco4wsu8dia1xl301`)`RequestTimeout=60s`/idle 15s —— 链路上任何一段静默超 60s 即被掐流。**何金妮案**:`chick-lxj` credential(`lxj_ppu`)live 实证指向 adapter **`/v1` 纯透传**(非 agent loop),首 token/prefill 排队期上游零字节 → ALB 60s 掐 BFF↔LiteLLM 连接 → 浏览器「Error in input stream」(`ai_answer` 空佐证)。→ **ops 修**:ALB `RequestTimeout` 60→180s(可逆,随本次上线一并调)。
+> 2. **既有心跳护不到 LiteLLM 中转段**:v0.6.16 写出层 `: hb` **SSE 注释**心跳只在「adapter 直连 BFF」(`/api/agent`)段有效;经 LiteLLM 的链路(chick-lxj / chick-lxj-web),注释行会被 LiteLLM 的 SSE 解析层吞掉、不再向下游转发(两案均发生在 v0.6.16 上线之后 = 实锤旁证;部署后做 live 穿透验证回写本条)。**故本次改用「合法空 delta chunk」保活** —— LiteLLM 按正常 chunk 转发(与生产已跑数版的 progress 空 delta chunk 同形状)。
+> 3. **K2.6 思考字段错配(agent loop 路径)**:vLLM kimi_k2 parser 把思考放 `delta.reasoning`,`_speculative_iteration` 只认 Qwen/SGLang 时代的 `reasoning_content` → agent 路径 thinking 期间 chunk 全被当「role-only 块」缓冲,**对下游整段零字节**;且 `reasoning_buf` 恒空 → v0.2.27 思考死循环防护、v0.2.14 reasoning 兜底对 K2.6 一直失效。
+> 4. **上游零重试**:`path=upstream_error` 直接终局 `agent_error`,一次瞬时抖动就把整轮判死(朱鹏飞案)。
+>
+> **改**(`agentic_web.py` + `adapter.py` 一处常量;对前端/契约零破坏,PROTOCOL §4 2026-07-10 行):
+> - **认双字段**:`reasoning_delta = reasoning_content ∥ reasoning`(chunk 分类/缓冲行为不变,只修累积)。配套:死循环护栏 `ADAPTER_MAX_REASONING_CHARS` 默认 **16000→60000 字符**(≈17K token;旧值是 Qwen3 INT8 死循环时代定的,直接对 K2.6 生效会误杀合法长思考、静默降级为禁 thinking 重试 —— reviewer P1;上线后观测 `reasoning_too_long` 触发率再收紧)。
+> - **静默保活 chunk**:新 `_iter_upstream_with_ticks`(后台线程读上游,主线程 15s 无数据吐 tick;消费方提前退出时 stop event 令 pump 在 chunk 边界退出释放上游,上界=socket 读超时 120s)+ `_speculative_iteration` 距上次真实下发 ≥`_UPSTREAM_KEEPALIVE_SECS=15s` 补一个空 delta 保活块(`id:"agent-keepalive"`,无扩展字段,前端/OpenAI SDK 天然忽略);真实下发处同步回写计时器(reviewer P2,对齐 v0.6.16 `_locked_write` 模式)。覆盖 thinking / tool_calls 拼装轮 / 首 token 排队三类静默。
+> - **瞬时错误重试**:新 cfg `max_upstream_error_retries=1` —— `upstream_error` 且错误匹配 timeout/5xx/gateway/连接被掐、且 `visible_buf` 为空(未向用户下发任何可见正文,重试不会正文重复)→ 发 progress `agent_upstream_retry`(「上游模型瞬时超时,自动重试中…」)原样重试一次;仍败/4xx/已有可见正文 → 照旧 `agent_error` 终局。前端 `Playground.tsx` 已加该 stage 文案(随下次前端发版;未知 stage 本就安全忽略)。
+>
+> **自验**:行为 harness 13 case 全 PASS(reasoning 双字段累积 / thinking 静默保活 / 上游全静默 tick 保活 / 瞬时 timeout 重试成功且上游只调 2 次 / HTTP 400 不重试 / 已有可见正文不重试 / 消费方退出 pump 释放)+ `py_compile` 绿 + reviewer 核查门(2 P1 已修:v0.6.16 心跳关系论证 + 阈值放宽;2 P2 已修:计时器语义 + 释放上界注释)。
+
 ## [v0.6.18-20260707] — 空作答兜底改判「可见缓冲」(治 sentinel 吞流假成功)· ✅ 已上线 2026-07-07
 > **背景(异常看板 2026-07-06 新 bug,韩雪艳 22:11 报错自动,v0.6.17 上线后仍复发)**:大表 plan-and-execute run(22:09–22:11,约 40 个 excel-poc 并行查询全 success,SpendLogs 实证)步骤全成功,**综合轮**(tools=[])K2.6 把「想再调工具」当正文流出 `<|tool_calls_section_begin|>…` sentinel 段且**未闭合** → `_StreamToolLeakGuard` 按设计整段吞掉(flush 抑制态丢弃)→ **客户端 0 字**;但 `content_buf` 是**原始**累积(存着 sentinel,非空)→ v0.6.17 的空作答兜底(判 `content_buf.strip()`)不触发 → `answered_streamed` 假成功 → 前端只能兜「模型这一轮没生成任何内容」错误卡。另佐证:content 路径的承诺条件本就是「出现过非空白 content delta」,`content_buf` 全空白时走的是 `empty` 路径 —— v0.6.17 那个判空条件在 content 路径**近乎死分支**(行为 harness case4 实证)。
 > **改**(`agentic_web.py`,零契约变更):

@@ -1236,6 +1236,11 @@ class AgentConfig:
     # 重试一次**,带 chat_template_kwargs.enable_thinking=false 强制模型直出 content。
     # 仍空就用 reasoning_buf 作兜底答案。0 关闭重试,纯走 reasoning 兜底。
     max_empty_retries: int = 1
+    # v0.6.19 上游瞬时错误重试:上游 timeout / 5xx / 连接被掐,且**尚未向用户下发
+    # 任何可见正文**(visible_buf 空,重试不会造成正文重复)时,自动原样重试。
+    # 此前零重试:一次瞬时抖动直接终局报「上游模型生成超时/暂时不可用」
+    # (异常看板 2026-07-09 案)。0 关闭。
+    max_upstream_error_retries: int = 1
     # v0.2.17 / v0.2.20 / v0.2.22 thinking 策略:agentic 循环每轮单独决定。
     # - intermediate(前 N-1 轮,决策调哪个工具):默认**关**,模型有 tool_call
     #   这个外置思考机制,内置 chain-of-thought 在工具决策场景是浪费 + 易出
@@ -3319,6 +3324,80 @@ def _execute_plan_streaming(
     })
 
 
+# v0.6.19 保活:下游链路(adapter→LiteLLM→ALB→BFF)最短的「无字节即掐」窗口是
+# ALB RequestTimeout=60s。K2.6 thinking 阶段 / tool_calls 拼装轮 / 上游首 token
+# 排队期,本模块对下游整段零输出,超 60s 连接被 LB 掐断 —— 用户侧表现为
+# 「Error in input stream」(异常看板 2026-07-08 案)。间隔取 15s,三倍余量。
+_UPSTREAM_KEEPALIVE_SECS = 15.0
+
+
+def _keepalive_chunk(model: str) -> dict[str, Any]:
+    """空 delta 保活块:形状与 _sse_progress_chunk 一致(OpenAI chunk,delta={}),
+    但不带任何扩展字段 —— LiteLLM 透传、前端/vanilla OpenAI 客户端静默忽略,
+    唯一作用是让 LB 看到字节流动。"""
+    return {
+        "id": "agent-keepalive",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model or "adapter",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+    }
+
+
+def _iter_upstream_with_ticks(
+    cfg: AgentConfig,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    extra: Optional[dict[str, Any]],
+    tool_choice: Any = None,
+):
+    """后台线程读上游 SSE;主线程每 _UPSTREAM_KEEPALIVE_SECS 无数据吐一个
+    ``("tick", None)``,让调用方有机会向客户端发保活(治上游首 token 排队 /
+    完全静默期,LB 60s 无字节掐流)。上游异常在主线程 re-raise(语义与直接
+    迭代 _stream_upstream 一致)。消费方提前退出(GeneratorExit)→ finally 置
+    stop → pump 线程在下一个 chunk 边界退出并释放上游连接(不白烧 GPU;
+    ⚠️ 上界:若上游此后彻底无字节,要等 socket 读超时 cfg.request_timeout
+    〈默认 120s〉抛异常才退出 —— 与旧版直接迭代 _stream_upstream 的释放上界一致)。"""
+    q: queue.Queue = queue.Queue(maxsize=256)
+    stop = threading.Event()
+
+    def _pump() -> None:
+        try:
+            for c in _stream_upstream(cfg, messages, tools, extra, tool_choice=tool_choice):
+                while not stop.is_set():
+                    try:
+                        q.put(("chunk", c), timeout=1.0)
+                        break
+                    except queue.Full:
+                        continue
+                if stop.is_set():
+                    return
+            q.put(("end", None))
+        except Exception as exc:  # noqa: BLE001 — 透传给主线程 re-raise
+            try:
+                q.put(("err", exc), timeout=1.0)
+            except queue.Full:
+                pass
+
+    th = threading.Thread(target=_pump, daemon=True)
+    th.start()
+    try:
+        while True:
+            try:
+                kind, item = q.get(timeout=_UPSTREAM_KEEPALIVE_SECS)
+            except queue.Empty:
+                yield ("tick", None)
+                continue
+            if kind == "chunk":
+                yield ("chunk", item)
+            elif kind == "end":
+                return
+            else:
+                raise item  # type: ignore[misc]
+    finally:
+        stop.set()
+
+
 def _speculative_iteration(
     cfg: AgentConfig,
     messages: list[dict[str, Any]],
@@ -3359,12 +3438,23 @@ def _speculative_iteration(
     leak_guard = _StreamToolLeakGuard()
     last_content_chunk: Optional[dict[str, Any]] = None  # flush 残留时复用作模板
 
+    # v0.6.19 保活:自上次向调用方 yield 任何 chunk 起计时;thinking / tool_calls
+    # 拼装 / 首 token 排队等「收上游但不下发」阶段,每 _UPSTREAM_KEEPALIVE_SECS
+    # 补一个空 delta 保活块,防 LB 60s 无字节掐流。
+    last_sent = time.time()
+
     try:
-        for chunk in _stream_upstream(cfg, messages, tools, extra, tool_choice=tool_choice):
+        for _kind, chunk in _iter_upstream_with_ticks(cfg, messages, tools, extra, tool_choice=tool_choice):
+            if _kind == "tick" or (time.time() - last_sent) >= _UPSTREAM_KEEPALIVE_SECS:
+                last_sent = time.time()
+                yield ("chunk", _keepalive_chunk(cfg.model))
+                if _kind == "tick":
+                    continue
             choices = chunk.get("choices") or []
             if not choices:
                 # usage-only / 心跳块:承诺后转发,未承诺前 buffer
                 if content_started:
+                    last_sent = time.time()
                     yield ("chunk", chunk)
                 elif not tool_calls_started:
                     pre_decision_chunks.append(chunk)
@@ -3377,16 +3467,22 @@ def _speculative_iteration(
 
             tc_delta = delta.get("tool_calls")
             content_delta = delta.get("content")
+            # v0.6.19:K2.6/vLLM kimi_k2 parser 把思考放 `reasoning` 字段;
+            # `reasoning_content` 是 Qwen/SGLang 时代字段名。只认后者时,K2.6 的
+            # reasoning_buf 恒空 —— 思考死循环防护(v0.2.27)与 reasoning 兜底
+            # (v0.2.14)对 K2.6 实际失效。两个字段都认,谁有取谁。
             reasoning_delta = delta.get("reasoning_content")
+            if not (isinstance(reasoning_delta, str) and reasoning_delta):
+                reasoning_delta = delta.get("reasoning")
 
             # reasoning 累积(不影响路径承诺)
             if isinstance(reasoning_delta, str) and reasoning_delta:
                 reasoning_buf += reasoning_delta
                 # v0.2.27 thinking 死循环防护:reasoning_buf 累积超 max_reasoning_chars
-                # 主动 abort。Qwen3 thinking + Int8 量化在简单问题上易陷入 "Final →
-                # Wait → keep → Final" 自我质疑循环;normal 推理 < 4k token (16k char)
-                # 够用,> 此值大概率已死循环。abort 后通过 "empty" path 走 reasoning
-                # 兜底,前端看到"思考过程过长,请换个简单点的问法"。
+                # 主动 abort(阈值 v0.6.19 起默认 60000 char ≈17K token,见 adapter.py
+                # ADAPTER_MAX_REASONING_CHARS 注释;16000 是 Qwen3 INT8 自我质疑循环
+                # 时代的旧值,对 K2.6 合法长思考会误杀)。abort 后通过 "empty" path 走
+                # reasoning 兜底,前端看到"思考过程过长,请换个简单点的问法"。
                 if (
                     cfg.max_reasoning_chars > 0
                     and len(reasoning_buf) > cfg.max_reasoning_chars
@@ -3415,10 +3511,12 @@ def _speculative_iteration(
                         for buffered in pre_decision_chunks:
                             yield ("chunk", buffered)
                         pre_decision_chunks = []
+                        last_sent = time.time()
                         safe = leak_guard.feed(content_delta)  # v0.6.4 流式守卫
                         if safe:
                             last_content_chunk = chunk
                             visible_buf += safe
+                            last_sent = time.time()
                             yield ("chunk", _chunk_with_content(chunk, safe))
                     else:
                         # 空白 content delta(如 "\\n\\n"):尚未承诺,buffer 起来
@@ -3429,12 +3527,14 @@ def _speculative_iteration(
                     if safe:
                         last_content_chunk = chunk
                         visible_buf += safe
+                        last_sent = time.time()
                         yield ("chunk", _chunk_with_content(chunk, safe))
                 # tool_calls_started + 后续 content delta:静默丢弃
                 continue
 
             # role-only / finish-only chunk
             if content_started:
+                last_sent = time.time()
                 yield ("chunk", chunk)
             elif not tool_calls_started:
                 pre_decision_chunks.append(chunk)
@@ -3605,6 +3705,7 @@ def run_agent_stream(
     # 用 dict 包裹以便嵌套闭包内 mutate(nonlocal 在闭包链里有时报 SyntaxError)。
     source_n_counter = {"v": 0}
     empty_retries_used = 0
+    upstream_error_retries_used = 0  # v0.6.19 上游瞬时错误重试(per-session)
     # v0.2.30 streaming path intent-leak 续轮兜底状态(per-session):
     # - intent_leak_retries_used: 已续轮次,封顶 cfg.max_intent_leak_retries
     # - force_tool_choice_next: 上一轮命中 intent leak → 下一轮强制 tool_choice
@@ -3843,6 +3944,42 @@ def run_agent_stream(
                 state = payload
         trace.upstream_latencies_ms.append(int((time.time() - t0) * 1000))
         trace.iterations = iteration
+
+        # ── v0.6.19 上游瞬时错误重试 ────────────────────────────────────
+        # timeout / 5xx / 连接被掐属瞬时抖动,且尚未向用户下发任何可见正文
+        # (visible_buf 空 → 重试不会正文重复)时,原样重试一次再判死刑。
+        # 4xx(参数/上下文超长)不重试 —— 重试同样会被拒。
+        if (
+            state.get("path") == "upstream_error"
+            and not state.get("visible_buf")
+            and upstream_error_retries_used < cfg.max_upstream_error_retries
+            and re.search(
+                r"http\s*error\s*5\d\d|timed?\s*out|timeout|gateway"
+                r"|connection\s*(reset|aborted)|remote\s*end\s*closed|incompleteread",
+                str(state.get("error", "")), re.I,
+            )
+        ):
+            upstream_error_retries_used += 1
+            progress_cb(
+                "agent_upstream_retry",
+                "上游模型瞬时超时/不可用,自动重试中…",
+                {
+                    "iteration": iteration,
+                    "attempt": upstream_error_retries_used,
+                    "error": str(state.get("error", ""))[:200],
+                },
+            )
+            yield from _drain_queue()
+            t_retry2 = time.time()
+            state = {}
+            for kind, payload in _run_attempt(
+                current_messages, current_tools, iter_extra, tool_choice=iter_tool_choice,
+            ):
+                if kind == "chunk":
+                    yield payload
+                else:
+                    state = payload
+            trace.upstream_latencies_ms.append(int((time.time() - t_retry2) * 1000))
 
         # upstream_error 短路
         if state.get("path") == "upstream_error":
